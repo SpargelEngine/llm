@@ -1,6 +1,22 @@
 import unittest
 
-from spargel_llm.tokenizer import UnicodeTokenizer
+from spargel_llm.tokenizer import UnicodeTokenizer, ByteTokenizer
+
+
+class TestByteTokenizer(unittest.TestCase):
+    def test_vocab_size(self):
+        t = ByteTokenizer()
+        self.assertEqual(t.vocab_size, 256)
+
+    def test_encode(self):
+        t = ByteTokenizer()
+        self.assertEqual(t.encode("hello"), [104, 101, 108, 108, 111])
+        self.assertEqual(t.encode("测试"), [0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95])
+
+    def test_decode(self):
+        t = ByteTokenizer()
+        self.assertEqual(t.decode([48, 32, 126]), "0 ~")
+        self.assertEqual(t.decode([0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95]), "测试")
 
 
 class TestUnicodeTokenizer(unittest.TestCase):
@@ -31,12 +47,6 @@ class TestUnicodeTokenizer(unittest.TestCase):
     def test_decode(self):
         t = UnicodeTokenizer.train_from_text("0123456789")
         self.assertEqual(t.decode([1, 3, 5, 7, 9]), "13579")
-
-    def test_sort(self):
-        t = UnicodeTokenizer.train_from_text("cba", sort=False)
-        self.assertEqual(t.vocab_size, 3)
-        self.assertEqual(t.encode("bca"), [1, 0, 2])
-        self.assertEqual(t.decode([2, 1, 0]), "abc")
 
 
 if __name__ == "__main__":

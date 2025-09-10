@@ -19,6 +19,21 @@ class Tokenizer(abc.ABC):
         pass
 
 
+class ByteTokenizer(Tokenizer):
+    @override
+    def encode(self, input: str) -> list[int]:
+        return list(input.encode(encoding="utf-8"))
+
+    @override
+    def decode(self, tokens: list[int]) -> str:
+        return bytes(tokens).decode(encoding="utf-8")
+
+    @property
+    @override
+    def vocab_size(self) -> int:
+        return 256
+
+
 class UnicodeTokenizer(Tokenizer):
     _vocab: list[str]
     _stoi: dict[str, int]
@@ -34,17 +49,15 @@ class UnicodeTokenizer(Tokenizer):
         self._iots = {i: ch for i, ch in enumerate(vocab)}
 
     @staticmethod
-    def train_from_text(text: str, *, sort: bool = True) -> UnicodeTokenizer:
+    def train_from_text(text: str) -> UnicodeTokenizer:
         """
         Train a Unicode tokenizer using the codepoints in the given text.
+        The codepoints will be sorted.
 
         Args:
             text: This should include all codepoints that will be encountered during encoding.
-            sort: Whether to sort the codepoints or not.
         """
-        vocab = list(set(text))
-        if sort:
-            vocab = sorted(vocab)
+        vocab = sorted(list(set(text)))
         return UnicodeTokenizer(vocab)
 
     @override
