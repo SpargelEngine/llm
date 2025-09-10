@@ -1,7 +1,8 @@
+# Priority of merge.
 Rank = int
 
-MAX_RANK = 1_000_000
-MAX_OFFSET = 1_000_000_000
+MAX_RANK: Rank = 1_000_000
+MAX_OFFSET: int = 1_000_000_000
 
 
 def byte_pair_merge(ranks: dict[bytes, Rank], piece: bytes) -> list[int]:
