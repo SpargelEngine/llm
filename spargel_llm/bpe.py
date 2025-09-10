@@ -14,6 +14,8 @@ def byte_pair_merge(ranks: dict[bytes, Rank], piece: bytes) -> list[int]:
 
     Args:
         ranks: a dictionary specifying ranks for some byte sequences
+               Note: it is assume that `ranks[s] <= ranks[t]` if `s` is a prefix of `t`, and
+                     every key in `ranks` can be written as the sum of another two keys in `ranks`.
         piece: the input byte sequence
 
     Return: the start position of each segment
