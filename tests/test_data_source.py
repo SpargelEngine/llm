@@ -23,7 +23,7 @@ class TestPlainTextSource(unittest.TestCase):
         )
 
         sample_length = random.randint(1, text_length // 16)
-        source = PlainTextSource(text, sample_length, sample_length, random=random)
+        source = PlainTextSource(text, sample_length, random=random)
         for _ in range(100):
             sampled_text = source.sample()
             self.assertTrue(text.find(sampled_text) >= 0)

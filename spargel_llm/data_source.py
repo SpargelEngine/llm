@@ -25,7 +25,12 @@ class PlainTextSource(DataSource[str]):
     _random: Random
 
     def __init__(
-        self, text: str, min_len: int, max_len: int | None, *, random: Random = Random()
+        self,
+        text: str,
+        min_len: int,
+        max_len: int | None = None,
+        *,
+        random: Random = Random(),
     ):
         """
         Args:
@@ -45,7 +50,7 @@ class PlainTextSource(DataSource[str]):
 
     @override
     def sample(self) -> str:
-        if self._min_len == self._max_len:
+        if self._min_len != self._max_len:
             length = self._random.randint(self._min_len, self._max_len)
         else:
             length = self._min_len
