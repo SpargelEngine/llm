@@ -9,6 +9,7 @@ import jax.nn as jnn
 import jax.numpy as jnp
 from jax import lax
 
+
 class Linear(nnx.Module):
     """
     A linear transformation of the form
@@ -58,6 +59,22 @@ class Embedding(nnx.Module):
             (..., seq_len, embed_dim)
         """
         return jnp.take(self.A.value, ids, axis=0)
+
+
+class RMSNorm(nnx.Module):
+    """
+    Root mean square normalization.
+    """
+
+    def __call__(self, x: jax.Array):
+        """
+        Args:
+            x: (..., input_dim)
+        Return:
+            (..., input_dim)
+        """
+        s = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
+        return x * lax.rsqrt(s)
 
 
 class LayerNorm(nnx.Module):
@@ -192,6 +209,10 @@ class FeedForward(nnx.Module):
 
 
 def all_you_need_init(block_size: int, embed_dim: int):
+    """
+    Intitialize the position encoding matrix using arXiv:1706.03762
+    """
+    assert embed_dim % 2 == 0
     arr = []
     for pos in range(block_size):
         v = []
