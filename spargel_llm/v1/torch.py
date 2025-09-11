@@ -15,22 +15,22 @@ class PositionalEncodingLearned(nn.Module):
         (..., seq_len, dim)
     """
 
-    _ctx_len: int
+    _max_seq_len: int
     _dim: int
 
     _pe: nn.Parameter
 
-    def __init__(self, ctx_len: int, dim: int):
+    def __init__(self, max_seq_len: int, dim: int):
         super().__init__()
 
-        self._ctx_len = ctx_len
+        self._max_seq_len = max_seq_len
         self._dim = dim
-        self._pe = nn.Parameter(torch.rand(ctx_len, dim))
+        self._pe = nn.Parameter(torch.rand(max_seq_len, dim))
 
     @override
     def forward(self, x: Tensor) -> Tensor:
         assert x.size(-1) == self._dim
-        assert x.size(-2) <= self._ctx_len  # seq_len
+        assert x.size(-2) <= self._max_seq_len  # seq_len
 
         seq_len = x.size(-2)
         x += self._pe[:seq_len, :]
@@ -47,22 +47,24 @@ class PositionalEncoding(nn.Module):
         (..., seq_len, dim)
     """
 
-    _ctx_len: int
+    _max_seq_len: int
     _dim: int
 
     _pe: nn.Buffer
 
-    def __init__(self, ctx_len: int, dim: int):
+    def __init__(self, max_seq_len: int, dim: int):
         super().__init__()
 
-        self._ctx_len = ctx_len
+        self._max_seq_len = max_seq_len
         self._dim = dim
-        self._pe = nn.Buffer(torch.empty(ctx_len, dim))
+        self._pe = nn.Buffer(torch.empty(max_seq_len, dim))
 
-        positions = torch.arange(0, ctx_len, dtype=torch.float).reshape(ctx_len, 1)
-        # frequencies = ctx_len ** (-torch.arange(0, dim // 2) * 2 / dim)
+        positions = torch.arange(0, max_seq_len, dtype=torch.float).reshape(
+            max_seq_len, 1
+        )
+        # frequencies = max_seq_len ** (-torch.arange(0, dim // 2) * 2 / dim)
         frequencies = (
-            torch.arange(1, dim // 2 + 1, dtype=torch.float) * torch.pi / ctx_len
+            torch.arange(1, dim // 2 + 1, dtype=torch.float) * torch.pi / max_seq_len
         )
 
         self._pe[:, 0::2] = torch.sin(positions * frequencies)
@@ -71,7 +73,7 @@ class PositionalEncoding(nn.Module):
     @override
     def forward(self, x: Tensor) -> Tensor:
         assert x.size(-1) == self._dim
-        assert x.size(-2) <= self._ctx_len  # seq_len
+        assert x.size(-2) <= self._max_seq_len  # seq_len
 
         seq_len = x.size(-2)
         x += self._pe[:seq_len, :]
@@ -110,12 +112,16 @@ def scaled_dot_product(
     scores = torch.einsum("...ik, ...jk -> ...ij", Q, K)
 
     if mask is not None:
-        scores.masked_fill_(mask, -torch.inf)
+        scores = scores.masked_fill(mask, -torch.inf)
 
     if scaled:
         scores /= math.sqrt(d_key)
 
     weights = torch.softmax(scores, dim=-1)
+
+    # get rid of NaN
+    if mask is not None:
+        weights = weights.masked_fill(mask, 0.0)
 
     # print(weights)
 
@@ -246,13 +252,17 @@ class LLM(nn.Module):
     _transformer: TransformerBlock
     _head: nn.Linear
 
-    def __init__(self, vocab_size: int, ctx_len: int, dim: int, d_key: int):
+    trained_steps: int
+
+    def __init__(self, vocab_size: int, max_seq_len: int, dim: int, d_key: int):
         super().__init__()
 
         self._token_embedding = nn.Embedding(vocab_size, dim)
-        self._positional_encoding = PositionalEncoding(ctx_len, dim)
+        self._positional_encoding = PositionalEncoding(max_seq_len, dim)
         self._transformer = TransformerBlock(dim, d_key)
         self._head = nn.Linear(dim, vocab_size)
+
+        self.trained_steps = 0
 
     @override
     def forward(self, tokens: Tensor, mask: Optional[Tensor] = None) -> Tensor:

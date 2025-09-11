@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
 from random import Random
 from typing import Callable, Iterable, override
 
