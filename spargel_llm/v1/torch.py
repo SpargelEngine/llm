@@ -126,6 +126,10 @@ def scaled_dot_product(
     if mask is not None:
         weights = weights.masked_fill(mask, 0.0)
 
+    # get rid of NaN
+    if mask is not None:
+        weights = weights.masked_fill(mask, 0.0)
+
     # print(weights)
 
     result = weights @ V
@@ -317,6 +321,8 @@ class LLM(nn.Module):
         self._transformer = TransformerBlock(dim, d_key, d_hidden)
         # self._transformer2 = TransformerBlock(dim, d_key, d_hidden)
         self._head = nn.Linear(dim, vocab_size)
+
+        self.trained_steps = 0
 
     @override
     def forward(self, tokens: Tensor, mask: Optional[Tensor] = None) -> Tensor:
