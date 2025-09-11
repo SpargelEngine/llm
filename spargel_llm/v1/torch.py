@@ -92,6 +92,8 @@ def scaled_dot_product(
         Q: (..., cnt_q, d_key)
         K: (..., cnt_k, d_key)
         V: (..., cnt_k, d_value)
+
+        mask: (..., cnt_q, cnt_k)
     Returns:
         (..., cnt_q, d_value)
     """
@@ -100,7 +102,7 @@ def scaled_dot_product(
     assert K.size(-2) == V.size(-2)
     if mask is not None:
         assert mask.dtype == torch.bool
-        assert mask.shape == (Q.size(-2), K.size(-2))
+        assert mask.size(-2) == Q.size(-2) and mask.size(-1) == K.size(-2)
 
     d_key = K.size(-1)
 
@@ -115,9 +117,6 @@ def scaled_dot_product(
 
     weights = torch.softmax(scores, dim=-1)
 
-    if mask is not None:
-        weights.masked_fill_(mask, 0.0)
-
     # print(weights)
 
     result = weights @ V
@@ -130,7 +129,7 @@ class Attention(nn.Module):
 
     Args:
         x: (..., seq_len, d_in)
-        mask (Optional): (seq_len, seq_len)
+        mask (Optional): (..., seq_len, seq_len)
     Returns:
         (..., seq_len, d_out)
     """
@@ -161,7 +160,7 @@ class Attention(nn.Module):
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         seq_len = x.size(-2)
         if mask is not None:
-            assert mask.shape == (seq_len, seq_len)
+            assert mask.size(-1) == mask.size(-2) == seq_len
 
         Q = self._W_q(x)
         K = self._W_k(x)
@@ -205,6 +204,7 @@ class TransformerBlock(nn.Module):
 
     Args:
         x: (..., seq_len, dim)
+        mask: (..., seq_len, seq_len)
     Returns:
         (..., seq_len, dim)
     """
@@ -264,3 +264,30 @@ class LLM(nn.Module):
         x = self._head(x)
 
         return x
+
+
+def generate_causal_mask(d1: int, d2: int) -> Tensor:
+    return torch.tril(torch.ones(d1, d2)) == 0
+
+
+def calculate_loss(
+    model: LLM,
+    input: Tensor,
+    mask: Tensor,
+    target: Tensor,
+    pad_index: int,
+) -> Tensor:
+    """
+    Args:
+        input: (..., seq_len), dtype=int
+        target: (..., seq_len), dtype=int
+    """
+
+    assert input.shape == target.shape
+
+    logits: Tensor = model(input, mask)  # (..., seq_len, vocab_size)
+    loss = nn.functional.cross_entropy(
+        logits.flatten(0, -2), target.flatten(0, -1), ignore_index=pad_index
+    )
+
+    return loss

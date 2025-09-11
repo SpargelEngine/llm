@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import abc
-from typing import override
+from typing import Optional, override
 
 
 class Tokenizer(abc.ABC):
@@ -49,7 +49,9 @@ class UnicodeTokenizer(Tokenizer):
         self._iots = {i: ch for i, ch in enumerate(vocab)}
 
     @staticmethod
-    def train_from_text(text: str) -> UnicodeTokenizer:
+    def train_from_text(
+        text: str, reserved_vocab: Optional[list[str]] = None
+    ) -> UnicodeTokenizer:
         """
         Train a Unicode tokenizer using the codepoints in the given text.
         The codepoints will be sorted.
@@ -58,6 +60,10 @@ class UnicodeTokenizer(Tokenizer):
             text: This should include all codepoints that will be encountered during encoding.
         """
         vocab = sorted(list(set(text)))
+
+        if reserved_vocab is not None:
+            vocab = reserved_vocab + vocab
+
         return UnicodeTokenizer(vocab)
 
     @override
