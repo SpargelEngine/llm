@@ -1,12 +1,12 @@
-from collections.abc import Callable
 import enum
 import math
+from collections.abc import Callable
 from typing import Optional
 
-from flax import nnx
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp
+from flax import nnx
 from jax import lax
 
 

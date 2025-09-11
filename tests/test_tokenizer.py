@@ -1,6 +1,6 @@
 import unittest
 
-from spargel_llm.tokenizer import UnicodeTokenizer, ByteTokenizer
+from spargel_llm.tokenizer import ByteTokenizer, UnicodeTokenizer
 
 
 class TestByteTokenizer(unittest.TestCase):
