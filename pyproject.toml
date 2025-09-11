@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.13"
 
 dependencies = [
+    "numpy>=2.3.3",
     "regex>=2025.9.1",
 ]
 
@@ -12,6 +13,9 @@ jax_cuda12 = [
     "flax>=0.11.2",
     "jax[cuda12]>=0.7.1",
     "optax>=0.2.5",
+]
+matplotlib = [
+    "matplotlib>=3.10.6"
 ]
 tensorboard = [
     "tensorboard>=2.20.0",
