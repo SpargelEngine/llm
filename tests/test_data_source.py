@@ -4,8 +4,8 @@ import unittest
 from random import Random
 
 from spargel_llm.data_source import (
-    PlainTextSource,
     GeneratedDataSource,
+    PlainTextSource,
     WeightedDataSource,
 )
 
