@@ -29,8 +29,8 @@ class PositionalEncodingLearned(nn.Module):
 
     @override
     def forward(self, x: Tensor) -> Tensor:
-        assert x.size(-1) == self._dim
-        assert x.size(-2) <= self._max_seq_len  # seq_len
+        torch._assert(x.size(-1) == self._dim, "bad dim")
+        torch._assert(x.size(-2) <= self._max_seq_len, "seq_len too large")
 
         seq_len = x.size(-2)
         x += self._pe[:seq_len, :]
@@ -72,8 +72,8 @@ class PositionalEncoding(nn.Module):
 
     @override
     def forward(self, x: Tensor) -> Tensor:
-        assert x.size(-1) == self._dim
-        assert x.size(-2) <= self._max_seq_len  # seq_len
+        torch._assert(x.size(-1) == self._dim, "bad dim")
+        torch._assert(x.size(-2) <= self._max_seq_len, "seq_len too large")  # seq_len
 
         seq_len = x.size(-2)
         x += self._pe[:seq_len, :]
@@ -87,7 +87,7 @@ def scaled_dot_product(
     V: Tensor,
     *,
     mask: Optional[Tensor] = None,
-    scaled: bool = False,
+    is_scaled: bool = False,
 ) -> Tensor:
     """
     Args:
@@ -100,13 +100,16 @@ def scaled_dot_product(
         (..., cnt_q, d_value)
     """
 
-    assert Q.size(-1) == K.size(-1)
-    assert K.size(-2) == V.size(-2)
-    if mask is not None:
-        assert mask.dtype == torch.bool
-        assert mask.size(-2) == Q.size(-2) and mask.size(-1) == K.size(-2)
+    torch._assert(Q.size(-1) == K.size(-1), "d_key not matched")
+    torch._assert(K.size(-2) == V.size(-2), "cnt_k not matched")
 
+    cnt_q, cnt_k = Q.size(-2), K.size(-2)
     d_key = K.size(-1)
+
+    if mask is not None:
+        torch._assert(mask.dtype == torch.bool, "mask dtype != bool")
+        torch._assert(mask.size(-2) == cnt_q, "bad mask size (-2)")
+        torch._assert(mask.size(-1) == cnt_k, "bad mask size (-1)")
 
     # (..., cnt_q, cnt_k)
     scores = torch.einsum("...ik, ...jk -> ...ij", Q, K)
@@ -114,10 +117,10 @@ def scaled_dot_product(
     if mask is not None:
         scores = scores.masked_fill(mask, -torch.inf)
 
-    if scaled:
-        scores /= math.sqrt(d_key)
-
-    weights = torch.softmax(scores, dim=-1)
+    if is_scaled:
+        weights = torch.softmax(scores / math.sqrt(d_key), dim=-1)
+    else:
+        weights = torch.softmax(scores, dim=-1)
 
     # get rid of NaN
     if mask is not None:
@@ -135,12 +138,13 @@ class Attention(nn.Module):
 
     Args:
         x: (..., seq_len, d_in)
-        mask (Optional): (..., seq_len, seq_len)
+        mask (Optional): (..., seq_len), dtype=bool
     Returns:
         (..., seq_len, d_out)
     """
 
-    _scaled: bool
+    _is_scaled: bool
+    _is_causal: bool
 
     _W_q: nn.Linear
     _W_k: nn.Linear
@@ -152,11 +156,13 @@ class Attention(nn.Module):
         d_out: int,
         d_key: int,
         *,
-        scaled: bool = False,
+        is_scaled: bool = False,
+        is_causal: bool = False,
     ):
         super().__init__()
 
-        self._scaled = scaled
+        self._is_scaled = is_scaled
+        self._is_causal = is_causal
 
         self._W_q = nn.Linear(d_in, d_key, bias=False)
         self._W_k = nn.Linear(d_in, d_key, bias=False)
@@ -166,16 +172,37 @@ class Attention(nn.Module):
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         seq_len = x.size(-2)
         if mask is not None:
-            assert mask.size(-1) == mask.size(-2) == seq_len
+            torch._assert(mask.size(-1) == seq_len, "bad mask size")
 
         Q = self._W_q(x)
         K = self._W_k(x)
         V = self._W_v(x)
 
-        if mask is not None:
-            return scaled_dot_product(Q, K, V, mask=mask, scaled=self._scaled)
+        if self._is_causal:
+            # (seq_len, seq_len)
+            causal_mask = torch.triu(
+                torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1
+            )
+            if mask is not None:
+                # (..., seq_len, seq_len)
+                padding_mask = mask.unsqueeze(-2) | mask.unsqueeze(-1)
+                return scaled_dot_product(
+                    Q,
+                    K,
+                    V,
+                    mask=(padding_mask | causal_mask),
+                    is_scaled=self._is_scaled,
+                )
+            else:
+                return scaled_dot_product(
+                    Q, K, V, mask=causal_mask, is_scaled=self._is_scaled
+                )
         else:
-            return scaled_dot_product(Q, K, V, scaled=self._scaled)
+            if mask is not None:
+                padding_mask = mask.unsqueeze(-2) | mask.unsqueeze(-1)
+                return scaled_dot_product(Q, K, V, mask=mask, is_scaled=self._is_scaled)
+            else:
+                return scaled_dot_product(Q, K, V, is_scaled=self._is_scaled)
 
 
 class FeedForward(nn.Module):
@@ -203,6 +230,26 @@ class FeedForward(nn.Module):
         return self._layers(x)
 
 
+class LayerNorm(nn.Module):
+    """
+    Args:
+        x: (..., dim)
+    Returns:
+        (..., dim)
+    """
+
+    eps = 1e-5
+
+    def __init__(self):
+        super().__init__()
+
+    @override
+    def forward(self, x: Tensor) -> Tensor:
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True)
+        return (x - mean) / torch.sqrt(var + self.eps)
+
+
 class TransformerBlock(nn.Module):
     """One transformer block
 
@@ -210,7 +257,7 @@ class TransformerBlock(nn.Module):
 
     Args:
         x: (..., seq_len, dim)
-        mask: (..., seq_len, seq_len)
+        mask: (..., seq_len), dtype=bool
     Returns:
         (..., seq_len, dim)
     """
@@ -218,17 +265,24 @@ class TransformerBlock(nn.Module):
     _attention: Attention
     _feed_forward: FeedForward
 
-    def __init__(self, dim: int, d_key: int):
+    # _norm1: LayerNorm
+
+    def __init__(self, dim: int, d_key: int, d_hidden: int):
         super().__init__()
 
-        self._attention = Attention(d_in=dim, d_out=dim, d_key=d_key, scaled=False)
-        self._feed_forward = FeedForward(dim, d_hidden=dim)
+        self._attention = Attention(
+            d_in=dim, d_out=dim, d_key=d_key, is_scaled=False, is_causal=True
+        )
+        self._feed_forward = FeedForward(dim, d_hidden=d_hidden)
+
+        # self._norm1 = LayerNorm()
 
     @override
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         y = x
         x = self._attention(x, mask)
         x += y
+        # x = self._norm1(x)
 
         y = x
         x = self._feed_forward(x)
@@ -242,7 +296,7 @@ class LLM(nn.Module):
 
     Args:
         tokens: (..., seq_len), dtype=int
-        mask: (..., seq_len, seq_len)
+        mask: (..., seq_len), dtype=bool
     Returns:
         (..., vocab_size)
     """
@@ -250,19 +304,19 @@ class LLM(nn.Module):
     _token_embedding: nn.Embedding
     _positional_encoding: PositionalEncoding
     _transformer: TransformerBlock
+    # _transformer2: TransformerBlock
     _head: nn.Linear
 
-    trained_steps: int
-
-    def __init__(self, vocab_size: int, max_seq_len: int, dim: int, d_key: int):
+    def __init__(
+        self, vocab_size: int, max_seq_len: int, dim: int, d_key: int, d_hidden: int
+    ):
         super().__init__()
 
         self._token_embedding = nn.Embedding(vocab_size, dim)
         self._positional_encoding = PositionalEncoding(max_seq_len, dim)
-        self._transformer = TransformerBlock(dim, d_key)
+        self._transformer = TransformerBlock(dim, d_key, d_hidden)
+        # self._transformer2 = TransformerBlock(dim, d_key, d_hidden)
         self._head = nn.Linear(dim, vocab_size)
-
-        self.trained_steps = 0
 
     @override
     def forward(self, tokens: Tensor, mask: Optional[Tensor] = None) -> Tensor:
@@ -270,14 +324,11 @@ class LLM(nn.Module):
         x = self._positional_encoding(x)
 
         x = self._transformer(x, mask)
+        # x = self._transformer2(x, mask)
 
         x = self._head(x)
 
         return x
-
-
-def generate_causal_mask(d1: int, d2: int) -> Tensor:
-    return torch.tril(torch.ones(d1, d2)) == 0
 
 
 def calculate_loss(
@@ -290,10 +341,11 @@ def calculate_loss(
     """
     Args:
         input: (..., seq_len), dtype=int
+        mask: (..., seq_len), dtype=bool
         target: (..., seq_len), dtype=int
     """
 
-    assert input.shape == target.shape
+    torch._assert(input.shape == target.shape, "shape not matched")
 
     logits: Tensor = model(input, mask)  # (..., seq_len, vocab_size)
     loss = nn.functional.cross_entropy(

@@ -36,21 +36,30 @@ class ByteTokenizer(Tokenizer):
 
 class UnicodeTokenizer(Tokenizer):
     _vocab: list[str]
+    _unknown: Optional[int]
     _stoi: dict[str, int]
-    _iots: dict[int, str]
+    _itos: dict[int, str]
 
-    def __init__(self, vocab: list[str]):
+    def __init__(self, vocab: list[str], *, unknown: Optional[int] = None):
         """
         Args:
             vocab: a list of unicode characters
+            unknown (Optional): the fallback token id for unknown token
         """
+        if unknown is not None:
+            assert 0 <= unknown < len(vocab)
+
         self._vocab = vocab
+        self._unknown = unknown
         self._stoi = {ch: i for i, ch in enumerate(vocab)}
-        self._iots = {i: ch for i, ch in enumerate(vocab)}
+        self._itos = {i: ch for i, ch in enumerate(vocab)}
 
     @staticmethod
     def train_from_text(
-        text: str, reserved_vocab: Optional[list[str]] = None
+        text: str,
+        reserved_vocab: Optional[list[str]] = None,
+        *,
+        unknown: Optional[int] = None,
     ) -> UnicodeTokenizer:
         """
         Train a Unicode tokenizer using the codepoints in the given text.
@@ -64,15 +73,25 @@ class UnicodeTokenizer(Tokenizer):
         if reserved_vocab is not None:
             vocab = reserved_vocab + vocab
 
-        return UnicodeTokenizer(vocab)
+        return UnicodeTokenizer(vocab, unknown=unknown)
 
     @override
     def encode(self, input: str) -> list[int]:
-        return [self._stoi[c] for c in input]
+        if self._unknown is not None:
+            return [
+                (self._stoi[c] if c in self._stoi else self._unknown) for c in input
+            ]
+        else:
+            return [self._stoi[c] for c in input]
 
     @override
     def decode(self, tokens: list[int]) -> str:
-        return "".join([self._iots[i] for i in tokens])
+        if self._unknown is not None:
+            return "".join(
+                [self._itos[i if i in self._itos else self._unknown] for i in tokens]
+            )
+        else:
+            return "".join([self._itos[i] for i in tokens])
 
     @property
     @override
