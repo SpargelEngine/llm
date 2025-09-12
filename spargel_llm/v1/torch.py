@@ -322,8 +322,6 @@ class LLM(nn.Module):
         # self._transformer2 = TransformerBlock(dim, d_key, d_hidden)
         self._head = nn.Linear(dim, vocab_size)
 
-        self.trained_steps = 0
-
     @override
     def forward(self, tokens: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         x = self._token_embedding(tokens)
