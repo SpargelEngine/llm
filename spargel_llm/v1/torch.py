@@ -81,6 +81,11 @@ class PositionalEncoding(nn.Module):
         return x
 
 
+@torch.compiler.disable
+def do_mask(scores: Tensor, mask: Tensor) -> Tensor:
+    return scores.masked_fill(mask, -torch.inf)
+
+
 def scaled_dot_product(
     Q: Tensor,
     K: Tensor,
@@ -115,7 +120,8 @@ def scaled_dot_product(
     scores = torch.einsum("...ik, ...jk -> ...ij", Q, K)
 
     if mask is not None:
-        scores = scores.masked_fill(mask, -torch.inf)
+        # native code bug in PyTorch library
+        scores = do_mask(scores, mask)
 
     if is_scaled:
         weights = torch.softmax(scores / math.sqrt(d_key), dim=-1)
@@ -138,7 +144,7 @@ def scaled_dot_product(
 
 
 class Attention(nn.Module):
-    """Scaled dot-product attention
+    """Multihead scaled dot-product attention
 
     Args:
         x: (..., seq_len, d_in)
@@ -147,30 +153,44 @@ class Attention(nn.Module):
         (..., seq_len, d_out)
     """
 
+    _cnt_h: int
     _is_scaled: bool
     _is_causal: bool
 
-    _W_q: nn.Linear
-    _W_k: nn.Linear
-    _W_v: nn.Linear
+    _W_q: nn.Parameter  # (cnt_h, d_in, d_key)
+    _W_k: nn.Parameter  # (cnt_h, d_in, d_key)
+    _W_v: nn.Parameter  # (cnt_h, d_in, d_value)
+    _W_o: nn.Parameter  # (cnt_h, d_value, d_out)
 
     def __init__(
         self,
+        cnt_h: int,
         d_in: int,
         d_out: int,
         d_key: int,
+        d_value: int,
         *,
         is_scaled: bool = False,
         is_causal: bool = False,
     ):
+        """
+        Args:
+            cnt_h: number of heads
+            d_in: input dimension
+            d_out: output dimension
+            d_key: key dimension
+            d_value: value dimension
+        """
         super().__init__()
 
+        self._cnt_h = cnt_h
         self._is_scaled = is_scaled
         self._is_causal = is_causal
 
-        self._W_q = nn.Linear(d_in, d_key, bias=False)
-        self._W_k = nn.Linear(d_in, d_key, bias=False)
-        self._W_v = nn.Linear(d_in, d_out, bias=False)
+        self._W_q = nn.Parameter(torch.rand(cnt_h, d_in, d_key))
+        self._W_k = nn.Parameter(torch.rand(cnt_h, d_in, d_key))
+        self._W_v = nn.Parameter(torch.rand(cnt_h, d_in, d_value))
+        self._W_o = nn.Parameter(torch.rand(cnt_h, d_value, d_out))
 
     @override
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
@@ -178,9 +198,22 @@ class Attention(nn.Module):
         if mask is not None:
             torch._assert(mask.size(-1) == seq_len, "bad mask size")
 
-        Q = self._W_q(x)
-        K = self._W_k(x)
-        V = self._W_v(x)
+        # x: (..., seq_len, d_in)
+
+        # W_q: (cnt_h, d_in, d_key)
+        Q = torch.einsum(
+            "ijk, ...lj -> ...ilk", self._W_q, x
+        )  # (..., cnt_h, seq_len, d_key)
+
+        # W_k: (cnt_h, d_in, d_key)
+        K = torch.einsum(
+            "ijk, ...lj -> ...ilk", self._W_k, x
+        )  # (..., cnt_h, seq_len, d_key)
+
+        # W_v: (cnt_h, d_in, d_value)
+        V = torch.einsum(
+            "ijk, ...lj -> ...ilk", self._W_v, x
+        )  # (..., cnt_h, seq_len, d_value)
 
         if self._is_causal:
             # (seq_len, seq_len)
@@ -189,24 +222,25 @@ class Attention(nn.Module):
             )
             if mask is not None:
                 # (..., seq_len, seq_len)
-                padding_mask = mask.unsqueeze(-2) | mask.unsqueeze(-1)
-                return scaled_dot_product(
-                    Q,
-                    K,
-                    V,
-                    mask=(padding_mask | causal_mask),
-                    is_scaled=self._is_scaled,
-                )
+                mask = mask.unsqueeze(-2) | mask.unsqueeze(-1) | causal_mask
             else:
-                return scaled_dot_product(
-                    Q, K, V, mask=causal_mask, is_scaled=self._is_scaled
-                )
+                mask = causal_mask
         else:
             if mask is not None:
-                padding_mask = mask.unsqueeze(-2) | mask.unsqueeze(-1)
-                return scaled_dot_product(Q, K, V, mask=mask, is_scaled=self._is_scaled)
+                mask = mask.unsqueeze(-2) | mask.unsqueeze(-1)
             else:
-                return scaled_dot_product(Q, K, V, is_scaled=self._is_scaled)
+                mask = None
+
+        # mask: (..., seq_len, seq_len) | (seq_len, seq_len) | None
+        if mask is not None:
+            mask = mask.unsqueeze(-3)
+        # mask: (..., 1, seq_len, seq_len) | (1, seq_len, seq_len) | None
+
+        values = scaled_dot_product(Q, K, V, mask=mask, is_scaled=self._is_scaled)
+
+        # values: (..., cnt_h, seq_len, d_value)
+        # W_o: (cnt_h, d_value, d_out)
+        return torch.einsum("ijk, ...ilj -> ...lk", self._W_o, values)
 
 
 class FeedForward(nn.Module):
@@ -271,11 +305,17 @@ class TransformerBlock(nn.Module):
 
     # _norm1: LayerNorm
 
-    def __init__(self, dim: int, d_key: int, d_hidden: int):
+    def __init__(self, cnt_h: int, dim: int, d_key: int, d_value: int, d_hidden: int):
         super().__init__()
 
         self._attention = Attention(
-            d_in=dim, d_out=dim, d_key=d_key, is_scaled=False, is_causal=True
+            cnt_h=cnt_h,
+            d_in=dim,
+            d_out=dim,
+            d_key=d_key,
+            d_value=d_value,
+            is_scaled=False,
+            is_causal=True,
         )
         self._feed_forward = FeedForward(dim, d_hidden=d_hidden)
 
@@ -312,14 +352,23 @@ class LLM(nn.Module):
     _head: nn.Linear
 
     def __init__(
-        self, vocab_size: int, max_seq_len: int, dim: int, d_key: int, d_hidden: int
+        self,
+        vocab_size: int,
+        max_seq_len: int,
+        cnt_h: int,
+        dim: int,
+        d_key: int,
+        d_value: int,
+        d_hidden: int,
     ):
         super().__init__()
 
         self._token_embedding = nn.Embedding(vocab_size, dim)
         self._positional_encoding = PositionalEncoding(max_seq_len, dim)
-        self._transformer = TransformerBlock(dim, d_key, d_hidden)
-        # self._transformer2 = TransformerBlock(dim, d_key, d_hidden)
+        self._transformer = TransformerBlock(
+            cnt_h=cnt_h, dim=dim, d_key=d_key, d_value=d_value, d_hidden=d_hidden
+        )
+        # self._transformer2 = TransformerBlock(cnt_h=cnt_h, dim=dim, d_key=d_key, d_value=d_value, d_hidden=d_hidden)
         self._head = nn.Linear(dim, vocab_size)
 
     @override
