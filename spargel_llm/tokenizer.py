@@ -35,8 +35,9 @@ class ByteTokenizer(Tokenizer):
 
 
 class UnicodeTokenizer(Tokenizer):
-    _vocab: list[str]
-    _unknown: Optional[int]
+    vocab: list[str]
+    unknown: Optional[int]
+
     _stoi: dict[str, int]
     _itos: dict[int, str]
 
@@ -49,8 +50,8 @@ class UnicodeTokenizer(Tokenizer):
         if unknown is not None:
             assert 0 <= unknown < len(vocab)
 
-        self._vocab = vocab
-        self._unknown = unknown
+        self.vocab = vocab
+        self.unknown = unknown
         self._stoi = {ch: i for i, ch in enumerate(vocab)}
         self._itos = {i: ch for i, ch in enumerate(vocab)}
 
@@ -60,6 +61,7 @@ class UnicodeTokenizer(Tokenizer):
         reserved_vocab: Optional[list[str]] = None,
         *,
         unknown: Optional[int] = None,
+        reserved_vocab_tail: Optional[list[str]] = None,
     ) -> UnicodeTokenizer:
         """
         Train a Unicode tokenizer using the codepoints in the given text.
@@ -67,28 +69,33 @@ class UnicodeTokenizer(Tokenizer):
 
         Args:
             text: This should include all codepoints that will be encountered during encoding.
+            reserved_vocab: these tokens will be prepended to the list
+            unknown (Optional): the token id for error fallback
+            reserved_vocab_tail (Optional): these tokens will be appended to the list
         """
+
         vocab = sorted(list(set(text)))
 
         if reserved_vocab is not None:
             vocab = reserved_vocab + vocab
 
+        if reserved_vocab_tail is not None:
+            vocab += reserved_vocab_tail
+
         return UnicodeTokenizer(vocab, unknown=unknown)
 
     @override
     def encode(self, input: str) -> list[int]:
-        if self._unknown is not None:
-            return [
-                (self._stoi[c] if c in self._stoi else self._unknown) for c in input
-            ]
+        if self.unknown is not None:
+            return [(self._stoi[c] if c in self._stoi else self.unknown) for c in input]
         else:
             return [self._stoi[c] for c in input]
 
     @override
     def decode(self, tokens: list[int]) -> str:
-        if self._unknown is not None:
+        if self.unknown is not None:
             return "".join(
-                [self._itos[i if i in self._itos else self._unknown] for i in tokens]
+                [self._itos[i if i in self._itos else self.unknown] for i in tokens]
             )
         else:
             return "".join([self._itos[i] for i in tokens])
@@ -96,4 +103,4 @@ class UnicodeTokenizer(Tokenizer):
     @property
     @override
     def vocab_size(self) -> int:
-        return len(self._vocab)
+        return len(self.vocab)
