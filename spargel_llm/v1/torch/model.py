@@ -1,27 +1,27 @@
-from dataclasses import dataclass
 from typing import Optional, override
 
+import torch
 import torch.nn as nn
+from pydantic import BaseModel, PositiveInt
 from torch import Tensor
 
 from spargel_llm.layers.torch import (
-    PositionalEncoding,
-    LayerNorm,
     Attention,
     FeedForward,
+    LayerNorm,
+    PositionalEncoding,
 )
 
 
-@dataclass
-class Config:
-    vocab_size: int
-    max_seq_len: int
-    cnt_layer: int
-    cnt_head: int
-    dim: int
-    d_key: int
-    d_value: int
-    d_feed_forward: int
+class Config(BaseModel):
+    vocab_size: PositiveInt
+    max_seq_len: PositiveInt
+    cnt_layer: PositiveInt
+    cnt_head: PositiveInt
+    dim: PositiveInt
+    d_key: PositiveInt
+    d_value: PositiveInt
+    d_feed_forward: PositiveInt
 
 
 class TransformerBlock(nn.Module):
@@ -102,6 +102,8 @@ class LLM(nn.Module):
         (..., vocab_size)
     """
 
+    config: Config
+
     token_embedding: nn.Embedding
     positional_encoding: PositionalEncoding
     transformer: Transformer
@@ -109,6 +111,8 @@ class LLM(nn.Module):
 
     def __init__(self, config: Config):
         super().__init__()
+
+        self.config = config
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.dim)
         self.positional_encoding = PositionalEncoding(config.max_seq_len, config.dim)
@@ -125,3 +129,22 @@ class LLM(nn.Module):
         x = self.out(x)
 
         return x
+
+    def loss(
+        self, input: Tensor, mask: Tensor, target: Tensor, pad_index: int
+    ) -> Tensor:
+        """
+        Args:
+            input: (..., seq_len), dtype=int
+            mask: (..., seq_len), dtype=bool
+            target: (..., seq_len), dtype=int
+        """
+
+        torch._assert(input.shape == target.shape, "shape")
+
+        logits: Tensor = self(input, mask)  # (..., seq_len, vocab_size)
+        loss = nn.functional.cross_entropy(
+            logits.flatten(0, -2), target.flatten(0, -1), ignore_index=pad_index
+        )
+
+        return loss
