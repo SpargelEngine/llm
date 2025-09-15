@@ -30,36 +30,18 @@ class TestUnicodeTokenizer(unittest.TestCase):
         t = UnicodeTokenizer(["a", "b", "c"], unknown=1)
         self.assertEqual(t.vocab_size, 3)
 
-    def test_train(self):
-        t = UnicodeTokenizer.train_from_text("123 abc")
-        self.assertEqual(t.vocab_size, 7)
-
-        t = UnicodeTokenizer.train_from_text(
-            "123 abc", ["<|pad|>", "<|unk|>", "<|sos|>", "<|eos|>"], unknown=1
-        )
-        self.assertEqual(t.vocab_size, 7 + 4)
-
-        t = UnicodeTokenizer.train_from_text("你好, 测试")
-        self.assertEqual(t.vocab_size, 6)
-
-        t = UnicodeTokenizer.train_from_text("おはよう")
-        self.assertEqual(t.vocab_size, 4)
-
-        t = UnicodeTokenizer.train_from_text("☺️")
-        self.assertEqual(t.vocab_size, 2)
-
     def test_encode(self):
-        t = UnicodeTokenizer.train_from_text("0123456789")
+        t = UnicodeTokenizer(list("0123456789"))
         self.assertEqual(t.encode("24680"), [2, 4, 6, 8, 0])
 
-        t = UnicodeTokenizer.train_from_text("0123456789", unknown=3)
+        t = UnicodeTokenizer(list("0123456789"), unknown=3)
         self.assertEqual(t.encode("2468A"), [2, 4, 6, 8, 3])
 
     def test_decode(self):
-        t = UnicodeTokenizer.train_from_text("0123456789")
+        t = UnicodeTokenizer(list("0123456789"))
         self.assertEqual(t.decode([1, 3, 5, 7, 9]), "13579")
 
-        t = UnicodeTokenizer.train_from_text("0123456789", unknown=0)
+        t = UnicodeTokenizer(list("0123456789"), unknown=0)
         self.assertEqual(t.decode([1, 3, 5, 7, 123]), "13570")
 
 

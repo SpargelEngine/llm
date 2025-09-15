@@ -55,30 +55,6 @@ class UnicodeTokenizer(Tokenizer):
         self._stoi = {ch: i for i, ch in enumerate(vocab)}
         self._itos = {i: ch for i, ch in enumerate(vocab)}
 
-    @staticmethod
-    def train_from_text(
-        text: str,
-        reserved_vocab: Optional[list[str]] = None,
-        *,
-        unknown: Optional[int] = None,
-    ) -> UnicodeTokenizer:
-        """
-        Train a Unicode tokenizer using the codepoints in the given text.
-        The codepoints will be sorted.
-
-        Args:
-            text: This should include all codepoints that will be encountered during encoding.
-            reserved_vocab: these tokens will be prepended to the list
-            unknown (Optional): the token id for error fallback
-        """
-
-        vocab = sorted(list(set(text)))
-
-        if reserved_vocab is not None:
-            vocab = reserved_vocab + vocab
-
-        return UnicodeTokenizer(vocab, unknown=unknown)
-
     @override
     def encode(self, input: str) -> list[int]:
         if self.unknown is not None:
