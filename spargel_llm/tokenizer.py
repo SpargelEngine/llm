@@ -61,7 +61,6 @@ class UnicodeTokenizer(Tokenizer):
         reserved_vocab: Optional[list[str]] = None,
         *,
         unknown: Optional[int] = None,
-        reserved_vocab_tail: Optional[list[str]] = None,
     ) -> UnicodeTokenizer:
         """
         Train a Unicode tokenizer using the codepoints in the given text.
@@ -71,16 +70,12 @@ class UnicodeTokenizer(Tokenizer):
             text: This should include all codepoints that will be encountered during encoding.
             reserved_vocab: these tokens will be prepended to the list
             unknown (Optional): the token id for error fallback
-            reserved_vocab_tail (Optional): these tokens will be appended to the list
         """
 
         vocab = sorted(list(set(text)))
 
         if reserved_vocab is not None:
             vocab = reserved_vocab + vocab
-
-        if reserved_vocab_tail is not None:
-            vocab += reserved_vocab_tail
 
         return UnicodeTokenizer(vocab, unknown=unknown)
 

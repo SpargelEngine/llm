@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from random import Random
-from typing import Callable, Iterable, override
+from typing import Callable, Iterable, Iterator, override
 
 
 class DataSource[T](ABC):
@@ -124,3 +124,106 @@ class PlainTextSource(DataSource[str]):
 
         start = self._random.randint(0, len(self._text) - length)
         return self._text[start : start + length]
+
+
+class Dataset[T](ABC):
+    @abstractmethod
+    def __len__(self) -> int:
+        pass
+
+    @abstractmethod
+    def __getitem__(self, index: int) -> T:
+        pass
+
+
+class ListDataset(Dataset[int]):
+    data: list[int]
+
+    def __init__(self, data: list[int]):
+        self.data = data
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, index: int) -> int:
+        if index < 0 or index >= len(self.data):
+            raise IndexError
+
+        return self.data[index]
+
+
+class FixedLengthTextDataset(Dataset[str]):
+    text: str
+    length: int
+    stride: int
+    offset: int
+
+    _count: int
+
+    def __init__(self, text: str, length: int, stride: int = 1, offset: int = 0):
+        assert length > 0 and length <= len(text)
+
+        self.text = text
+        self.length = length
+        self.stride = stride
+        self.offset = offset
+
+        self._count = (len(text) - offset - length) // stride + 1
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __getitem__(self, index: int) -> str:
+        if index < 0 or index >= self._count:
+            raise IndexError
+
+        start = self.offset + index * self.stride
+        return self.text[start : start + self.length]
+
+
+class DataLoader[T](Iterator[T]):
+    dataset: Dataset[T]
+    shuffle: bool
+    random: Random
+
+    _len: int
+    _indices: list[int]
+    _current: int
+
+    def __init__(
+        self,
+        dataset: Dataset[T],
+        shuffle: bool = False,
+        *,
+        random: Random = Random(),
+    ):
+        self.dataset = dataset
+        self.shuffle = shuffle
+        self.random = random
+
+        self._len = len(dataset)
+        self._indices = []
+
+    @override
+    def __iter__(self) -> Iterator[T]:
+        if self.shuffle:
+            self._indices = list(range(self._len))
+            self.random.shuffle(self._indices)
+
+        self._current = 0
+
+        return self
+
+    @override
+    def __next__(self) -> T:
+        if self._current >= self._len:
+            raise StopIteration
+        else:
+            if self.shuffle:
+                result = self.dataset[self._indices[self._current]]
+            else:
+                result = self.dataset[self._current]
+
+            self._current += 1
+
+            return result

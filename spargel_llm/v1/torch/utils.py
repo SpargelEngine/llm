@@ -1,65 +1,30 @@
 import time
-from enum import Enum
-from typing import Callable, Optional
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
+from pydantic import BaseModel, NonNegativeFloat, NonNegativeInt
 from torch import Tensor
 
-from .model import Config, LLM
+from spargel_llm.data import DataLoader
+
+from .model import LLM, Config
 
 
-def calculate_loss(
-    model: LLM,
-    input: Tensor,
-    mask: Tensor,
-    target: Tensor,
-    pad_index: int,
-) -> Tensor:
-    """
-    Args:
-        input: (..., seq_len), dtype=int
-        mask: (..., seq_len), dtype=bool
-        target: (..., seq_len), dtype=int
-    """
-
-    torch._assert(input.shape == target.shape, "shape not matched")
-
-    logits: Tensor = model(input, mask)  # (..., seq_len, vocab_size)
-    loss = nn.functional.cross_entropy(
-        logits.flatten(0, -2), target.flatten(0, -1), ignore_index=pad_index
-    )
-
-    return loss
+class TrainInfo(BaseModel):
+    trained_steps: NonNegativeInt = 0
+    trained_time: NonNegativeFloat = 0
 
 
-class TrainInfo:
-    trained_steps: int = 0
-    trained_time: float = 0
-
-
-class TokenizerInfo:
+class TokenInfo(BaseModel):
     vocab: list[str] = []
-    pad: int = 0
-    unknown: int = 0
+    pad: NonNegativeInt = 0
+    unknown: NonNegativeInt = 0
 
 
-class State:
-    model: LLM
-    tokenizer_info: TokenizerInfo
+class ModelInfo(BaseModel):
     train_info: TrainInfo
-
-    def __init__(self, model: LLM):
-        self.model = model
-        self.tokenizer_info = TokenizerInfo()
-        self.train_info = TrainInfo()
-
-
-class TrainStage(Enum):
-    START = 0
-    RUNNING = 1
-    END = 2
+    token_info: TokenInfo
+    config: Config
 
 
 @torch.compile
@@ -72,60 +37,100 @@ def train_step(
     pad_index: int,
 ):
     optimizer.zero_grad()
-    loss = calculate_loss(model, inputs, masks, targets, pad_index=pad_index)
+    loss = model.loss(inputs, masks, targets, pad_index=pad_index)
     loss.backward()
     optimizer.step()
 
-
-type DataLoader = Callable[
-    [int], tuple[Tensor, Tensor, Tensor]
-]  # batch_size -> inputs, masks, targets
+    return loss
 
 
 def train(
-    state: State,
+    info: TrainInfo,
+    model: LLM,
     optimizer: optim.Optimizer,
-    data_loader: DataLoader,
+    data_loader: DataLoader[list[int]],  # tokens
+    seq_len: int,
+    pad_index: int,
     batch_size: int,
-    steps: int,
+    epochs: int,
     *,
-    callback: Optional[Callable[[State, TrainStage], None]] = None,
-    callback_period: int = 100,
+    log_period: int = 100,
 ):
-    model = state.model
-    train_info = state.train_info
+    print(16 * "=")
 
-    if callback is not None:
-        callback(state, TrainStage.START)
+    for epoch in range(epochs):
+        print(f"Epoch {epoch}:")
 
-    t_last = time.perf_counter()
+        t_epoch_start = t_last = time.perf_counter()
 
-    for i in range(steps):
-        # prepare data
-        inputs, masks, targets = data_loader(batch_size)
+        iterator = iter(data_loader)
 
-        # train
-        model.train()
+        step = 0
+        stop = False
 
-        train_step(
-            model=model,
-            optimizer=optimizer,
-            inputs=inputs,
-            masks=masks,
-            targets=targets,
-            pad_index=state.tokenizer_info.pad,
-        )
+        sum_of_time = 0
 
-        # update info
-        train_info.trained_steps += 1
+        while True:
+            # prepare a batch of data
+            inputs = torch.zeros(batch_size, seq_len, dtype=torch.int)
+            masks = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+            targets = torch.zeros(batch_size, seq_len, dtype=torch.int)
 
-        t = time.perf_counter()
-        train_info.trained_time += t - t_last
-        t_last = t
+            for i in range(batch_size):
+                try:
+                    tokens = next(iterator)
+                except StopIteration:
+                    stop = True
+                    break
 
-        # callback
-        if (i + 1) % callback_period == 0 and callback is not None:
-            callback(state, TrainStage.RUNNING)
+                length = len(tokens) - 1
 
-    if callback is not None:
-        callback(state, TrainStage.END)
+                if length <= 0 or 1 > seq_len:
+                    raise ValueError("incorrect number of tokens")
+
+                inputs[i] = torch.tensor(
+                    tokens[:-1] + (seq_len - length) * [pad_index], dtype=torch.int
+                )
+                masks[i] = torch.tensor(
+                    length * [False] + (seq_len - length) * [True], dtype=torch.bool
+                )
+                targets[i] = torch.tensor(
+                    tokens[1:] + (seq_len - length) * [pad_index], dtype=torch.int
+                )
+
+            if stop:
+                break
+
+            # train
+            model.train()
+
+            loss = train_step(
+                model=model,
+                optimizer=optimizer,
+                inputs=inputs,
+                masks=masks,
+                targets=targets,
+                pad_index=pad_index,
+            )
+
+            step += 1
+            info.trained_steps += 1
+
+            t = time.perf_counter()
+            delta_t = t - t_last
+            t_last = t
+            info.trained_time += delta_t
+            sum_of_time += delta_t
+
+            if step % log_period == 0:
+                print(f"  Step {step}: loss={loss.item():.6f}, time={sum_of_time:.6f}")
+                sum_of_time = 0
+
+        t_epoch_end = time.perf_counter()
+
+        print(f"Epoch time: {t_epoch_end - t_epoch_start:.6f}")
+        print(f"Total steps: {info.trained_steps}")
+        print(f"Total time: {info.trained_time:.6f}")
+        print()
+
+    print("Done.")
