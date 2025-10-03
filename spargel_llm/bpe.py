@@ -1,4 +1,9 @@
-from typing import Iterable, Sequence
+import multiprocessing
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+from typing import Iterable, Optional, Sequence
+
+from .meta import ai_marker
 
 # Priority of merge.
 Rank = int
@@ -74,28 +79,68 @@ def byte_pair_merge(ranks: dict[bytes, Rank], piece: bytes) -> list[int]:
     return [segment[0] for segment in parts[:-1]]
 
 
-def find_most_frequent_pair(samples: Iterable[Sequence[int]]) -> tuple[int, int, int]:
+@ai_marker(human_checked=True)
+def _count_pairs_in_chunk(chunk: list[Sequence[int]]) -> Counter[tuple[int, int]]:
+
+    def pairwise[T](seq: Sequence[T]):
+        for i in range(len(seq) - 1):
+            yield seq[i], seq[i + 1]
+
+    counter = Counter[tuple[int, int]]()
+    for sample in chunk:
+        counter += Counter(pairwise(sample))
+    return counter
+
+
+@ai_marker(human_checked=True)
+def find_most_frequent_pair(
+    samples: Iterable[Sequence[int]],
+    *,
+    num_processes: Optional[int] = None,
+    chunk_size: int = 1000,
+) -> tuple[int, int, int]:
     """
     Args:
         samples: from all these we count the frequencies of pairs
+        num_processes: number of processes to use (default: number of CPU cores)
+        chunk_size: number of sequences to process in each chunk (default: 1000)
 
     Return:
-        id1, id2, freq: the most frequent pair and its frequency
+        id1, id2, freq: the most frequent pair and its frequency (return freq = 0 when no pairs)
     """
+    # Convert to list for chunking
+    samples_list = list(samples)
 
-    freqs: dict[tuple[int, int], int] = {}
+    if not samples_list:
+        return 0, 0, 0
 
-    # count the number of appearance of each pair
-    for sample in samples:
-        for i in range(len(sample) - 1):
-            id1, id2 = sample[i], sample[i + 1]
+    # Use all available CPUs if not specified
+    if num_processes is None:
+        num_processes = multiprocessing.cpu_count()
 
-            if freqs.get((id1, id2)) is None:
-                freqs[(id1, id2)] = 0
+    # For small datasets, use sequential processing to avoid overhead
+    if len(samples_list) <= chunk_size or num_processes == 1:
+        counter = _count_pairs_in_chunk(samples_list)
+    else:
+        # Split samples into chunks
+        chunks = [
+            samples_list[i : i + chunk_size]
+            for i in range(0, len(samples_list), chunk_size)
+        ]
 
-            freqs[(id1, id2)] += 1
+        # Process chunks in parallel
+        with ProcessPoolExecutor(max_workers=num_processes) as executor:
+            chunk_counters = list(executor.map(_count_pairs_in_chunk, chunks))
 
-    # find the most frequent pair
-    max_pair = max(freqs, key=freqs.__getitem__)
+        # Merge all counters
+        counter = Counter[tuple[int, int]]()
+        for chunk_counter in chunk_counters:
+            counter += chunk_counter
 
-    return *max_pair, freqs[max_pair]
+    # Find the most common pair
+    most_common = counter.most_common(1)
+    if len(most_common) == 0:
+        return 0, 0, 0
+    else:
+        pair, cnt = most_common[0]
+        return *pair, cnt
