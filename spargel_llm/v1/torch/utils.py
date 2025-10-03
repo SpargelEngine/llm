@@ -1,4 +1,5 @@
 import time
+from typing import Callable, Optional
 
 import torch
 import torch.optim as optim
@@ -55,8 +56,13 @@ def train(
     epochs: int,
     *,
     log_period: int = 100,
+    max_steps: int = 0,
+    loss_callback: Optional[Callable[[int, float], None]] = None,
 ):
     print(16 * "=")
+
+    total_steps = 0
+    stop_all = False
 
     for epoch in range(epochs):
         print(f"Epoch {epoch}:")
@@ -66,15 +72,21 @@ def train(
         iterator = iter(data_loader)
 
         step = 0
-        stop = False
 
         sum_of_time = 0
+        sum_of_loss = 0.0
 
         while True:
+            if max_steps > 0 and total_steps >= max_steps:
+                stop_all = True
+                break
+
             # prepare a batch of data
             inputs = torch.zeros(batch_size, seq_len, dtype=torch.int)
             masks = torch.zeros(batch_size, seq_len, dtype=torch.bool)
             targets = torch.zeros(batch_size, seq_len, dtype=torch.int)
+
+            stop = False
 
             for i in range(batch_size):
                 try:
@@ -85,7 +97,7 @@ def train(
 
                 length = len(tokens) - 1
 
-                if length <= 0 or 1 > seq_len:
+                if length <= 0 or length > seq_len:
                     raise ValueError("incorrect number of tokens")
 
                 inputs[i] = torch.tensor(
@@ -114,6 +126,7 @@ def train(
             )
 
             step += 1
+            total_steps += 1
             info.trained_steps += 1
 
             t = time.perf_counter()
@@ -122,15 +135,30 @@ def train(
             info.trained_time += delta_t
             sum_of_time += delta_t
 
+            sum_of_loss += loss.item()
+
             if step % log_period == 0:
-                print(f"  Step {step}: loss={loss.item():.6f}, time={sum_of_time:.6f}")
+                avg_of_loss = sum_of_loss / log_period
+
+                print(f"  Step {step}: loss={avg_of_loss:.6f}, time={sum_of_time:.6f}")
+
+                if loss_callback is not None:
+                    loss_callback(info.trained_steps, avg_of_loss)
+
                 sum_of_time = 0
+                sum_of_loss = 0
 
         t_epoch_end = time.perf_counter()
+
+        if stop_all:
+            print("(Stopped early due to max_steps.)")
 
         print(f"Epoch time: {t_epoch_end - t_epoch_start:.6f}")
         print(f"Total steps: {info.trained_steps}")
         print(f"Total time: {info.trained_time:.6f}")
         print()
+
+        if stop_all:
+            break
 
     print("Done.")

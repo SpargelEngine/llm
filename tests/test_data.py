@@ -5,12 +5,12 @@ from random import Random
 
 from spargel_llm.data import (
     DataLoader,
-    FixedLengthTextDataset,
     GeneratedDataSource,
     ListDataset,
-    PlainTextSource,
     WeightedDataSource,
 )
+from spargel_llm.datasets import FixedLengthTextDataset, PlainTextSource
+from spargel_llm.meta import ai_marker_class
 
 seed = time.time()
 # print("seed:", seed)
@@ -95,6 +95,7 @@ class TestPlainTextSource(unittest.TestCase):
             self.assertTrue(text.find(sampled_text) >= 0)
 
 
+@ai_marker_class(human_checked=True)
 class TestDataset(unittest.TestCase):
     def test_basic_functionality(self):
         random = Random(seed)
@@ -125,6 +126,7 @@ class TestDataset(unittest.TestCase):
             _ = dataset[-1]
 
 
+@ai_marker_class(human_checked=True)
 class TestFixedLengthTextDataset(unittest.TestCase):
     def test_basic_functionality(self):
         # Create a test text
@@ -209,6 +211,7 @@ class TestFixedLengthTextDataset(unittest.TestCase):
         self.assertEqual(dataset[2], "fghi")
 
 
+@ai_marker_class(human_checked=True)
 class TestDataLoader(unittest.TestCase):
     def test_no_shuffle(self):
         random = Random(seed)

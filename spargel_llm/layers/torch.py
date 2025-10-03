@@ -117,6 +117,8 @@ class LayerNorm(nn.Module):
         if scale_and_shift:
             self.scale = nn.Parameter(torch.ones(dim))
             self.shift = nn.Parameter(torch.zeros(dim))
+        else:
+            self.scale = self.shift = None
 
     @override
     def forward(self, x: Tensor) -> Tensor:
@@ -209,8 +211,8 @@ class Attention(nn.Module):
         d_key: int,
         d_value: int,
         *,
-        is_scaled: bool = False,
-        is_causal: bool = False,
+        is_scaled: bool = True,
+        is_causal: bool = True,
     ):
         """
         Args:
