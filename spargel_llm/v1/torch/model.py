@@ -56,8 +56,8 @@ class TransformerBlock(nn.Module):
         )
         self.feed_forward = FeedForward(config.dim, d_hidden=config.d_feed_forward)
 
-        self.norm1 = LayerNorm(config.dim)
-        self.norm2 = LayerNorm(config.dim)
+        self.norm1 = LayerNorm(config.dim, scale_and_shift=False)
+        self.norm2 = LayerNorm(config.dim, scale_and_shift=False)
 
     @override
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
@@ -144,7 +144,9 @@ class LLM(nn.Module):
 
         logits: Tensor = self(input, mask)  # (..., seq_len, vocab_size)
         loss = nn.functional.cross_entropy(
-            logits.flatten(0, -2), target.flatten(0, -1), ignore_index=pad_index
+            logits.flatten(0, -2),
+            target.flatten(0, -1).type(torch.long),
+            ignore_index=pad_index,
         )
 
         return loss

@@ -1,3 +1,5 @@
+from typing import Iterable, Sequence
+
 # Priority of merge.
 Rank = int
 
@@ -70,3 +72,30 @@ def byte_pair_merge(ranks: dict[bytes, Rank], piece: bytes) -> list[int]:
                 min_rank = (i, rank)
 
     return [segment[0] for segment in parts[:-1]]
+
+
+def find_most_frequent_pair(samples: Iterable[Sequence[int]]) -> tuple[int, int, int]:
+    """
+    Args:
+        samples: from all these we count the frequencies of pairs
+
+    Return:
+        id1, id2, freq: the most frequent pair and its frequency
+    """
+
+    freqs: dict[tuple[int, int], int] = {}
+
+    # count the number of appearance of each pair
+    for sample in samples:
+        for i in range(len(sample) - 1):
+            id1, id2 = sample[i], sample[i + 1]
+
+            if freqs.get((id1, id2)) is None:
+                freqs[(id1, id2)] = 0
+
+            freqs[(id1, id2)] += 1
+
+    # find the most frequent pair
+    max_pair = max(freqs, key=freqs.__getitem__)
+
+    return *max_pair, freqs[max_pair]
