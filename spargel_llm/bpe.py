@@ -1,7 +1,7 @@
 import multiprocessing
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 from .meta import ai_marker
 
@@ -38,12 +38,12 @@ def byte_pair_merge(ranks: dict[bytes, Rank], piece: bytes) -> list[int]:
     for i in range(len(piece) - 1):
         # if the byte-pair does not exist in `ranks`, assign inf to rank
         rank = ranks.get(piece[i : i + 2], MAX_RANK)
-        if rank < min_rank[1]:
-            min_rank = (i, rank)
         parts.append((i, rank))
     parts.append((len(piece) - 1, MAX_RANK))
     # add a virtual merge point at the end
     parts.append((len(piece), MAX_RANK))
+
+    min_rank = parts[min(range(len(parts)), key=lambda i: parts[i][1])]
 
     # sanity check
     assert len(parts) == len(piece) + 1
@@ -71,10 +71,8 @@ def byte_pair_merge(ranks: dict[bytes, Rank], piece: bytes) -> list[int]:
         parts.pop(i + 1)
 
         # find the next merge point with minimal rank
-        min_rank = (MAX_OFFSET, MAX_RANK)
-        for i, (_, rank) in enumerate(parts[:-1]):
-            if rank < min_rank[1]:
-                min_rank = (i, rank)
+        min_index = min(range(len(parts)), key=lambda i: parts[i][1])
+        min_rank = (min_index, parts[min_index][1])
 
     return [segment[0] for segment in parts[:-1]]
 
@@ -94,10 +92,9 @@ def _count_pairs_in_chunk(chunk: list[Sequence[int]]) -> Counter[tuple[int, int]
 
 @ai_marker(human_checked=True)
 def find_most_frequent_pair(
-    samples: Iterable[Sequence[int]],
+    samples: Sequence[Sequence[int]],
     *,
     num_processes: Optional[int] = None,
-    chunk_size: int = 1000,
 ) -> tuple[int, int, int]:
     """
     Args:
@@ -108,10 +105,9 @@ def find_most_frequent_pair(
     Return:
         id1, id2, freq: the most frequent pair and its frequency (return freq = 0 when no pairs)
     """
-    # Convert to list for chunking
     samples_list = list(samples)
 
-    if not samples_list:
+    if len(samples_list) == 0:
         return 0, 0, 0
 
     # Use all available CPUs if not specified
@@ -119,10 +115,12 @@ def find_most_frequent_pair(
         num_processes = multiprocessing.cpu_count()
 
     # For small datasets, use sequential processing to avoid overhead
-    if len(samples_list) <= chunk_size or num_processes == 1:
+    if num_processes == 1 or len(samples_list) < num_processes:
         counter = _count_pairs_in_chunk(samples_list)
     else:
         # Split samples into chunks
+        chunk_size = len(samples_list) // num_processes
+
         chunks = [
             samples_list[i : i + chunk_size]
             for i in range(0, len(samples_list), chunk_size)

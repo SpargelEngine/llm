@@ -1,5 +1,6 @@
 from random import Random
-from typing import Callable, Optional, override
+from typing import Callable, Optional, Sequence, override
+from warnings import deprecated
 
 from spargel_llm.data import DataSource
 
@@ -54,35 +55,36 @@ class PlainTextSource(DataSource[str]):
         return self._text[start : start + length]
 
 
-class FixedLengthTextDataset(Dataset[str]):
-    text: str
+class FixedLengthDataset[T](Dataset[list[T]]):
+    seq: list[T]
     length: int
     stride: int
     offset: int
 
     _count: int
 
-    def __init__(self, text: str, length: int, stride: int = 1, offset: int = 0):
-        assert length > 0 and length <= len(text)
+    def __init__(self, seq: Sequence[T], length: int, stride: int = 1, offset: int = 0):
+        assert length > 0 and length <= len(seq)
 
-        self.text = text
+        self.seq = list(seq)
         self.length = length
         self.stride = stride
         self.offset = offset
 
-        self._count = (len(text) - offset - length) // stride + 1
+        self._count = (len(seq) - offset - length) // stride + 1
 
     def __len__(self) -> int:
         return self._count
 
-    def __getitem__(self, index: int) -> str:
+    def __getitem__(self, index: int) -> list[T]:
         if index < 0 or index >= self._count:
             raise IndexError
 
         start = self.offset + index * self.stride
-        return self.text[start : start + self.length]
+        return self.seq[start : start + self.length]
 
 
+@deprecated("should use TokenizedTextSource instead")
 class TokenizedDataset(Dataset[list[int]]):
     text_dataset: Dataset[str]
     tokenizer: Tokenizer

@@ -1,20 +1,21 @@
-from __future__ import annotations
-
-import abc
+from abc import ABC, abstractmethod
 from typing import Optional, override
 
+from .bpe import byte_pair_merge
+from .text_splitter import TextSplitter, TrivialSplitter
 
-class Tokenizer(abc.ABC):
-    @abc.abstractmethod
+
+class Tokenizer(ABC):
+    @abstractmethod
     def encode(self, input: str) -> list[int]:
         pass
 
-    @abc.abstractmethod
+    @abstractmethod
     def decode(self, tokens: list[int]) -> str:
         pass
 
     @property
-    @abc.abstractmethod
+    @abstractmethod
     def vocab_size(self) -> int:
         pass
 
@@ -75,3 +76,85 @@ class UnicodeTokenizer(Tokenizer):
     @override
     def vocab_size(self) -> int:
         return len(self.vocab)
+
+
+class WordTokenizer(Tokenizer):
+    """
+    This tokenizer will do encoding by first cutting the text to segments,
+    and then dividing it into words according to the word list.
+    """
+
+    words: list[bytes]
+    encode_range: tuple[int, int]
+
+    unknown: Optional[int]
+    text_splitter: TextSplitter
+
+    _word_to_id: dict[bytes, int]
+
+    def __init__(
+        self,
+        words: list[bytes],
+        encode_range: tuple[int, int],
+        *,
+        unknown: Optional[int] = None,
+        text_splitter: TextSplitter = TrivialSplitter(),
+    ):
+        """
+        Args:
+            tokens: list of words, with token id == index in list
+            encode_range: in the form [start, end), indicating the range of words used to do encoding
+            unknown: the token index for unknown word
+            text_splitter: the splitter used to cut the text before tokenizing
+        """
+
+        self.words = words
+        self.encode_range = encode_range
+
+        self.unknown = unknown
+        self.text_splitter = text_splitter
+
+        self._word_to_id = {}
+        for i in range(*encode_range):
+            self._word_to_id[words[i]] = i
+
+    @override
+    def encode(self, input: str) -> list[int]:
+        if len(input) == 0:
+            return []
+
+        tokens = []
+
+        # split text into segmentsI
+        cuts = [0] + self.text_splitter.split(input) + [len(input)]
+
+        for i in range(len(cuts) - 1):
+            start, end = cuts[i], cuts[i + 1]
+            segment = input[start:end].encode("utf-8")
+
+            # find words
+            positions = byte_pair_merge(self._word_to_id, segment)
+            positions.append(len(segment))
+
+            for j in range(len(positions) - 1):
+                word = segment[positions[j] : positions[j + 1]]
+
+                if self.unknown is not None:
+                    token = self._word_to_id.get(word, self.unknown)
+                else:
+                    token = self._word_to_id.get(word)
+
+                tokens.append(token)
+
+        return tokens
+
+    @override
+    def decode(self, tokens: list[int]) -> str:
+        return b"".join(self.words[id] for id in tokens).decode(
+            "utf-8", errors="ignore"
+        )
+
+    @property
+    @override
+    def vocab_size(self) -> int:
+        return len(self.words)

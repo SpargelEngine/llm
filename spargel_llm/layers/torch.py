@@ -138,7 +138,7 @@ def scaled_dot_product(
     V: Tensor,
     *,
     mask: Optional[Tensor] = None,
-    is_scaled: bool = False,
+    is_scaled: bool = True,
 ) -> Tensor:
     """
     Args:
@@ -230,10 +230,10 @@ class Attention(nn.Module):
         self.is_scaled = is_scaled
         self.is_causal = is_causal
 
-        self.W_q = nn.Parameter(torch.rand(cnt_head, d_in, d_key))
-        self.W_k = nn.Parameter(torch.rand(cnt_head, d_in, d_key))
-        self.W_v = nn.Parameter(torch.rand(cnt_head, d_in, d_value))
-        self.W_o = nn.Parameter(torch.rand(cnt_head, d_value, d_out))
+        self.W_q = nn.Parameter((torch.rand(cnt_head, d_in, d_key) - 0.5) * 1)  # TODO
+        self.W_k = nn.Parameter((torch.rand(cnt_head, d_in, d_key) - 0.5) * 1)
+        self.W_v = nn.Parameter((torch.rand(cnt_head, d_in, d_value) - 0.5) * 1)
+        self.W_o = nn.Parameter((torch.rand(cnt_head, d_value, d_out) - 0.5) * 1)
 
     @override
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
