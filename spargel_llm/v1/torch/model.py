@@ -51,13 +51,11 @@ class TransformerBlock(nn.Module):
             d_out=config.dim,
             d_key=config.d_key,
             d_value=config.d_value,
-            is_scaled=False,
-            is_causal=True,
         )
         self.feed_forward = FeedForward(config.dim, d_hidden=config.d_feed_forward)
 
-        self.norm1 = LayerNorm(config.dim, scale_and_shift=False)
-        self.norm2 = LayerNorm(config.dim, scale_and_shift=False)
+        self.norm1 = LayerNorm(config.dim)
+        self.norm2 = LayerNorm(config.dim)
 
     @override
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:

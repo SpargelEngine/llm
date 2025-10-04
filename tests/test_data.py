@@ -9,7 +9,7 @@ from spargel_llm.data import (
     ListDataset,
     WeightedDataSource,
 )
-from spargel_llm.datasets import FixedLengthTextDataset, PlainTextSource
+from spargel_llm.datasets import FixedLengthDataset, PlainTextSource
 from spargel_llm.meta import ai_marker_class
 
 seed = time.time()
@@ -127,63 +127,63 @@ class TestDataset(unittest.TestCase):
 
 
 @ai_marker_class(human_checked=True)
-class TestFixedLengthTextDataset(unittest.TestCase):
+class TestFixedLengthDataset(unittest.TestCase):
     def test_basic_functionality(self):
-        # Create a test text
-        text = "abcdefghijklmnopqrstuvwxyz"
+        # Create a test sequence
+        seq = list(range(26))
         length = 5
-        dataset = FixedLengthTextDataset(text, length)
+        dataset = FixedLengthDataset(seq, length)
 
         # Test __len__
-        expected_length = len(text) - length + 1
+        expected_length = 22
         self.assertEqual(len(dataset), expected_length)
 
         # Test __getitem__ for all indices
         for i in range(expected_length):
-            expected_chunk = text[i : i + length]
+            expected_chunk = seq[i : i + length]
             self.assertEqual(dataset[i], expected_chunk)
 
     def test_with_stride(self):
-        text = "abcdefghijklmnopqrstuvwxyz"
+        seq = list(range(26))
         length = 5
         stride = 2
-        dataset = FixedLengthTextDataset(text, length, stride=stride)
+        dataset = FixedLengthDataset(seq, length, stride=stride)
 
         # Test __len__
-        expected_length = (len(text) - length) // stride + 1
+        expected_length = 11
         self.assertEqual(len(dataset), expected_length)
 
         # Test __getitem__ for all indices
         for i in range(expected_length):
             start = i * stride
-            expected_chunk = text[start : start + length]
+            expected_chunk = seq[start : start + length]
             self.assertEqual(dataset[i], expected_chunk)
 
     def test_with_offset(self):
-        text = "abcdefghijklmnopqrstuvwxyz"
+        seq = list(range(26))
         length = 5
         offset = 3
-        dataset = FixedLengthTextDataset(text, length, offset=offset)
+        dataset = FixedLengthDataset(seq, length, offset=offset)
 
         # Test __len__
-        expected_length = (len(text) - offset - length) + 1
+        expected_length = 19
         self.assertEqual(len(dataset), expected_length)
 
         # Test __getitem__ for all indices
         for i in range(expected_length):
             start = offset + i
-            expected_chunk = text[start : start + length]
+            expected_chunk = seq[start : start + length]
             self.assertEqual(dataset[i], expected_chunk)
 
     def test_index_error(self):
-        text = "abcdefghijklmnopqrstuvwxyz"
+        seq = list(range(26))
         length = 5
-        dataset = FixedLengthTextDataset(text, length)
+        dataset = FixedLengthDataset(seq, length)
 
         # Test valid indices
-        self.assertEqual(dataset[0], "abcde")
-        self.assertEqual(dataset[1], "bcdef")
-        self.assertEqual(dataset[21], "vwxyz")
+        self.assertEqual(dataset[0], [0, 1, 2, 3, 4])
+        self.assertEqual(dataset[1], [1, 2, 3, 4, 5])
+        self.assertEqual(dataset[21], [21, 22, 23, 24, 25])
 
         # Test invalid indices
         with self.assertRaises(IndexError):
@@ -192,23 +192,23 @@ class TestFixedLengthTextDataset(unittest.TestCase):
             _ = dataset[-1]
 
     def test_edge_cases(self):
-        # Test with minimal text length
-        text = "abc"
+        # Test with minimal sequence length
+        seq = [0, 1, 2]
         length = 3
-        dataset = FixedLengthTextDataset(text, length)
+        dataset = FixedLengthDataset(seq, length)
         self.assertEqual(len(dataset), 1)
-        self.assertEqual(dataset[0], "abc")
+        self.assertEqual(dataset[0], [0, 1, 2])
 
-        # Test with longer text and custom stride/offset
-        text = "abcdefghij"
+        # Test with longer sequence and custom stride/offset
+        seq = list(range(10))
         length = 4
         stride = 2
         offset = 1
-        dataset = FixedLengthTextDataset(text, length, stride=stride, offset=offset)
-        self.assertEqual(len(dataset), 3)  # (10-1-4)//2 + 1 = 3
-        self.assertEqual(dataset[0], "bcde")
-        self.assertEqual(dataset[1], "defg")
-        self.assertEqual(dataset[2], "fghi")
+        dataset = FixedLengthDataset(seq, length, stride=stride, offset=offset)
+        self.assertEqual(len(dataset), 3)
+        self.assertEqual(dataset[0], [1, 2, 3, 4])
+        self.assertEqual(dataset[1], [3, 4, 5, 6])
+        self.assertEqual(dataset[2], [5, 6, 7, 8])
 
 
 @ai_marker_class(human_checked=True)
