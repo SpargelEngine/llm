@@ -97,15 +97,15 @@ class WordTokenizer(Tokenizer):
         words: list[bytes],
         encode_range: tuple[int, int],
         *,
-        unknown: Optional[int] = None,
         text_splitter: TextSplitter = TrivialSplitter(),
+        unknown: Optional[int] = None,
     ):
         """
         Args:
-            tokens: list of words, with token id == index in list
+            words: list of words, with word id == index in list
             encode_range: in the form [start, end), indicating the range of words used to do encoding
+            text_splitter: the splitter used to cut the text before tokenizing (pre-tokenization)
             unknown: the token index for unknown word
-            text_splitter: the splitter used to cut the text before tokenizing
         """
 
         self.words = words
@@ -125,8 +125,8 @@ class WordTokenizer(Tokenizer):
 
         tokens = []
 
-        # split text into segmentsI
-        cuts = [0] + self.text_splitter.split(input) + [len(input)]
+        # split text into segments
+        cuts = self.text_splitter.split(input) + [len(input)]
 
         for i in range(len(cuts) - 1):
             start, end = cuts[i], cuts[i + 1]
