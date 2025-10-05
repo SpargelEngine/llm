@@ -1,28 +1,32 @@
 from functools import wraps
 
 
-def ai_marker(human_checked: bool = False, *, tag=None):
-    """This decorator marks a function that has AI-generated content."""
+def ai_marker(human_checked: bool = False):
+    def decorate(obj):
+        if isinstance(obj, type):
+            orig_init = obj.__init__
 
-    def decorate(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            if not human_checked:
-                raise Exception(
-                    f"{tag if tag is not None else func}: AI-generated content has not been marked as examined by human yet."
-                )
-            return func(*args, **kwargs)
+            @wraps(orig_init)
+            def wrapped_init(self, *args, **kwargs):
+                if not human_checked:
+                    raise Exception(
+                        f"{obj}: Class contains AI-generated content, which has not been marked as examined by human yet."
+                    )
+                return orig_init(self, *args, **kwargs)
 
-        return wrapper
+            obj.__init__ = wrapped_init
+            return obj
 
-    return decorate
+        else:
 
+            @wraps(obj)
+            def wrapper(*args, **kwargs):
+                if not human_checked:
+                    raise Exception(
+                        f"{obj}: Object contains AI-generated content, which has not been marked as examined by human yet."
+                    )
+                return obj(*args, **kwargs)
 
-def ai_marker_class(human_checked: bool = False):
-    """This decorator marks a class that has AI-generated content."""
-
-    def decorate(cls):
-        cls.__init__ = ai_marker(human_checked, tag=cls)(cls.__init__)
-        return cls
+            return wrapper
 
     return decorate

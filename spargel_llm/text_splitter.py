@@ -6,7 +6,7 @@ class TextSplitter(ABC):
     @abstractmethod
     def split(self, text: str) -> list[int]:
         """
-        Returns: a list of cut positions (excluding endpoints 0 and len(text))
+        Returns: a list of segment start positions
         """
         pass
 
@@ -16,7 +16,7 @@ class TrivialSplitter(TextSplitter):
 
     @override
     def split(self, text: str) -> list[int]:
-        return []
+        return [0]
 
 
 class FixedLengthSplitter(TextSplitter):
@@ -29,4 +29,4 @@ class FixedLengthSplitter(TextSplitter):
 
     @override
     def split(self, text: str) -> list[int]:
-        return list(range(self.length, len(text), self.length))
+        return list(range(0, len(text), self.length))

@@ -10,7 +10,7 @@ from spargel_llm.data import (
     WeightedDataSource,
 )
 from spargel_llm.datasets import FixedLengthDataset, PlainTextSource
-from spargel_llm.meta import ai_marker_class
+from spargel_llm.meta import ai_marker
 
 seed = time.time()
 # print("seed:", seed)
@@ -95,7 +95,7 @@ class TestPlainTextSource(unittest.TestCase):
             self.assertTrue(text.find(sampled_text) >= 0)
 
 
-@ai_marker_class(human_checked=True)
+@ai_marker(human_checked=True)
 class TestDataset(unittest.TestCase):
     def test_basic_functionality(self):
         random = Random(seed)
@@ -126,7 +126,7 @@ class TestDataset(unittest.TestCase):
             _ = dataset[-1]
 
 
-@ai_marker_class(human_checked=True)
+@ai_marker(human_checked=True)
 class TestFixedLengthDataset(unittest.TestCase):
     def test_basic_functionality(self):
         # Create a test sequence
@@ -211,7 +211,7 @@ class TestFixedLengthDataset(unittest.TestCase):
         self.assertEqual(dataset[2], [5, 6, 7, 8])
 
 
-@ai_marker_class(human_checked=True)
+@ai_marker(human_checked=True)
 class TestDataLoader(unittest.TestCase):
     def test_no_shuffle(self):
         random = Random(seed)
