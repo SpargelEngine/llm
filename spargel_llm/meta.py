@@ -2,6 +2,8 @@ from functools import wraps
 
 
 def ai_marker(human_checked: bool = False):
+    """Marks the code of the class/function as having AI-generated content."""
+
     def decorate(obj):
         if isinstance(obj, type):
             orig_init = obj.__init__

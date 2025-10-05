@@ -88,9 +88,21 @@ def _count_pairs_in_seqs(seqs: Iterable[Sequence[int]]) -> Counter[tuple[int, in
     return Counter(pairs(seqs))
 
 
+def find_most_frequent_pair(seqs: Iterable[Sequence[int]]) -> tuple[int, int, int]:
+    counter = _count_pairs_in_seqs(seqs)
+
+    most_common = counter.most_common(1)
+    if len(most_common) == 0:
+        return 0, 0, 0
+    else:
+        pair, cnt = most_common[0]
+        return *pair, cnt
+
+
+# experimental: it behaves even worse
 @ai_marker(human_checked=True)
-def find_most_frequent_pair(
-    samples: Iterable[Sequence[int]],
+def find_most_frequent_pair_parallel(
+    seqs: Iterable[Sequence[int]],
     *,
     num_processes: Optional[int] = None,
 ) -> tuple[int, int, int]:
@@ -102,9 +114,9 @@ def find_most_frequent_pair(
     Return:
         id1, id2, freq: the most frequent pair and its frequency (return freq = 0 when no pairs)
     """
-    samples_list = list(samples)
+    seqs_list = list(seqs)
 
-    if len(samples_list) == 0:
+    if len(seqs_list) == 0:
         return 0, 0, 0
 
     # Use all available CPUs if not specified
@@ -112,16 +124,21 @@ def find_most_frequent_pair(
         num_processes = multiprocessing.cpu_count()
 
     # For small datasets, use sequential processing to avoid overhead
-    if num_processes == 1 or len(samples_list) < num_processes:
-        counter = _count_pairs_in_seqs(samples_list)
+    if num_processes == 1 or len(seqs_list) < num_processes:
+        counter = _count_pairs_in_seqs(seqs_list)
     else:
         # Split samples into chunks
-        chunk_size = len(samples_list) // num_processes
+        chunk_size = len(seqs_list) // num_processes
 
         chunks = [
-            samples_list[i : i + chunk_size]
-            for i in range(0, len(samples_list), chunk_size)
+            seqs_list[i : i + chunk_size] for i in range(0, len(seqs_list), chunk_size)
         ]
+
+        # Keep len(chunks) == num_processes
+        if len(chunks) == num_processes + 1:
+            last_chunk = chunks.pop()
+            for i, seq in enumerate(last_chunk):
+                chunks[i].append(seq)
 
         # Process chunks in parallel
         with ProcessPoolExecutor(max_workers=num_processes) as executor:
