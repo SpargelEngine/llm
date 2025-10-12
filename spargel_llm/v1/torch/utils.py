@@ -14,6 +14,7 @@ from .model import LLM, Config
 class TrainInfo(BaseModel):
     trained_steps: NonNegativeInt = 0
     trained_time: NonNegativeFloat = 0
+    trained_tokens: NonNegativeInt = 0
 
 
 class TokenInfo(BaseModel):
@@ -58,6 +59,7 @@ def train(
     log_period: int = 100,
     max_steps: int = 0,
     loss_callback: Optional[Callable[[int, float], None]] = None,
+    epoch_callback: Optional[Callable[[], None]] = None,
 ):
     print(16 * "=")
 
@@ -125,10 +127,6 @@ def train(
                 pad_index=pad_index,
             )
 
-            step += 1
-            total_steps += 1
-            info.trained_steps += 1
-
             t = time.perf_counter()
             delta_t = t - t_last
             t_last = t
@@ -137,6 +135,13 @@ def train(
 
             sum_of_loss += loss.item()
 
+            step += 1
+            total_steps += 1
+            info.trained_steps += 1
+
+            info.trained_tokens += batch_size * seq_len
+
+            # log the average loss from last time
             if step % log_period == 0:
                 avg_of_loss = sum_of_loss / log_period
 
@@ -156,6 +161,10 @@ def train(
         print(f"Epoch time: {t_epoch_end - t_epoch_start:.6f}")
         print(f"Total steps: {info.trained_steps}")
         print(f"Total time: {info.trained_time:.6f}")
+
+        if epoch_callback is not None:
+            epoch_callback()
+
         print()
 
         if stop_all:
