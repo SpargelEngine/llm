@@ -31,7 +31,8 @@ class PositionalEncodingLearned(nn.Module):
 
         self.max_seq_len = max_seq_len
         self.dim = dim
-        self.pe = nn.Parameter(torch.rand(max_seq_len, dim))
+        self.pe = nn.Parameter(torch.empty(max_seq_len, dim))
+        nn.init.xavier_uniform_(self.pe)
 
     @override
     def forward(self, x: Tensor) -> Tensor:
@@ -92,6 +93,10 @@ class PositionalEncoding(nn.Module):
 
         return x
 
+    @override
+    def extra_repr(self) -> str:
+        return f"max_seq_len={self.max_seq_len}, dim={self.dim}"
+
 
 class LayerNorm(nn.Module):
     """
@@ -103,6 +108,7 @@ class LayerNorm(nn.Module):
 
     eps = 1e-5
 
+    scale_and_shift: bool
     scale: Optional[nn.Parameter]
     shift: Optional[nn.Parameter]
 
@@ -113,6 +119,8 @@ class LayerNorm(nn.Module):
         """
 
         super().__init__()
+
+        self.scale_and_shift = scale_and_shift
 
         if scale_and_shift:
             self.scale = nn.Parameter(torch.ones(dim))
@@ -126,10 +134,14 @@ class LayerNorm(nn.Module):
         var = x.var(dim=-1, keepdim=True)
         normalized = (x - mean) / torch.sqrt(var + self.eps)
 
-        if self.scale is not None and self.shift is not None:
+        if self.scale_and_shift and self.scale is not None and self.shift is not None:
             return self.scale * normalized + self.shift
         else:
             return normalized
+
+    @override
+    def extra_repr(self) -> str:
+        return f"scale_and_shift={self.scale_and_shift}"
 
 
 def scaled_dot_product(
@@ -195,6 +207,10 @@ class Attention(nn.Module):
     """
 
     cnt_head: int
+    d_in: int
+    d_out: int
+    d_key: int
+    d_value: int
     is_scaled: bool
     is_causal: bool
 
@@ -227,13 +243,27 @@ class Attention(nn.Module):
         super().__init__()
 
         self.cnt_head = cnt_head
+        self.d_in = d_in
+        self.d_out = d_out
+        self.d_key = d_key
+        self.d_value = d_value
+
         self.is_scaled = is_scaled
         self.is_causal = is_causal
 
-        self.W_q = nn.Parameter((torch.rand(cnt_head, d_in, d_key) - 0.5) * 1)  # TODO
-        self.W_k = nn.Parameter((torch.rand(cnt_head, d_in, d_key) - 0.5) * 1)
-        self.W_v = nn.Parameter((torch.rand(cnt_head, d_in, d_value) - 0.5) * 1)
-        self.W_o = nn.Parameter((torch.rand(cnt_head, d_value, d_out) - 0.5) * 1)
+        self.W_q = nn.Parameter(torch.empty(cnt_head, d_in, d_key))
+        self.W_k = nn.Parameter(torch.empty(cnt_head, d_in, d_key))
+        self.W_v = nn.Parameter(torch.empty(cnt_head, d_in, d_value))
+        self.W_o = nn.Parameter(torch.empty(cnt_head, d_value, d_out))
+
+        def _xavier_init(W: Tensor, d1: int, d2: int):
+            a = math.sqrt(6 / (d1 + d2))
+            nn.init._no_grad_uniform_(W, -a, +a)
+
+        _xavier_init(self.W_q, d_in, cnt_head * d_key)
+        _xavier_init(self.W_k, d_in, cnt_head * d_key)
+        _xavier_init(self.W_v, d_in, cnt_head * d_value)
+        _xavier_init(self.W_o, cnt_head * d_value, d_out)
 
     @override
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
@@ -285,6 +315,10 @@ class Attention(nn.Module):
         # W_o: (cnt_h, d_value, d_out)
         return torch.einsum("ijk, ...ilj -> ...lk", self.W_o, values)
 
+    @override
+    def extra_repr(self) -> str:
+        return f"cnt_head={self.cnt_head}, d_in={self.d_in}, d_out={self.d_out}, d_key={self.d_key}, d_value={self.d_value}, is_scaled={self.is_scaled}, is_causal={self.is_causal}"
+
 
 class FeedForward(nn.Module):
     """Fully connected feed-forward layers
@@ -295,10 +329,16 @@ class FeedForward(nn.Module):
         (..., dim)
     """
 
+    dim: int
+    d_hidden: int
+
     layers: nn.Sequential
 
     def __init__(self, dim: int, d_hidden: int):
         super().__init__()
+
+        self.dim = dim
+        self.d_hidden = d_hidden
 
         self.layers = nn.Sequential(
             nn.Linear(dim, d_hidden),
@@ -309,3 +349,7 @@ class FeedForward(nn.Module):
     @override
     def forward(self, x: Tensor) -> Tensor:
         return self.layers(x)
+
+    @override
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}, d_hidden={self.d_hidden}"

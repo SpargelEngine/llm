@@ -41,7 +41,7 @@ def bpe_train(words: list[bytes], samples: Sequence[Sequence[int]], count: int):
 
     Args:
         words: the list of words, id == index; new words will be appended to it.
-        samples: from these we find pairs (will be modified while training)
+        samples: from these we find pairs
         count: number of new words to find (will stop early if no more pairs)
     """
 

@@ -128,6 +128,10 @@ class LLM(nn.Module):
 
         return x
 
+    @override
+    def extra_repr(self) -> str:
+        return str(self.config)
+
     def loss(
         self, input: Tensor, mask: Tensor, target: Tensor, pad_index: int
     ) -> Tensor:
