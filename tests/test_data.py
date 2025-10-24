@@ -1,15 +1,14 @@
-import string
 import time
 import unittest
 from random import Random
 
 from spargel_llm.data import (
-    DataLoader,
     GeneratedDataSource,
     ListDataset,
+    SliceDataSource,
     WeightedDataSource,
 )
-from spargel_llm.datasets import FixedLengthDataset, PlainTextSource
+from spargel_llm.datasets import FixedLengthDataset
 from spargel_llm.meta import ai_marker
 
 seed = time.time()
@@ -46,7 +45,9 @@ class TestWeightedSource(unittest.TestCase):
         random = Random(seed)
 
         n = random.randint(1, 100)
-        source = WeightedDataSource([(1, GeneratedDataSource(lambda _: n))])
+        source = WeightedDataSource(
+            [1], [GeneratedDataSource(lambda _: n)], random=random
+        )
         for x in source.sample_multiple(100):
             self.assertEqual(x, n)
 
@@ -55,44 +56,138 @@ class TestWeightedSource(unittest.TestCase):
 
         a, b = random.randint(1, 100), random.randint(1, 100)
         source = WeightedDataSource(
-            [
-                (1, GeneratedDataSource(lambda _: a)),
-                (2, GeneratedDataSource(lambda _: b)),
-            ]
+            [1, 2],
+            [GeneratedDataSource(lambda _: a), GeneratedDataSource(lambda _: b)],
+            random=random,
         )
         for x in source.sample_multiple(100):
             self.assertIn(x, [a, b])
 
 
-class TestPlainTextSource(unittest.TestCase):
-    def _generate_text(self, random: Random, length: int) -> str:
-        return "".join(
-            random.choices(
-                string.ascii_letters + string.digits + string.punctuation, k=length
-            )
-        )
+@ai_marker(human_checked=True)
+class TestSliceDataSource(unittest.TestCase):
+    def test_fixed_length_slices(self):
+        """Test slices with fixed length (min_len == max_len)"""
+        random = Random(seed)
+        seq = list(range(100))
+        slice_len = 10
 
-    def test_fixed_length(self):
+        source = SliceDataSource(seq, slice_len, slice_len, random=random)
+
+        for _ in range(50):
+            slice_result = source.sample()
+            self.assertEqual(len(slice_result), slice_len)
+            # Verify slice is a valid subsequence
+            self.assertTrue(all(x in seq for x in slice_result))
+
+        source = SliceDataSource(seq, slice_len, random=random)
+
+        for _ in range(50):
+            slice_result = source.sample()
+            self.assertEqual(len(slice_result), slice_len)
+            self.assertTrue(all(x in seq for x in slice_result))
+
+    def test_variable_length_slices(self):
+        """Test slices with variable length (min_len != max_len)"""
+        random = Random(seed)
+        seq = list(range(50))
+        min_len, max_len = 5, 15
+
+        source = SliceDataSource(seq, min_len, max_len, random=random)
+
+        for _ in range(50):
+            slice_result = source.sample()
+            self.assertTrue(min_len <= len(slice_result) <= max_len)
+            # Verify slice is a valid subsequence
+            self.assertTrue(all(x in seq for x in slice_result))
+
+    def test_boundary_conditions(self):
+        """Test slices at sequence boundaries"""
+        random = Random(seed)
+        seq = list(range(20))
+
+        # Test minimum possible slice
+        source_min = SliceDataSource(seq, 1, 1, random=random)
+        for _ in range(20):
+            slice_result = source_min.sample()
+            self.assertEqual(len(slice_result), 1)
+
+        # Test maximum possible slice
+        source_max = SliceDataSource(seq, 20, 20, random=random)
+        for _ in range(5):
+            slice_result = source_max.sample()
+            self.assertEqual(len(slice_result), 20)
+            self.assertEqual(slice_result, seq)
+
+    def test_different_sequence_types(self):
+        """Test with different sequence types (list and string)"""
         random = Random(seed)
 
-        text_length = random.randint(16, 1000)
-        text = self._generate_text(random, text_length)
+        # Test with list
+        list_seq = list(range(30))
+        list_source = SliceDataSource(list_seq, 5, 10, random=random)
+        for _ in range(20):
+            slice_result = list_source.sample()
+            self.assertTrue(isinstance(slice_result, list))
+            self.assertTrue(5 <= len(slice_result) <= 10)
 
-        sample_length = random.randint(1, text_length // 16)
-        source = PlainTextSource(text, sample_length, random=random)
-        for sampled_text in source.sample_multiple(100):
-            self.assertTrue(text.find(sampled_text) >= 0)
-            self.assertEqual(len(sampled_text), sample_length)
+        # Test with string
+        string_seq = "abcdefghijklmnopqrstuvwxyz"
+        string_source = SliceDataSource(string_seq, 3, 7, random=random)
+        for _ in range(20):
+            slice_result = string_source.sample()
+            self.assertTrue(isinstance(slice_result, str))
+            self.assertTrue(3 <= len(slice_result) <= 7)
+            self.assertTrue(all(c in string_seq for c in slice_result))
 
-    def test(self):
+    def test_randomness(self):
+        """Test that multiple samples produce different results"""
         random = Random(seed)
+        seq = list(range(100))
 
-        text_length = random.randint(16, 1000)
-        text = self._generate_text(random, text_length)
+        source = SliceDataSource(seq, 10, 20, random=random)
 
-        source = PlainTextSource(text, 1, text_length // 16, random=random)
-        for sampled_text in source.sample_multiple(100):
-            self.assertTrue(text.find(sampled_text) >= 0)
+        # Collect multiple samples
+        samples = [source.sample() for _ in range(20)]
+
+        # Check that we have some variation in slice positions
+        start_positions = [sample[0] for sample in samples]
+        self.assertTrue(len(set(start_positions)) > 1)
+
+        # Check that we have some variation in slice lengths
+        lengths = [len(sample) for sample in samples]
+        self.assertTrue(len(set(lengths)) > 1)
+
+    def test_parameter_validation(self):
+        """Test that invalid parameters raise assertions"""
+        seq = list(range(10))
+
+        # Test invalid min_len
+        with self.assertRaises(AssertionError):
+            SliceDataSource(seq, -1, 5)
+
+        # Test invalid max_len > sequence length
+        with self.assertRaises(AssertionError):
+            SliceDataSource(seq, 5, 15)
+
+        # Test invalid min_len > max_len
+        with self.assertRaises(AssertionError):
+            SliceDataSource(seq, 8, 5)
+
+    def test_sample_multiple(self):
+        """Test sample_multiple method"""
+        random = Random(seed)
+        seq = list(range(50))
+
+        source = SliceDataSource(seq, 5, 10, random=random)
+
+        # Test sampling multiple slices
+        samples = list(source.sample_multiple(10))
+        self.assertEqual(len(samples), 10)
+
+        for sample in samples:
+            self.assertTrue(5 <= len(sample) <= 10)
+            self.assertTrue(all(x in seq for x in sample))
 
 
 @ai_marker(human_checked=True)
@@ -209,107 +304,6 @@ class TestFixedLengthDataset(unittest.TestCase):
         self.assertEqual(dataset[0], [1, 2, 3, 4])
         self.assertEqual(dataset[1], [3, 4, 5, 6])
         self.assertEqual(dataset[2], [5, 6, 7, 8])
-
-
-@ai_marker(human_checked=True)
-class TestDataLoader(unittest.TestCase):
-    def test_no_shuffle(self):
-        random = Random(seed)
-
-        # Create dataset with predictable data
-        data = list(range(10))
-        dataset = ListDataset(data)
-
-        # Test DataLoader without shuffling
-        dataloader = DataLoader(dataset, shuffle=False, random=random)
-
-        # Should iterate in order
-        for i, item in enumerate(dataloader):
-            self.assertEqual(item, i)
-
-        # Test multiple iterations
-        items = list(dataloader)
-        self.assertEqual(items, list(range(10)))
-
-        # Test explicit iteration
-        dataloader = DataLoader(dataset, shuffle=False, random=random)
-        collected = []
-        for item in dataloader:
-            collected.append(item)
-        self.assertEqual(collected, list(range(10)))
-
-    def test_with_shuffle(self):
-        random = Random(seed)
-
-        # Create dataset
-        data = list(range(100))
-        dataset = ListDataset(data)
-
-        # Test DataLoader with shuffling
-        dataloader = DataLoader(dataset, shuffle=True, random=random)
-
-        # Should contain all items but in random order
-        items = list(dataloader)
-        self.assertEqual(len(items), 100)
-        self.assertEqual(set(items), set(range(100)))
-
-        # Order should be different from original
-        self.assertNotEqual(items, list(range(100)))
-
-    def test_empty_dataset(self):
-        random = Random(seed)
-
-        # Test with empty dataset
-        dataset = ListDataset([])
-        dataloader = DataLoader(dataset, random=random)
-
-        # Should immediately raise StopIteration
-        with self.assertRaises(StopIteration):
-            next(iter(dataloader))
-
-        # Should work with list()
-        items = list(dataloader)
-        self.assertEqual(items, [])
-
-    def test_single_item(self):
-        random = Random(seed)
-
-        # Test with single item dataset
-        dataset = ListDataset([42])
-        dataloader = DataLoader(dataset, random=random)
-
-        items = list(dataloader)
-        self.assertEqual(items, [42])
-
-        # Test with shuffling (should still return the single item)
-        dataloader_shuffled = DataLoader(dataset, shuffle=True, random=random)
-        items_shuffled = list(dataloader_shuffled)
-        self.assertEqual(items_shuffled, [42])
-
-    def test_multiple_iterations(self):
-        random = Random(seed)
-
-        data = list(range(100))
-        dataset = ListDataset(data)
-
-        # Test multiple iterations without shuffle (should be identical)
-        dataloader = DataLoader(dataset, shuffle=False, random=random)
-        first_pass = list(dataloader)
-        second_pass = list(dataloader)
-        self.assertEqual(first_pass, second_pass)
-        self.assertEqual(first_pass, list(range(100)))
-
-        # Test multiple iterations with shuffle (should be different each time)
-        dataloader_shuffled = DataLoader(dataset, shuffle=True, random=random)
-        first_shuffled = list(dataloader_shuffled)
-        second_shuffled = list(dataloader_shuffled)
-
-        # Both should contain all items
-        self.assertEqual(set(first_shuffled), set(range(100)))
-        self.assertEqual(set(second_shuffled), set(range(100)))
-
-        # Order should be different between iterations (very high probability)
-        self.assertNotEqual(first_shuffled, second_shuffled)
 
 
 if __name__ == "__main__":

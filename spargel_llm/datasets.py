@@ -1,77 +1,50 @@
 from random import Random
-from typing import Callable, Optional, Sequence, override
+from typing import Callable, Optional, Sequence
 from warnings import deprecated
 
-from spargel_llm.data import DataSource
-
 from .data import Dataset
+from .meta import ai_marker
 from .tokenizer import Tokenizer
 
 
-class PlainTextSource(DataSource[str]):
-    """Data source that samples from a given text.
-
-    Sampled text will have a length equally distributed between [min_len, max_len],
-    and a position equally distributed in the possible positions.
-    """
-
-    _text: str
-    _min_len: int
-    _max_len: int
-    _random: Random
-
-    def __init__(
-        self,
-        text: str,
-        min_len: int,
-        max_len: int | None = None,
-        *,
-        random: Random = Random(),
-    ):
-        """
-        Args:
-            text (str): the text to sample from
-            min_len (int): minimum length for sampled text
-            max_len (int | None): maximum length for sampled text; equal to min_len if not provided
-        """
-
-        if max_len is None:
-            max_len = min_len
-
-        assert min_len >= 0 and max_len >= min_len and max_len <= len(text)
-
-        self._text = text
-        self._random = random
-        self._min_len, self._max_len = min_len, max_len
-
-    @override
-    def sample(self) -> str:
-        if self._min_len != self._max_len:
-            length = self._random.randint(self._min_len, self._max_len)
-        else:
-            length = self._min_len
-
-        start = self._random.randint(0, len(self._text) - length)
-        return self._text[start : start + length]
+type PadFunc[T] = Optional[Callable[[list[T], int], None]]
 
 
+@ai_marker(human_checked=True)
 class FixedLengthDataset[T](Dataset[list[T]]):
     seq: list[T]
     length: int
     stride: int
     offset: int
+    allow_incomplete: bool
+    pad_func: PadFunc[T]
 
     _count: int
 
-    def __init__(self, seq: Sequence[T], length: int, stride: int = 1, offset: int = 0):
-        assert length > 0 and length <= len(seq)
+    def __init__(
+        self,
+        seq: Sequence[T],
+        length: int,
+        stride: int = 1,
+        offset: int = 0,
+        allow_incomplete: bool = False,
+        pad_func: PadFunc[T] = None,
+    ):
+        assert length > 0
+        if not allow_incomplete:
+            assert length <= len(seq)
 
         self.seq = list(seq)
         self.length = length
         self.stride = stride
         self.offset = offset
+        self.allow_incomplete = allow_incomplete
+        self.pad_func = pad_func
 
-        self._count = (len(seq) - offset - length) // stride + 1
+        if allow_incomplete:
+            self._count = max(0, (len(seq) - offset + stride - 1) // stride)
+        else:
+            self._count = max(0, (len(seq) - offset - length) // stride + 1)
 
     def __len__(self) -> int:
         return self._count
@@ -81,7 +54,27 @@ class FixedLengthDataset[T](Dataset[list[T]]):
             raise IndexError
 
         start = self.offset + index * self.stride
-        return self.seq[start : start + self.length]
+        end = start + self.length
+
+        subseq = self.seq[start:end]
+
+        if (
+            self.allow_incomplete
+            and self.pad_func is not None
+            and len(subseq) < self.length
+        ):
+            self.pad_func(subseq, self.length)
+
+        return subseq
+
+
+def pad_simple(
+    seq: list[int], length: int, pad_index: int, end_index: Optional[int] = None
+):
+    if len(seq) < length:
+        if end_index is not None:
+            seq.append(end_index)
+        seq.extend(pad_index for _ in range(length - len(seq)))
 
 
 @deprecated("should use TokenizedTextSource instead")
