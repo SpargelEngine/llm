@@ -1,11 +1,9 @@
-from random import Random
 from typing import Callable, Optional, Sequence
 from warnings import deprecated
 
 from .data import Dataset
 from .meta import ai_marker
 from .tokenizer import Tokenizer
-
 
 type PadFunc[T] = Optional[Callable[[list[T], int], None]]
 

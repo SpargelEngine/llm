@@ -6,7 +6,7 @@ from spargel_llm.tokenizer import ByteTokenizer, UnicodeTokenizer
 class TestByteTokenizer(unittest.TestCase):
     def test_vocab_size(self):
         t = ByteTokenizer()
-        self.assertEqual(t.vocab_size, 256)
+        self.assertEqual(t.vocab_size(), 256)
 
     def test_encode(self):
         t = ByteTokenizer()
@@ -22,13 +22,13 @@ class TestByteTokenizer(unittest.TestCase):
 class TestUnicodeTokenizer(unittest.TestCase):
     def test_basic(self):
         t = UnicodeTokenizer([])
-        self.assertEqual(t.vocab_size, 0)
+        self.assertEqual(t.vocab_size(), 0)
 
         t = UnicodeTokenizer(["a", "b", "c"])
-        self.assertEqual(t.vocab_size, 3)
+        self.assertEqual(t.vocab_size(), 3)
 
         t = UnicodeTokenizer(["a", "b", "c"], unknown=1)
-        self.assertEqual(t.vocab_size, 3)
+        self.assertEqual(t.vocab_size(), 3)
 
     def test_encode(self):
         t = UnicodeTokenizer(list("0123456789"))

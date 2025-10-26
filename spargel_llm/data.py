@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
 from random import Random
-from typing import Callable, Iterable, Iterator, Sequence, Sized, override
-from warnings import deprecated
+from typing import Callable, Iterable, Iterator, Sequence, override
 
 from .typing import Sliceable
 
@@ -16,6 +15,22 @@ class DataSource[T](ABC):
         assert count >= 0
         for _ in range(count):
             yield self.sample()
+
+
+class SeqDataSource[T](DataSource[T]):
+    data: Sequence[T]
+    random: Random
+
+    def __init__(self, data: Sequence[T], *, random: Random = Random()):
+        assert len(data) > 0
+
+        self.data = data
+        self.random = random
+
+    @override
+    def sample(self) -> T:
+        index = self.random.randint(0, len(self.data) - 1)
+        return self.data[index]
 
 
 class GeneratedDataSource[T](DataSource[T]):
@@ -42,19 +57,19 @@ class WeightedDataSource[T](DataSource[T]):
     Each time, one of the sources is randomly chosen according to the provided weights.
     """
 
-    weights: Sequence[float]
     sources: Sequence[DataSource[T]]
+    weights: Sequence[float]
     random: Random
 
     def __init__(
         self,
-        weights: Sequence[float],
         sources: Sequence[DataSource[T]],
+        weights: Sequence[float],
         *,
         random: Random = Random(),
     ):
-        self.weights = weights
         self.sources = sources
+        self.weights = weights
         self.random = random
 
         assert all(weight >= 0 for weight in weights) and sum(weights) > 0.0
@@ -99,15 +114,16 @@ class SliceDataSource[S: Sliceable](DataSource[S]):
     @override
     def sample(self) -> S:
         if self.min_len == self.max_len:
-            l = self.min_len
+            length = self.min_len
         else:
-            l = self.random.randint(self.min_len, self.max_len)
+            length = self.random.randint(self.min_len, self.max_len)
 
-        index = self.random.randint(0, len(self.seq) - l)
+        index = self.random.randint(0, len(self.seq) - length)
 
-        return self.seq[index : index + l]
+        return self.seq[index : index + length]
 
 
+# deprecated
 class Dataset[T](ABC):
     @abstractmethod
     def __len__(self) -> int: ...
@@ -132,7 +148,7 @@ class ListDataset[T](Dataset[T]):
         return self.data[index]
 
 
-@deprecated("no need for this?")
+# deprecated
 class DataLoader[T](Iterator[T]):
     datasets: list[Dataset[T]]
     shuffle: bool

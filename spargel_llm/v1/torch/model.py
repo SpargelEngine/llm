@@ -132,6 +132,9 @@ class LLM(nn.Module):
     def extra_repr(self) -> str:
         return str(self.config)
 
+    def embed(self, token: Tensor) -> Tensor:
+        return self.token_embedding(token)
+
     def loss(
         self, input: Tensor, mask: Tensor, target: Tensor, pad_index: int
     ) -> Tensor:

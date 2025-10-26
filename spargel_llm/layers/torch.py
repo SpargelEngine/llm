@@ -178,18 +178,18 @@ def scaled_dot_product(
     scores = torch.einsum("...ik, ...jk -> ...ij", Q, K)
 
     if mask is not None:
-        scores = scores.masked_fill(mask, -torch.inf)
+        scores = scores.masked_fill(mask, scores.new_tensor(float("-inf")))
 
     if is_scaled:
         weights = torch.softmax(scores / math.sqrt(d_key), dim=-1)
     else:
         weights = torch.softmax(scores, dim=-1)
 
-    # get rid of NaN
-    if mask is not None:
-        weights = weights.masked_fill(mask, 0.0)
-
-    # print(weights)
+    # LEGACY
+    # Get rid of possible NaN,
+    # since NaN * 0.0 = NaN and therefore cannot be eliminated.
+    # if mask is not None:
+    #     weights = weights.masked_fill(mask, 0.0)
 
     result = weights @ V
 
@@ -205,6 +205,8 @@ class Attention(nn.Module):
     Returns:
         (..., seq_len, d_out)
     """
+
+    cnt = 0
 
     cnt_head: int
     d_in: int
@@ -291,23 +293,25 @@ class Attention(nn.Module):
         if self.is_causal:
             # (seq_len, seq_len)
             causal_mask = torch.triu(
-                torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device),
+                diagonal=1,
             )
             if mask is not None:
                 # (..., seq_len, seq_len)
-                mask = mask.unsqueeze(-2) | mask.unsqueeze(-1) | causal_mask
+                mask = mask.unsqueeze(-2) | causal_mask
             else:
                 mask = causal_mask
         else:
             if mask is not None:
-                mask = mask.unsqueeze(-2) | mask.unsqueeze(-1)
+                mask = mask.unsqueeze(-2)
             else:
                 mask = None
 
-        # mask: (..., seq_len, seq_len) | (seq_len, seq_len) | None
+        # mask: (..., seq_len, seq_len) | (seq_len, seq_len) | (..., 1, seq_len) | None
         if mask is not None:
+            # broadcase to all heads
             mask = mask.unsqueeze(-3)
-        # mask: (..., 1, seq_len, seq_len) | (1, seq_len, seq_len) | None
+        # mask: (..., 1, seq_len, seq_len) | (1, seq_len, seq_len) | (..., 1, 1, seq_len) | None
 
         values = scaled_dot_product(Q, K, V, mask=mask, is_scaled=self.is_scaled)
 

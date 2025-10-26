@@ -5,37 +5,47 @@
 import time
 from typing import Sequence
 
-from .bpe import find_most_frequent_pair
+from .bpe import find_most_frequent_pair, find_most_frequent_pair_parallel
 from .tokenizer import Tokenizer
 
 
-def _apply_merge(seq: Sequence[int], id1: int, id2: int, new_id: int):
+def apply_merge(seq: list[int], id1: int, id2: int, new_id: int):
     """
     Find all adjacent pairs of (id1, id2) in a sequence and replace them with new_id.
     """
 
     # no pairs: nothing to do
     if len(seq) <= 1:
-        return list(seq)
+        return
 
-    result: list[int] = []
-
+    # We do the merging in place so no extra memory allocation is needed.
+    # There won't be any RAW (Read After Write) since we always have pos <= cursor.
+    cursor = 0
     pos = 0
-    while pos < len(seq) - 1:
-        if seq[pos] == id1 and seq[pos + 1] == id2:
-            result.append(new_id)
-            pos += 2
+    while cursor < len(seq) - 1:
+        if seq[cursor] == id1 and seq[cursor + 1] == id2:
+            seq[pos] = new_id
+            cursor += 2
         else:
-            result.append(seq[pos])
-            pos += 1
+            seq[pos] = seq[cursor]
+            cursor += 1
+        pos += 1
 
-    if pos == len(seq) - 1:
-        result.append(seq[pos])
+    # last one
+    if cursor == len(seq) - 1:
+        seq[pos] = seq[cursor]
+        pos += 1
 
-    return result
+    del seq[pos:]
 
 
-def bpe_train(words: list[bytes], samples: Sequence[Sequence[int]], count: int):
+def bpe_train(
+    words: list[bytes],
+    samples: Sequence[Sequence[int]],
+    count: int,
+    *,
+    parallel: bool = False,
+):
     """
     Find frequent pairs and replace them with new words.
 
@@ -45,7 +55,7 @@ def bpe_train(words: list[bytes], samples: Sequence[Sequence[int]], count: int):
         count: number of new words to find (will stop early if no more pairs)
     """
 
-    samples_list = list(samples)
+    samples_list = list(list(sample) for sample in samples)
 
     for _ in range(count):
 
@@ -53,7 +63,10 @@ def bpe_train(words: list[bytes], samples: Sequence[Sequence[int]], count: int):
 
         new_id = len(words)
 
-        id1, id2, freq = find_most_frequent_pair(samples_list)
+        if parallel:
+            id1, id2, freq = find_most_frequent_pair_parallel(samples_list)
+        else:
+            id1, id2, freq = find_most_frequent_pair(samples_list)
 
         if freq == 0:
             print("No more pairs. Stopping.")
@@ -63,8 +76,8 @@ def bpe_train(words: list[bytes], samples: Sequence[Sequence[int]], count: int):
 
         words.append(new_word)
 
-        for i, sample in enumerate(samples_list):
-            samples_list[i] = _apply_merge(sample, id1, id2, new_id)
+        for sample in samples_list:
+            apply_merge(sample, id1, id2, new_id)
 
         t_end = time.perf_counter()
 
@@ -74,19 +87,21 @@ def bpe_train(words: list[bytes], samples: Sequence[Sequence[int]], count: int):
 
 
 def demo_tokenization(
-    text: str,
     tokenizer: Tokenizer,
+    text: str,
     *,
-    color_codes: Sequence[str] = ["\033[40;37m", "\033[47;30m"],
+    color_codes: Sequence[str] = ["\033[40;97m", "\033[107;30m"],
 ):
     num_colors = len(color_codes)
 
     tokens = tokenizer.encode(text)
 
+    print("Number of tokens:", len(tokens))
+
     for i, token in enumerate(tokens):
         if num_colors > 0:
             print(color_codes[i % num_colors], end="")
-            print(tokenizer.decode([token]), end="")
+        print(tokenizer.decode([token]), end="")
 
     if num_colors > 0:
         print("\033[0m", end="")
