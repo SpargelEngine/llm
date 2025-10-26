@@ -1,38 +1,72 @@
 import time
-from typing import Callable, Optional
+from collections import namedtuple
+from typing import Callable, Iterator, Optional, cast, override
 
 import torch
-import torch.optim as optim
 from pydantic import BaseModel, NonNegativeFloat, NonNegativeInt
 from torch import Tensor
+from torch.optim import Optimizer
+from torch.utils.data import DataLoader, IterableDataset
 
-from spargel_llm.data import DataLoader
+from spargel_llm.data import DataSource
 
-from .model import LLM, Config
+from .model import LLM
 
 
 class TrainInfo(BaseModel):
-    trained_steps: NonNegativeInt = 0
-    trained_time: NonNegativeFloat = 0
-    trained_tokens: NonNegativeInt = 0
+    time: NonNegativeFloat = 0
+    token_count: NonNegativeInt = 0
 
 
-class TokenInfo(BaseModel):
-    vocab: list[str] = []
-    pad: NonNegativeInt = 0
-    unknown: NonNegativeInt = 0
+Sample = namedtuple("Sample", ["input", "mask", "target"])
 
 
-class ModelInfo(BaseModel):
-    train_info: TrainInfo
-    token_info: TokenInfo
-    config: Config
+class TrainDataset(IterableDataset[Sample]):
+    data_source: DataSource[list[int]]
+    seq_len: int
+    pad_index: int
+
+    def __init__(
+        self, data_source: DataSource[list[int]], seq_len: int, pad_index: int
+    ):
+        self.data_source = data_source
+        self.seq_len = seq_len
+        self.pad_index = pad_index
+
+    @override
+    def __iter__(self) -> Iterator[Sample]:
+
+        def generator():
+            while True:
+                tokens = self.data_source.sample()
+
+                if len(tokens) == 0:
+                    continue
+
+                length = len(tokens) - 1
+
+                input = torch.tensor(
+                    tokens[:-1] + (self.seq_len - length) * [self.pad_index],
+                    dtype=torch.int,
+                )
+                mask = torch.tensor(
+                    length * [False] + (self.seq_len - length) * [True],
+                    dtype=torch.bool,
+                )
+                target = torch.tensor(
+                    tokens[1:] + (self.seq_len - length) * [self.pad_index],
+                    dtype=torch.int,
+                )
+
+                yield Sample(input=input, mask=mask, target=target)
+
+        return iter(generator())
 
 
 @torch.compile
 def train_step(
     model: LLM,
-    optimizer: optim.Optimizer,
+    optimizer: Optimizer,
     inputs: Tensor,
     masks: Tensor,
     targets: Tensor,
@@ -46,128 +80,90 @@ def train_step(
     return loss
 
 
+@torch.compile
+def generate_step(model: LLM, input: Tensor) -> Tensor:
+    return model(input)
+
+
 def train(
     info: TrainInfo,
     model: LLM,
-    optimizer: optim.Optimizer,
-    data_loader: DataLoader[list[int]],  # tokens
     seq_len: int,
+    optimizer: Optimizer,
+    data_source: DataSource[list[int]],  # tokens
     pad_index: int,
     batch_size: int,
-    epochs: int,
+    steps: int,
     *,
-    log_period: int = 100,
-    max_steps: int = 0,
-    loss_callback: Optional[Callable[[int, float], None]] = None,
-    epoch_callback: Optional[Callable[[], None]] = None,
+    device: str = "cpu",
+    log_period: int = 10,
+    loss_callback: Optional[Callable[[int, int, float], None]] = None,
+    save_period: int = 100,
+    save_callback: Optional[Callable[[], None]] = None,
 ):
-    print(16 * "=")
+    data_loader = DataLoader(
+        TrainDataset(data_source, seq_len, pad_index), batch_size=batch_size
+    )
+    iterator = iter(data_loader)
 
-    total_steps = 0
-    stop_all = False
+    sum_of_time = 0
+    sum_of_loss = 0.0
+    total_token_count = 0
+    t_start = t_last = time.perf_counter()
 
-    for epoch in range(epochs):
-        print(f"Epoch {epoch}:")
+    for step in range(1, steps + 1):
 
-        t_epoch_start = t_last = time.perf_counter()
-
-        iterator = iter(data_loader)
-
-        step = 0
-
-        sum_of_time = 0
-        sum_of_loss = 0.0
-
-        while True:
-            if max_steps > 0 and total_steps >= max_steps:
-                stop_all = True
-                break
-
-            # prepare a batch of data
-            inputs = torch.zeros(batch_size, seq_len, dtype=torch.int)
-            masks = torch.zeros(batch_size, seq_len, dtype=torch.bool)
-            targets = torch.zeros(batch_size, seq_len, dtype=torch.int)
-
-            stop = False
-
-            for i in range(batch_size):
-                try:
-                    tokens = next(iterator)
-                except StopIteration:
-                    stop = True
-                    break
-
-                length = len(tokens) - 1
-
-                if length <= 0 or length > seq_len:
-                    raise ValueError("incorrect number of tokens")
-
-                inputs[i] = torch.tensor(
-                    tokens[:-1] + (seq_len - length) * [pad_index], dtype=torch.int
-                )
-                masks[i] = torch.tensor(
-                    length * [False] + (seq_len - length) * [True], dtype=torch.bool
-                )
-                targets[i] = torch.tensor(
-                    tokens[1:] + (seq_len - length) * [pad_index], dtype=torch.int
-                )
-
-            if stop:
-                break
-
-            # train
-            model.train()
-
-            loss = train_step(
-                model=model,
-                optimizer=optimizer,
-                inputs=inputs,
-                masks=masks,
-                targets=targets,
-                pad_index=pad_index,
-            )
-
-            t = time.perf_counter()
-            delta_t = t - t_last
-            t_last = t
-            info.trained_time += delta_t
-            sum_of_time += delta_t
-
-            sum_of_loss += loss.item()
-
-            step += 1
-            total_steps += 1
-            info.trained_steps += 1
-
-            info.trained_tokens += batch_size * seq_len
-
-            # log the average loss from last time
-            if step % log_period == 0:
-                avg_of_loss = sum_of_loss / log_period
-
-                print(f"  Step {step}: loss={avg_of_loss:.6f}, time={sum_of_time:.6f}")
-
-                if loss_callback is not None:
-                    loss_callback(info.trained_steps, avg_of_loss)
-
-                sum_of_time = 0
-                sum_of_loss = 0
-
-        t_epoch_end = time.perf_counter()
-
-        if stop_all:
-            print("(Stopped early due to max_steps.)")
-
-        print(f"Epoch time: {t_epoch_end - t_epoch_start:.6f}")
-        print(f"Total steps: {info.trained_steps}")
-        print(f"Total time: {info.trained_time:.6f}")
-
-        if epoch_callback is not None:
-            epoch_callback()
-
-        print()
-
-        if stop_all:
+        try:
+            inputs, masks, targets = cast(tuple[Tensor, Tensor, Tensor], next(iterator))
+        except StopIteration:
+            print("Stopping early because there are no more data.")
             break
 
-    print("Done.")
+        # train
+        model.train()
+
+        loss = train_step(
+            model=model,
+            optimizer=optimizer,
+            inputs=inputs.to(device),
+            masks=masks.to(device),
+            targets=targets.to(device),
+            pad_index=pad_index,
+        )
+
+        t = time.perf_counter()
+        delta_t = t - t_last
+        t_last = t
+        info.time += delta_t
+        sum_of_time += delta_t
+
+        sum_of_loss += loss.detach().item()
+
+        # count tokens (not paddings)
+        token_count = int(torch.sum(masks == False).item())
+        info.token_count += token_count
+        total_token_count += token_count
+
+        # log the average loss from last time
+        if step % log_period == 0:
+            avg_of_loss = sum_of_loss / log_period
+
+            print(f"  Step {step}: loss={avg_of_loss:.6f}, time={sum_of_time:.6f}")
+
+            if loss_callback is not None:
+                loss_callback(step, info.token_count, avg_of_loss)
+
+            sum_of_time = 0
+            sum_of_loss = 0
+
+        if save_callback is not None and step % save_period == 0:
+            save_callback()
+
+    t_end = time.perf_counter()
+
+    print()
+    if save_callback is not None:
+        save_callback()
+
+    print(f"time: {t_end - t_start:.6f}")
+    print(f"tokens: {total_token_count}")

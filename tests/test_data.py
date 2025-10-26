@@ -46,7 +46,7 @@ class TestWeightedSource(unittest.TestCase):
 
         n = random.randint(1, 100)
         source = WeightedDataSource(
-            [1], [GeneratedDataSource(lambda _: n)], random=random
+            [GeneratedDataSource(lambda _: n)], [1], random=random
         )
         for x in source.sample_multiple(100):
             self.assertEqual(x, n)
@@ -56,8 +56,8 @@ class TestWeightedSource(unittest.TestCase):
 
         a, b = random.randint(1, 100), random.randint(1, 100)
         source = WeightedDataSource(
-            [1, 2],
             [GeneratedDataSource(lambda _: a), GeneratedDataSource(lambda _: b)],
+            [1, 2],
             random=random,
         )
         for x in source.sample_multiple(100):

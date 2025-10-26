@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, override
+from typing import Optional, Sequence, override
 
 from .bpe import byte_pair_merge
 from .text_splitter import TextSplitter, TrivialSplitter
@@ -7,17 +7,13 @@ from .text_splitter import TextSplitter, TrivialSplitter
 
 class Tokenizer(ABC):
     @abstractmethod
-    def encode(self, input: str) -> list[int]:
-        pass
+    def encode(self, input: str) -> list[int]: ...
 
     @abstractmethod
-    def decode(self, tokens: list[int]) -> str:
-        pass
+    def decode(self, tokens: list[int]) -> str: ...
 
-    @property
     @abstractmethod
-    def vocab_size(self) -> int:
-        pass
+    def vocab_size(self) -> int: ...
 
 
 class ByteTokenizer(Tokenizer):
@@ -27,9 +23,8 @@ class ByteTokenizer(Tokenizer):
 
     @override
     def decode(self, tokens: list[int]) -> str:
-        return bytes(tokens).decode(encoding="utf-8")
+        return bytes(tokens).decode(encoding="utf-8", errors="ignore")
 
-    @property
     @override
     def vocab_size(self) -> int:
         return 256
@@ -72,7 +67,6 @@ class UnicodeTokenizer(Tokenizer):
         else:
             return "".join([self._itos[i] for i in tokens])
 
-    @property
     @override
     def vocab_size(self) -> int:
         return len(self.vocab)
@@ -84,8 +78,7 @@ class WordTokenizer(Tokenizer):
     and then dividing it into words according to the word list.
     """
 
-    words: list[bytes]
-    encode_range: tuple[int, int]
+    words: Sequence[bytes]
 
     unknown: Optional[int]
     text_splitter: TextSplitter
@@ -94,29 +87,29 @@ class WordTokenizer(Tokenizer):
 
     def __init__(
         self,
-        words: list[bytes],
-        encode_range: tuple[int, int],
+        words: Sequence[bytes],
         *,
+        encode_blacklist: Sequence[int] = [],
         text_splitter: TextSplitter = TrivialSplitter(),
         unknown: Optional[int] = None,
     ):
         """
         Args:
             words: list of words, with word id == index in list
-            encode_range: in the form [start, end), indicating the range of words used to do encoding
+            encode_blacklist: word (indices) that are not allowed to encode
             text_splitter: the splitter used to cut the text before tokenizing (pre-tokenization)
             unknown: the token index for unknown word
         """
 
         self.words = words
-        self.encode_range = encode_range
 
         self.unknown = unknown
         self.text_splitter = text_splitter
 
         self._word_to_id = {}
-        for i in range(*encode_range):
-            self._word_to_id[words[i]] = i
+        for i, word in enumerate(words):
+            if i not in encode_blacklist:
+                self._word_to_id[word] = i
 
     @override
     def encode(self, input: str) -> list[int]:
@@ -154,7 +147,6 @@ class WordTokenizer(Tokenizer):
             "utf-8", errors="ignore"
         )
 
-    @property
     @override
     def vocab_size(self) -> int:
         return len(self.words)
