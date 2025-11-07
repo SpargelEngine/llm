@@ -102,7 +102,7 @@ def find_most_frequent_pair(seqs: Iterable[Sequence[int]]) -> tuple[int, int, in
 # experimental: it behaves even worse
 @ai_marker(human_checked=True)
 def find_most_frequent_pair_parallel(
-    seqs: Iterable[Sequence[int]],
+    seqs: Sequence[Sequence[int]],
     *,
     num_processes: Optional[int] = None,
 ) -> tuple[int, int, int]:
@@ -114,9 +114,8 @@ def find_most_frequent_pair_parallel(
     Return:
         id1, id2, freq: the most frequent pair and its frequency (return freq = 0 when no pairs)
     """
-    seqs_list = list(seqs)
 
-    if len(seqs_list) == 0:
+    if len(seqs) == 0:
         return 0, 0, 0
 
     # Use all available CPUs if not specified
@@ -124,21 +123,16 @@ def find_most_frequent_pair_parallel(
         num_processes = multiprocessing.cpu_count()
 
     # For small datasets, use sequential processing to avoid overhead
-    if num_processes == 1 or len(seqs_list) < num_processes:
-        counter = _count_pairs_in_seqs(seqs_list)
+    if num_processes == 1 or len(seqs) < num_processes:
+        counter = _count_pairs_in_seqs(seqs)
     else:
         # Split samples into chunks
-        chunk_size = len(seqs_list) // num_processes
+        chunk_size = len(seqs) // num_processes
 
-        chunks = [
-            seqs_list[i : i + chunk_size] for i in range(0, len(seqs_list), chunk_size)
-        ]
+        if len(seqs) % num_processes != 0:
+            chunk_size += 1
 
-        # Keep len(chunks) == num_processes
-        if len(chunks) == num_processes + 1:
-            last_chunk = chunks.pop()
-            for i, seq in enumerate(last_chunk):
-                chunks[i].append(seq)
+        chunks = [seqs[i : i + chunk_size] for i in range(0, len(seqs), chunk_size)]
 
         # Process chunks in parallel
         with ProcessPoolExecutor(max_workers=num_processes) as executor:
