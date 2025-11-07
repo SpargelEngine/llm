@@ -1,4 +1,3 @@
-import math
 import os
 import random
 import sys
@@ -25,20 +24,17 @@ from spargel_llm.data import (
 from spargel_llm.text_splitter import GPT2_SPLIT_PATTERN, RegexSplitter
 from spargel_llm.tokenizer import WordTokenizer
 from spargel_llm.tools.logging import log_info, log_success
-from spargel_llm.tools.source import get_texts
 from spargel_llm.tools.typing import StrOrPath
 from spargel_llm.tools.utils import (
     NO_STRINGS,
     YES_STRINGS,
     PromptAbortError,
-    prompt_overwrite,
     load_gzip_pickle,
-    save_gzip_pickle,
+    prompt_overwrite,
 )
 
 from .model import LLM, Config
 from .utils import TrainDataset, TrainInfo, generate_step, train
-
 
 reserved_words = [
     b"<|pad|>",
@@ -146,8 +142,15 @@ def create_data_source(paths: list[str], seq_len: int, eot: bool = False):
 
     count_total, count_selected = 0, 0
 
+    if eot:
+        log_info("EOT will be appended to each sample.")
+
     for path, weight, sample_type in map(parse_data, paths):
         data = cast(list[list[int]], load_gzip_pickle(path))
+
+        for tokens in data:
+            for i in range(len(tokens)):
+                tokens[i] += len(reserved_words)
 
         count_total += len(data)
 
@@ -519,66 +522,6 @@ def action_model_init(path: StrOrPath, *, yes: bool = False):
     log_success(f"Initialized model at {weight_file}.")
 
 
-def action_tokenize(
-    vocab_path: StrOrPath,
-    out_path: StrOrPath,
-    source_path: StrOrPath,
-    *,
-    yes: bool = False,
-):
-    prompt_overwrite(out_path, yes=yes)
-
-    words = load_gzip_pickle(vocab_path)
-
-    log_info("Preparing data.")
-
-    texts = get_texts(source_path)
-    log_info(f"Loaded {len(texts)} texts.")
-
-    log_info("Tokenization begins.")
-
-    tokenizer = create_tokenizer(words)
-
-    data: list[list[int]] = []
-
-    percent = 0
-    for i, text in enumerate(texts):
-        tokens = tokenizer.encode(text)
-
-        data.append(tokens)
-
-        # show progress
-        new_percent = math.ceil((i + 1) * 100 / len(texts))
-        for j in range(percent + 1, new_percent + 1):
-            if j % 10 == 0:
-                print(f"{j}%", end="", flush=True)
-            else:
-                print(".", end="", flush=True)
-        percent = new_percent
-    print()
-
-    log_info(f"Total token count: {sum(len(seq) for seq in data)}")
-
-    save_gzip_pickle(out_path, data)
-
-
-def action_data_show(path: StrOrPath, vocab_path: StrOrPath, count: int = 1):
-    words = load_gzip_pickle(vocab_path)
-    tokenizer = create_tokenizer(words)
-
-    data = cast(list[list[int]], load_gzip_pickle(path))
-    print("Number of samples:", len(data))
-
-    if count > 0:
-        print("Example:")
-        for _ in range(count):
-            tokens = random.choice(data)
-            print("Length:", len(tokens))
-            print(tokens)
-            print(repr(tokenizer.decode(tokens)))
-            print()
-
-
 #### main ####
 
 
@@ -675,22 +618,6 @@ def create_parser() -> ArgumentParser:
     )
     model_init_parser.add_argument("path", help="project file")
 
-    # tokenize
-    tokenize_parser = subparsers.add_parser(
-        "tokenize", help="tokenize given texts to tokens that are ready for training"
-    )
-    tokenize_parser.add_argument("vocab_path", help="vocabulary file")
-    tokenize_parser.add_argument("out_path", help="output file")
-    tokenize_parser.add_argument("source", help="text source file")
-
-    # data_show
-    data_show_parser = subparsers.add_parser("data_show", help="show data examples")
-    data_show_parser.add_argument("path", help="data path")
-    data_show_parser.add_argument("vocab_path", help="vocabulary file")
-    data_show_parser.add_argument(
-        "count", nargs="?", type=int, default=1, help="number of examples to show"
-    )
-
     return parser
 
 
@@ -746,15 +673,6 @@ def main():
             )
         case "model_init":
             action_model_init(args.path, yes=args.yes)
-        case "tokenize":
-            action_tokenize(
-                args.vocab_path,
-                args.out_path,
-                args.source,
-                yes=args.yes,
-            )
-        case "data_show":
-            action_data_show(args.path, args.vocab_path, args.count)
         case _:
             raise ValueError(f"unrecognized action: {args.action}")
 
