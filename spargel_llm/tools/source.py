@@ -12,6 +12,10 @@ from spargel_llm.meta import ai_marker
 from .typing import StrOrPath
 
 
+def resolve_parent(path: StrOrPath):
+    return Path(path).resolve().parent
+
+
 class SourceModel(BaseModel):
     """Base class for all source models"""
 
@@ -35,7 +39,7 @@ class FileListSource(SourceModel):
     def get_texts(self, this_path):
         for path in self.paths:
             if path.startswith("@"):
-                list_file_path = Path(dirname(this_path), self.base, path[1:]).resolve()
+                list_file_path = resolve_parent(this_path) / self.base / path[1:]
                 with open(list_file_path, "r") as f:
                     for line in f:
                         file_path = line.strip()
@@ -46,7 +50,7 @@ class FileListSource(SourceModel):
                             with open(real_path, "r") as file_f:
                                 yield file_f.read()
             else:
-                real_path = Path(dirname(this_path), self.base, path).resolve()
+                real_path = resolve_parent(this_path) / self.base / path
                 with open(real_path, "r") as f:
                     yield f.read()
 
@@ -68,7 +72,7 @@ class FindSource(SourceModel):
         file_pattern = regex.compile(self.file_pattern) if self.file_pattern else None
 
         for base in self.bases:
-            search_dir = Path(dirname(this_path), base)
+            search_dir = resolve_parent(this_path) / base
 
             yield from self._search_dir(
                 search_dir, file_pattern=file_pattern, dir_pattern=dir_pattern
@@ -108,7 +112,7 @@ class ReferenceSource(SourceModel):
     @override
     def get_texts(self, this_path):
         for path in self.paths:
-            ref_path = Path(dirname(this_path), self.base, path).resolve()
+            ref_path = resolve_parent(this_path) / self.base / path
             yield from get_texts(ref_path)
 
 
@@ -235,7 +239,7 @@ class ReferenceOperation(OperationModel):
     @override
     def process(self, text, this_path):
         for path in self.paths:
-            ref_path = Path(dirname(this_path), self.base, path).resolve()
+            ref_path = resolve_parent(this_path) / self.base / path
             for operation in self._get_operations(ref_path):
                 text = operation.process(text, ref_path)
         return text
@@ -249,25 +253,18 @@ class ReferenceOperation(OperationModel):
 
 
 class StripOperation(OperationModel):
-    """text -> text.strip()"""
+    """Strip whitespace from text"""
 
     type: Literal["strip"]
     chars: Optional[str] = None
+    per_line: bool = False
 
     @override
     def process(self, text, this_path):
-        return text.strip(self.chars)
-
-
-class StripLinesOperation(OperationModel):
-    """Apply strip to each line in the text"""
-
-    type: Literal["strip_lines"]
-    chars: Optional[str] = None
-
-    @override
-    def process(self, text, this_path):
-        return "\n".join(line.strip(self.chars) for line in text.splitlines())
+        if self.per_line:
+            return "\n".join(line.strip(self.chars) for line in text.splitlines())
+        else:
+            return text.strip(self.chars)
 
 
 @ai_marker(human_checked=True)
@@ -278,9 +275,16 @@ class RegexReplaceOperation(OperationModel):
     pattern: str
     replacement: str
     repeat: bool = False
+    per_line: bool = False
 
     @override
     def process(self, text, this_path):
+        if self.per_line:
+            return "\n".join(self._apply_replace(line) for line in text.splitlines())
+        else:
+            return self._apply_replace(text)
+
+    def _apply_replace(self, text: str) -> str:
         if self.repeat:
             last_text = text
             while True:
@@ -306,7 +310,7 @@ class RemoveShortLinesOperation(OperationModel):
         )
 
 
-type Operation = ReferenceOperation | StripOperation | StripLinesOperation | RegexReplaceOperation | RemoveShortLinesOperation
+type Operation = ReferenceOperation | StripOperation | RegexReplaceOperation | RemoveShortLinesOperation
 
 
 class OperationWrapperModel(BaseModel):

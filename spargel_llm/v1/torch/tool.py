@@ -1,6 +1,6 @@
 import os
-import random
 import sys
+import time
 from argparse import ArgumentParser
 from codecs import getincrementaldecoder
 from datetime import datetime
@@ -11,7 +11,8 @@ from typing import cast
 
 import torch
 from pydantic import BaseModel
-from torch.optim import Adam
+from torch import Tensor
+from torch.optim import Adam, Optimizer
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -34,18 +35,20 @@ from spargel_llm.tools.utils import (
 )
 
 from .model import LLM, Config
-from .utils import TrainDataset, TrainInfo, generate_step, train
+from .utils import StepInfo, TrainDataset, TrainInfo, generate_step, train
 
 reserved_words = [
-    b"<|pad|>",
-    b"<|unk|>",
-    b"<|eot|>",
+    b"<|pad|>",  # padding
+    b"<|unk|>",  # unknown
+    b"<|sot|>",  # start of text
+    b"<|eot|>",  # end of text
 ]
+
+PAD, UNK, SOT, EOT = range(len(reserved_words))
+
 assert len(reserved_words) <= 16
 for i in range(len(reserved_words), 16):
     reserved_words.append(f"<|placeholder{i}|>".encode())
-
-PAD, UNK, EOT = range(3)
 
 
 class ProjectInfo(BaseModel):
@@ -81,6 +84,14 @@ def load_weights(path: StrOrPath, model: LLM, *, device: str):
 
 def save_weights(path: StrOrPath, model: LLM):
     torch.save(model.state_dict(), path)
+
+
+def load_optimizer_state(path: StrOrPath, optimizer: Optimizer):
+    optimizer.load_state_dict(torch.load(path))
+
+
+def save_optimizer_state(path: StrOrPath, optimizer: Optimizer):
+    torch.save(optimizer.state_dict(), path)
 
 
 #### other helpers ####
@@ -134,7 +145,7 @@ def parse_data(s: str) -> tuple[str, float, SampleType]:
     return path, weight, sample_type
 
 
-def create_data_source(paths: list[str], seq_len: int, eot: bool = False):
+def create_data_source(paths: list[str], seq_len: int, mark: bool = False):
     assert len(paths) > 0
 
     data_sources: list[DataSource[list[int]]] = []
@@ -142,12 +153,10 @@ def create_data_source(paths: list[str], seq_len: int, eot: bool = False):
 
     count_total, count_selected = 0, 0
 
-    if eot:
-        log_info("EOT will be appended to each sample.")
-
     for path, weight, sample_type in map(parse_data, paths):
         data = cast(list[list[int]], load_gzip_pickle(path))
 
+        # Adjust token indices since we have special tokens.
         for tokens in data:
             for i in range(len(tokens)):
                 tokens[i] += len(reserved_words)
@@ -160,8 +169,8 @@ def create_data_source(paths: list[str], seq_len: int, eot: bool = False):
                 child_weights = []
 
                 for tokens in data:
-                    if eot:
-                        tokens.append(EOT)
+                    if mark:
+                        tokens = [SOT] + tokens + [EOT]
 
                     if len(tokens) < seq_len + 1:
                         continue
@@ -186,8 +195,8 @@ def create_data_source(paths: list[str], seq_len: int, eot: bool = False):
                     if len(tokens) <= 0:
                         continue
 
-                    if eot:
-                        tokens.append(EOT)
+                    if mark:
+                        tokens = [SOT] + tokens + [EOT]
 
                     selected.append(tokens[: seq_len + 1])
 
@@ -211,26 +220,70 @@ def writer_add_embedding(
     writer: SummaryWriter,
     model: LLM,
     tokenizer: WordTokenizer,
-    dim: int,
     *,
     device: str = "cpu",
 ):
-    embed_vectors = torch.empty((len(tokenizer.words), dim), device=device)
-    labels = []
-
     model.eval()
     with torch.no_grad():
-        for i, word in enumerate(tokenizer.words):
-            embed_vectors[i] = model.embed(
-                torch.tensor(i, dtype=torch.int, device=device)
-            )
+        indices = torch.arange(len(tokenizer.words), dtype=torch.int, device=device)
+        embed_vectors = model.embed(indices)
 
+        labels = []
+        for word in tokenizer.words:
             try:
                 label = word.decode("utf-8")
             except UnicodeDecodeError:
                 label = repr(word)
             labels.append(label if len(label.strip()) == len(label) else repr(label))
+
     writer.add_embedding(embed_vectors.cpu(), labels)
+
+
+@torch.compile
+def validation_loss_step(
+    model: LLM,
+    inputs: Tensor,
+    masks: Tensor,
+    targets: Tensor,
+    pad_index: int,
+):
+    return model.loss(inputs, masks, targets, pad_index=pad_index)
+
+
+def compute_validation_loss(
+    model: LLM,
+    data_source: DataSource[list[int]],
+    seq_len: int,
+    batch_size: int,
+    pad_index: int,
+    device: str,
+    num_batches: int = 10,
+) -> float:
+    assert num_batches > 0
+
+    total_loss = 0.0
+
+    dataset = TrainDataset(data_source, seq_len, pad_index)
+    loader = DataLoader(dataset, batch_size=batch_size)
+    iterator = iter(loader)
+
+    model.eval()
+
+    with torch.no_grad():
+        for _ in range(num_batches):
+            try:
+                inputs, masks, targets = next(iterator)
+            except StopIteration:
+                iterator = iter(loader)
+                inputs, masks, targets = next(iterator)
+
+            loss = validation_loss_step(
+                model, inputs.to(device), masks.to(device), targets, pad_index=PAD
+            )
+
+            total_loss += loss.detach().item()
+
+    return total_loss / num_batches
 
 
 def always_true():
@@ -258,14 +311,15 @@ def action_init(path: StrOrPath, *, yes: bool = False):
     prompt_overwrite(path, yes=yes)
 
     # default config
-    dim = 64
-    cnt_head = 4
+    dim = 256
+    cnt_layer = 4
+    cnt_head = 16
     assert dim % cnt_head == 0
 
     config = Config(
         vocab_size=1000,
-        max_seq_len=64,
-        cnt_layer=4,
+        max_seq_len=4096,
+        cnt_layer=cnt_layer,
         cnt_head=cnt_head,
         dim=dim,
         d_key=dim // cnt_head,
@@ -291,17 +345,20 @@ def action_gen(
     path: StrOrPath,
     seq_len: int,
     prompt: str,
-    max_cnt: int = 0,
+    count: int = 0,
     temperature: float = 0.5,
     *,
     device: str = "cpu",
     stream: bool = False,
     all: bool = False,
     stop_token: int = EOT,
+    mark: bool = False,
 ):
-    assert len(prompt) > 0
     assert seq_len > 0
     assert temperature > 0
+
+    if not mark:
+        assert len(prompt) > 0
 
     project_info = load_project(path)
 
@@ -314,17 +371,21 @@ def action_gen(
 
     prompt_tokens = tokenizer.encode(prompt)
 
-    print("Prompt:", repr(prompt))
-    print("Prompt token count:", len(prompt_tokens))
+    if mark:
+        tokens = [SOT] + prompt_tokens
+    else:
+        tokens = list(prompt_tokens)
+
+    print("Prompt:", repr(tokenizer.decode(tokens)))
+    print("Prompt token count:", len(tokens))
     print("Sequence length:", seq_len)
     print("Temperature:", temperature)
-    print("Max generation count:", max_cnt)
+    print("Max generation count:", count)
     print("Stop token id:", stop_token)
 
     print("Generated text:")
     log_info("********")
 
-    tokens = list(prompt_tokens)
     start_pos = len(tokens)
 
     model.eval()
@@ -334,9 +395,9 @@ def action_gen(
     decoder = getincrementaldecoder("utf-8")(errors="ignore")
 
     if stream and all:
-        print(prompt, end="")
+        print(tokenizer.decode(tokens), end="")
 
-    for _ in range(max_cnt) if max_cnt >= 0 else always_true():
+    for _ in range(count) if count >= 0 else always_true():
         input = tokens[-seq_len:]
 
         with torch.no_grad():
@@ -375,10 +436,12 @@ def action_train(
     steps: int,
     data_paths: list[str],
     *,
-    device: str = "cpu",
-    tensorboard_dir: str | None = None,
+    learning_rate: float = 0.001,
+    val_paths: list[str] | None = None,
     log_period: int = 10,
-    eot: bool = False,
+    tensorboard_dir: str | None = None,
+    device: str = "cpu",
+    mark: bool = False,
 ):
     assert seq_len > 0
     assert batch_size > 0
@@ -395,21 +458,33 @@ def action_train(
     tokenizer = create_tokenizer(words)
 
     log_info("Making backups.")
-
     save_weights(get_backup_path(weight_file), model)
     save_project(get_backup_path(path), project_info)
 
     log_info("Preparing data.")
-
-    data_source = create_data_source(data_paths, seq_len, eot=eot)
+    if mark:
+        log_info("Markers (SOT, EOT, etc.) will be added.")
+    data_source = create_data_source(data_paths, seq_len, mark=mark)
 
     print("Data example:")
     example_tokens = data_source.sample()
     print(
-        f"  (len={len(example_tokens)}) {example_tokens} ({repr(tokenizer.decode(example_tokens))})"
+        f"(len={len(example_tokens)}) {example_tokens} ({repr(tokenizer.decode(example_tokens))})"
     )
 
-    optimizer = Adam(model.parameters(), lr=0.001)
+    val_batches = max(log_period // 10, 1)
+    val_data_source = None
+    if val_paths and len(val_paths) > 0:
+        log_info("Preparing validation data.")
+        val_data_source = create_data_source(val_paths, seq_len, mark=mark)
+
+        print("Validation data example:")
+        val_example_tokens = val_data_source.sample()
+        print(
+            f"(len={len(val_example_tokens)}) {val_example_tokens} ({repr(tokenizer.decode(val_example_tokens))})"
+        )
+
+    optimizer = Adam(model.parameters(), lr=learning_rate)
 
     writer = None
     if tensorboard_dir is not None:
@@ -422,30 +497,14 @@ def action_train(
         writer.add_graph(model, (dummy_input.to(device), dummy_mask.to(device)))
 
         # show input word embedding
-        writer_add_embedding(
-            writer, model, tokenizer, project_info.config.dim, device=device
-        )
+        writer_add_embedding(writer, model, tokenizer, device=device)
 
     def log_important(msg: str):
         log_info(msg)
         if writer is not None:
             writer.add_text("train/log", msg, project_info.train_info.token_count)
 
-    def loss_callback(step: int, token_count: int, loss: float):
-        if writer is not None:
-            writer.add_scalar("train/loss", loss, token_count)
-
-        if step % (log_period * 100) == 0:
-            log_info("Makeing backups.")
-            save_weights(get_backup_path(weight_file), model)
-            save_project(get_backup_path(path), project_info)
-
-            if writer is not None:
-                writer_add_embedding(
-                    writer, model, tokenizer, project_info.config.dim, device=device
-                )
-
-    def save_callback():
+    def save():
         log_info(f"Saving. (train_info: {project_info.train_info})")
         save_weights(weight_file, model)
         save_project(path, project_info)
@@ -453,6 +512,82 @@ def action_train(
     log_important(
         f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}). Time: {datetime.now()}"
     )
+
+    state = {
+        "sum_loss": 0.0,
+        "sum_time_load_batch": 0.0,
+        "sum_time_transfer_batch": 0.0,
+        "sum_time_forward": 0.0,
+        "sum_time_backward": 0.0,
+    }
+
+    def step_callback(info: StepInfo):
+        token_count = project_info.train_info.token_count
+
+        if writer is not None:
+            writer.add_scalar("loss/train", info.loss, token_count)
+
+        state["sum_loss"] += info.loss
+        state["sum_time_load_batch"] += info.time_load_batch
+        state["sum_time_transfer_batch"] += info.time_transfer_batch
+        state["sum_time_forward"] += info.time_forward
+        state["sum_time_backward"] += info.time_backward
+
+        step = info.step + 1
+
+        if step % log_period == 0:
+            avg_loss = state["sum_loss"] / log_period
+            avg_time_load_batch = state["sum_time_load_batch"] / log_period
+            avg_time_transfer_batch = state["sum_time_transfer_batch"] / log_period
+            avg_time_forward = state["sum_time_forward"] / log_period
+            avg_time_backward = state["sum_time_backward"] / log_period
+            avg_time = (
+                avg_time_load_batch
+                + avg_time_transfer_batch
+                + avg_time_forward
+                + avg_time_backward
+            )
+
+            state["sum_loss"] = 0.0
+            state["sum_time_load_batch"] = 0.0
+            state["sum_time_transfer_batch"] = 0.0
+            state["sum_time_forward"] = 0.0
+            state["sum_time_backward"] = 0.0
+
+            val_loss = None
+            if val_data_source is not None:
+                val_loss = compute_validation_loss(
+                    model=model,
+                    data_source=val_data_source,
+                    seq_len=seq_len,
+                    batch_size=batch_size,
+                    pad_index=PAD,
+                    device=device,
+                    num_batches=val_batches,
+                )
+
+            time_log_msg = f"avg_time={avg_time:.6f} (({avg_time_load_batch:.6f} + {avg_time_transfer_batch:.6f}) + ({avg_time_forward:.6f} + {avg_time_backward:.6f}))"
+            if val_loss is not None:
+                print(
+                    f"  {step}: avg_loss={avg_loss:.6f}, val_loss={val_loss:.6f}, {time_log_msg}"
+                )
+                if writer is not None:
+                    writer.add_scalar("loss/val", val_loss, token_count)
+            else:
+                print(f"  {step}: avg_loss={avg_loss:.6f}, {time_log_msg}")
+
+            if step % (log_period * 10) == 0:
+                save()
+
+                if step % (log_period * 100) == 0:
+                    log_info("Making backups.")
+                    save_weights(get_backup_path(weight_file), model)
+                    save_project(get_backup_path(path), project_info)
+
+                    if writer is not None:
+                        writer_add_embedding(writer, model, tokenizer, device=device)
+
+    t_start = time.perf_counter()
 
     train(
         info=project_info.train_info,
@@ -464,19 +599,18 @@ def action_train(
         batch_size=batch_size,
         steps=steps,
         device=device,
-        log_period=log_period,
-        loss_callback=loss_callback,
-        save_period=log_period * 10,
-        save_callback=save_callback,
+        step_callback=step_callback,
     )
 
-    log_info("Training completed.")
+    save()
+
+    t_end = time.perf_counter()
+
+    log_important(f"Training completed. (time: {t_end - t_start:.6f})")
 
     if writer is not None:
         # show input word embedding
-        writer_add_embedding(
-            writer, model, tokenizer, project_info.config.dim, device=device
-        )
+        writer_add_embedding(writer, model, tokenizer, device=device)
 
         writer.close()
 
@@ -568,8 +702,8 @@ def create_parser() -> ArgumentParser:
     gen_parser.add_argument("seq_len", type=int, help="sequence length")
     gen_parser.add_argument("prompt", help="prompt from which to start generating")
     gen_parser.add_argument(
-        "-m",
-        "--max-cnt",
+        "-c",
+        "--count",
         type=int,
         default=200,
         help="maximum number of tokens to generate (negative for infinite)",
@@ -591,6 +725,9 @@ def create_parser() -> ArgumentParser:
         default=EOT,
         help="stop token id (-1: never stop)",
     )
+    gen_parser.add_argument(
+        "-m", "--mark", action="store_true", help="add markers (SOT, EOT, etc.)"
+    )
 
     # train
     train_parser = subparsers.add_parser("train", help="train model")
@@ -599,6 +736,10 @@ def create_parser() -> ArgumentParser:
     train_parser.add_argument("batch_size", type=int, help="batch size")
     train_parser.add_argument("steps", type=int, help="number of steps")
     train_parser.add_argument("data", nargs="+", help="token data file")
+    train_parser.add_argument("-v", "--val", nargs="*", help="validation data file")
+    train_parser.add_argument(
+        "-lr", "--learning-rate", type=float, default=0.001, help="learning rate"
+    )
     train_parser.add_argument(
         "-tb", "--tensorboard-dir", help="TensorBoard write directory"
     )
@@ -609,7 +750,9 @@ def create_parser() -> ArgumentParser:
         default=10,
         help="log each this number of steps",
     )
-    train_parser.add_argument("-e", "--eot", action="store_true", help="add EOT")
+    train_parser.add_argument(
+        "-m", "--mark", action="store_true", help="add markers (SOT, EOT, etc.)"
+    )
 
     # model_init
     model_init_parser = subparsers.add_parser(
@@ -630,12 +773,7 @@ def main():
     log_info(f"PyTorch will use {args.thread} CPU thread(s).")
     torch.set_num_threads(args.thread)
 
-    accelerator = torch.accelerator.current_accelerator()
-    device = (
-        accelerator.type
-        if torch.accelerator.is_available() and accelerator is not None
-        else "cpu"
-    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     log_info(f"Using device: {device}")
 
     # CUDA
@@ -652,12 +790,13 @@ def main():
                 args.path,
                 seq_len=args.seq_len,
                 prompt=args.prompt,
-                max_cnt=args.max_cnt,
+                count=args.count,
                 temperature=args.temp,
                 device=device,
                 stream=args.stream,
                 all=args.all,
                 stop_token=args.stop_token,
+                mark=args.mark,
             )
         case "train":
             action_train(
@@ -666,10 +805,12 @@ def main():
                 batch_size=args.batch_size,
                 steps=args.steps,
                 data_paths=args.data,
+                learning_rate=args.learning_rate,
+                val_paths=args.val,
                 device=device,
                 tensorboard_dir=args.tensorboard_dir,
                 log_period=args.log_period,
-                eot=args.eot,
+                mark=args.mark,
             )
         case "model_init":
             action_model_init(args.path, yes=args.yes)

@@ -125,6 +125,11 @@ class WordTokenizer(Tokenizer):
             start, end = cuts[i], cuts[i + 1]
             segment = input[start:end].encode("utf-8")
 
+            # quick path for single word
+            if segment in self._word_to_id or len(segment) <= 1:
+                tokens.append(self._word_to_id.get(segment))
+                continue
+
             # find words
             positions = byte_pair_merge(self._word_to_id, segment)
             positions.append(len(segment))

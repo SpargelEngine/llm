@@ -3,6 +3,7 @@ from random import Random
 from typing import Callable, Iterable, Iterator, Sequence, override
 
 from .typing import Sliceable
+from .utils import RandomPicker
 
 
 class DataSource[T](ABC):
@@ -57,8 +58,7 @@ class WeightedDataSource[T](DataSource[T]):
     Each time, one of the sources is randomly chosen according to the provided weights.
     """
 
-    sources: Sequence[DataSource[T]]
-    weights: Sequence[float]
+    picker: RandomPicker[DataSource[T]]
     random: Random
 
     def __init__(
@@ -68,22 +68,12 @@ class WeightedDataSource[T](DataSource[T]):
         *,
         random: Random = Random(),
     ):
-        self.sources = sources
-        self.weights = weights
+        self.picker = RandomPicker(sources, weights)
         self.random = random
-
-        assert all(weight >= 0 for weight in weights) and sum(weights) > 0.0
 
     @override
     def sample(self) -> T:
-        source = self.random.choices(self.sources, weights=self.weights)[0]
-        return source.sample()
-
-    @override
-    def sample_multiple(self, count: int) -> Iterable[T]:
-        assert count >= 0
-        for source in self.random.choices(self.sources, weights=self.weights, k=count):
-            yield source.sample()
+        return self.picker.sample(self.random).sample()
 
 
 class SliceDataSource[S: Sliceable](DataSource[S]):
