@@ -1,5 +1,6 @@
 import time
 from collections import namedtuple
+from dataclasses import dataclass
 from typing import Callable, Iterator, Optional, cast, override
 
 import torch
@@ -16,6 +17,12 @@ from .model import LLM
 class TrainInfo(BaseModel):
     time: NonNegativeFloat = 0
     token_count: NonNegativeInt = 0
+
+
+class TrainConfig(BaseModel):
+    seq_len: NonNegativeInt = 0
+    batch_size: NonNegativeInt = 0
+    optimizer_state_file: str = "optimizer_state.pth"
 
 
 Sample = namedtuple("Sample", ["input", "mask", "target"])
@@ -64,7 +71,7 @@ class TrainDataset(IterableDataset[Sample]):
 
 
 @torch.compile
-def train_step(
+def forward_step(
     model: LLM,
     optimizer: Optimizer,
     inputs: Tensor,
@@ -74,15 +81,28 @@ def train_step(
 ):
     optimizer.zero_grad()
     loss = model.loss(inputs, masks, targets, pad_index=pad_index)
+    return loss
+
+
+@torch.compile
+def backward_step(loss: Tensor, optimizer: Optimizer):
     loss.backward()
     optimizer.step()
-
-    return loss
 
 
 @torch.compile
 def generate_step(model: LLM, input: Tensor) -> Tensor:
     return model(input)
+
+
+@dataclass
+class StepInfo:
+    step: int
+    loss: float
+    time_load_batch: float
+    time_transfer_batch: float
+    time_forward: float
+    time_backward: float
 
 
 def train(
@@ -96,22 +116,20 @@ def train(
     steps: int,
     *,
     device: str = "cpu",
-    log_period: int = 10,
-    loss_callback: Optional[Callable[[int, int, float], None]] = None,
-    save_period: int = 100,
-    save_callback: Optional[Callable[[], None]] = None,
+    step_callback: Optional[Callable[[StepInfo], None]] = None,
 ):
+    """
+    Args:
+        step_callback: (step, token_count, loss, step_time) -> None
+    """
+
     data_loader = DataLoader(
         TrainDataset(data_source, seq_len, pad_index), batch_size=batch_size
     )
     iterator = iter(data_loader)
 
-    sum_of_time = 0
-    sum_of_loss = 0.0
-    total_token_count = 0
-    t_start = t_last = time.perf_counter()
-
-    for step in range(1, steps + 1):
+    for step in range(steps):
+        t0 = time.perf_counter()
 
         try:
             inputs, masks, targets = cast(tuple[Tensor, Tensor, Tensor], next(iterator))
@@ -119,51 +137,46 @@ def train(
             print("Stopping early because there are no more data.")
             break
 
+        t1 = time.perf_counter()
+
+        inputs2 = inputs.to(device)
+        masks2 = masks.to(device)
+        targets2 = targets.to(device)
+
+        t2 = time.perf_counter()
+
         # train
         model.train()
 
-        loss = train_step(
+        loss = forward_step(
             model=model,
             optimizer=optimizer,
-            inputs=inputs.to(device),
-            masks=masks.to(device),
-            targets=targets.to(device),
+            inputs=inputs2,
+            masks=masks2,
+            targets=targets2,
             pad_index=pad_index,
         )
 
-        t = time.perf_counter()
-        delta_t = t - t_last
-        t_last = t
-        info.time += delta_t
-        sum_of_time += delta_t
+        t3 = time.perf_counter()
 
-        sum_of_loss += loss.detach().item()
+        backward_step(loss, optimizer)
+
+        t4 = time.perf_counter()
+
+        info.time += t4 - t0
 
         # count tokens (not paddings)
         token_count = int(torch.sum(masks == False).item())
         info.token_count += token_count
-        total_token_count += token_count
 
-        # log the average loss from last time
-        if step % log_period == 0:
-            avg_of_loss = sum_of_loss / log_period
-
-            print(f"  Step {step}: loss={avg_of_loss:.6f}, time={sum_of_time:.6f}")
-
-            if loss_callback is not None:
-                loss_callback(step, info.token_count, avg_of_loss)
-
-            sum_of_time = 0
-            sum_of_loss = 0
-
-        if save_callback is not None and step % save_period == 0:
-            save_callback()
-
-    t_end = time.perf_counter()
-
-    print()
-    if save_callback is not None:
-        save_callback()
-
-    print(f"time: {t_end - t_start:.6f}")
-    print(f"tokens: {total_token_count}")
+        if step_callback is not None:
+            step_callback(
+                StepInfo(
+                    step=step,
+                    loss=loss.detach().item(),
+                    time_load_batch=t1 - t0,
+                    time_transfer_batch=t2 - t1,
+                    time_forward=t3 - t2,
+                    time_backward=t4 - t3,
+                )
+            )

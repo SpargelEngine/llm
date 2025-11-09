@@ -2,7 +2,7 @@ from typing import Optional, override
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, PositiveInt
+from pydantic import BaseModel, NonNegativeFloat, PositiveInt
 from torch import Tensor
 
 from spargel_llm.layers.torch import (
@@ -22,6 +22,7 @@ class Config(BaseModel):
     d_key: PositiveInt
     d_value: PositiveInt
     d_feed_forward: PositiveInt
+    dropout_p: NonNegativeFloat = 0.1
 
 
 class TransformerBlock(nn.Module):
@@ -42,6 +43,9 @@ class TransformerBlock(nn.Module):
     norm1: LayerNorm
     norm2: LayerNorm
 
+    dropout1: nn.Dropout
+    dropout2: nn.Dropout
+
     def __init__(self, config: Config):
         super().__init__()
 
@@ -57,16 +61,21 @@ class TransformerBlock(nn.Module):
         self.norm1 = LayerNorm(config.dim)
         self.norm2 = LayerNorm(config.dim)
 
+        self.dropout1 = nn.Dropout(config.dropout_p)
+        self.dropout2 = nn.Dropout(config.dropout_p)
+
     @override
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         y = x
         x = self.norm1(x)
         x = self.attention(x, mask)
+        x = self.dropout1(x)
         x += y
 
         y = x
         x = self.norm2(x)
         x = self.feed_forward(x)
+        x = self.dropout2(x)
         x += y
 
         return x

@@ -1,4 +1,3 @@
-import math
 import random
 import sys
 from argparse import ArgumentParser
@@ -9,7 +8,7 @@ from tqdm import tqdm
 
 from spargel_llm.text_splitter import GPT2_SPLIT_PATTERN, RegexSplitter
 from spargel_llm.tokenizer import WordTokenizer
-from spargel_llm.utils import bpe_train, demo_tokenization
+from spargel_llm.utils import bpe_expand, demo_tokenization
 
 from .logging import log_info, log_success, log_warning
 from .source import get_texts
@@ -88,11 +87,11 @@ def action_expand(
 
     for item in source_paths:
         source_path, count = parse_source(item)
-        _texts = list(get_texts(source_path))
+        _texts = list(tqdm(get_texts(source_path), desc=source_path))
 
         if count > 0 and count < len(_texts):
             random.shuffle(_texts)
-            _texts = _texts[:count]
+            del _texts[count:]
 
         texts.extend(_texts)
 
@@ -104,32 +103,25 @@ def action_expand(
 
     log_info("Splitting and tokenizing.")
 
-    percent = 0
-    for i, text in enumerate(texts):
+    for text in tqdm(texts):
         cuts = text_splitter.split(text) + [len(text)]
         for j in range(len(cuts) - 1):
             start, end = cuts[j], cuts[j + 1]
             tokens = tokenizer.encode(text[start:end])
-            samples.append(tokens)
+            if len(tokens) >= 2:
+                samples.append(tokens)
 
-        # show progress
-        new_percent = math.ceil((i + 1) * 100 / len(texts))
-        for j in range(percent + 1, new_percent + 1):
-            if j % 10 == 0:
-                print(f"{j}%", end="", flush=True)
-            else:
-                print(".", end="", flush=True)
-        percent = new_percent
-    print()
+    # free memory
+    texts = None
 
-    log_info(f"Loaded {len(samples)} samples.")
+    log_info(f"Loaded {len(samples)} samples with length >= 2.")
     log_info(
         f"Average sample length (in tokens): {sum(len(sample) for sample in samples) / len(samples)}"
     )
 
     log_info("Vocabulary expansion begins.")
 
-    bpe_train(words, samples, size - len(words), parallel=parallel)
+    bpe_expand(words, samples, size - len(words), parallel=parallel)
 
     log_info(f"Finished. Vocabulary size expaned to {len(words)}")
 
@@ -173,7 +165,7 @@ def action_tokenize(
 
     data: list[list[int]] = []
 
-    log_info(f"Tokenization begins.")
+    log_info("Tokenization begins.")
 
     count = 0
     for text in tqdm(get_texts(source_path)):
@@ -181,10 +173,44 @@ def action_tokenize(
         data.append(tokens)
         count += 1
 
-    log_info(f"Number of texts: {count}")
-    log_info(f"Total token count: {sum(len(seq) for seq in data)}")
+    print("Number of texts:", count)
+    print("Total token count:", sum(len(seq) for seq in data))
 
     save_gzip_pickle(out_path, data)
+
+
+def action_data_split(
+    path: StrOrPath,
+    ratio: float,
+    out_path1: StrOrPath,
+    out_path2: StrOrPath,
+    *,
+    yes: bool = False,
+    random_seed=None,
+):
+    if ratio <= 0.0 or ratio >= 1.0:
+        raise ValueError(f"ratio {ratio} should be in (0.0, 1.0)")
+
+    prompt_overwrite(out_path1, yes)
+    prompt_overwrite(out_path2, yes)
+
+    data = cast(list[list[int]], load_gzip_pickle(path))
+    log_info(f"Loaded {len(data)} samples.")
+
+    random.seed(random_seed)
+    random.shuffle(data)
+
+    split_index = int(len(data) * ratio)
+    data1 = data[:split_index]
+    data2 = data[split_index:]
+
+    print(f"Date splitted into: {len(data)} = {len(data1)} + {len(data2)}")
+    log_info("Saving.")
+
+    save_gzip_pickle(out_path1, data1)
+    save_gzip_pickle(out_path2, data2)
+
+    log_success("Data splitting completed.")
 
 
 def action_demo(path: StrOrPath, text: str):
@@ -200,6 +226,9 @@ def action_source_show(path: StrOrPath, count: int = 1):
     print("Number of texts:", len(texts))
 
     if count > 0:
+        if len(texts) == 0:
+            raise ValueError("no texts")
+
         print("Example:")
         for i in range(count):
             text = random.choice(texts)
@@ -209,6 +238,14 @@ def action_source_show(path: StrOrPath, count: int = 1):
                 log_info("%")
             log_info("****************")
             print()
+
+
+def action_data_info(path: StrOrPath):
+    log_info("Loading data.")
+    data = cast(list[list[int]], load_gzip_pickle(path))
+
+    print("Number of texts:", len(data))
+    print("Total number of tokens:", sum(len(item) for item in data))
 
 
 def action_data_show(path: StrOrPath, vocab_path: StrOrPath, count: int = 1):
@@ -292,6 +329,16 @@ def create_parser() -> ArgumentParser:
     tokenize_parser.add_argument("out_path", help="output file")
     tokenize_parser.add_argument("source", help="text source file")
 
+    # data_split
+    data_split_parser = subparsers.add_parser(
+        "data_split", help="split tokenized data into two sets (train/val)"
+    )
+    data_split_parser.add_argument("path", help="data path")
+    data_split_parser.add_argument("ratio", type=float, help="split ratio (0.0~1.0)")
+    data_split_parser.add_argument("out_path1", help="output file 1")
+    data_split_parser.add_argument("out_path2", help="output file 2")
+    data_split_parser.add_argument("-rs", "--random-seed", help="random seed")
+
     # demo
     demo_parser = subparsers.add_parser("demo", help="demonstrate tokenization")
     demo_parser.add_argument("path", help="vocabulary file")
@@ -305,6 +352,10 @@ def create_parser() -> ArgumentParser:
     source_show_parser.add_argument(
         "count", nargs="?", type=int, default=1, help="number of examples to show"
     )
+
+    # data_info
+    data_info_parser = subparsers.add_parser("data_info", help="show data information")
+    data_info_parser.add_argument("path", help="data path")
 
     # data_show
     data_show_parser = subparsers.add_parser("data_show", help="show data examples")
@@ -343,10 +394,21 @@ def main():
                 args.source,
                 yes=args.yes,
             )
+        case "data_split":
+            action_data_split(
+                args.path,
+                args.ratio,
+                args.out_path1,
+                args.out_path2,
+                yes=args.yes,
+                random_seed=args.random_seed,
+            )
         case "demo":
             action_demo(args.path, args.text)
         case "source_show":
             action_source_show(args.path, args.count)
+        case "data_info":
+            action_data_info(args.path)
         case "data_show":
             action_data_show(args.path, args.vocab_path, args.count)
         case _:
