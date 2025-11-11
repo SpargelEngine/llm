@@ -1,5 +1,4 @@
 import json
-from os.path import dirname
 from pathlib import Path
 from typing import Iterable, Literal, Optional, override
 
@@ -44,9 +43,7 @@ class FileListSource(SourceModel):
                     for line in f:
                         file_path = line.strip()
                         if file_path:
-                            real_path = Path(
-                                dirname(list_file_path), file_path
-                            ).resolve()
+                            real_path = resolve_parent(list_file_path) / file_path
                             with open(real_path, "r") as file_f:
                                 yield file_f.read()
             else:

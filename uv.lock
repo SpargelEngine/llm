@@ -639,6 +639,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pydantic" },
     { name = "regex" },
+    { name = "rich" },
     { name = "tqdm" },
 ]
 
@@ -674,6 +675,7 @@ requires-dist = [
     { name = "optax", marker = "extra == 'jax-cuda12'", specifier = ">=0.2.5" },
     { name = "pydantic", specifier = ">=2.12.3" },
     { name = "regex", specifier = ">=2025.10.23" },
+    { name = "rich", specifier = ">=14.2.0" },
     { name = "tensorboard", marker = "extra == 'tensorboard'", specifier = ">=2.20.0" },
     { name = "torch", marker = "extra == 'torch-cpu'", specifier = ">=2.9.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "tqdm", specifier = ">=4.67.1" },

@@ -19,12 +19,6 @@ class TrainInfo(BaseModel):
     token_count: NonNegativeInt = 0
 
 
-class TrainConfig(BaseModel):
-    seq_len: NonNegativeInt = 0
-    batch_size: NonNegativeInt = 0
-    optimizer_state_file: str = "optimizer_state.pth"
-
-
 Sample = namedtuple("Sample", ["input", "mask", "target"])
 
 

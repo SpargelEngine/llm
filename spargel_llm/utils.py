@@ -31,7 +31,7 @@ class RandomPicker[T]:
         self._n = n = len(objects)
         self.objects = objects
         self._prop = [0.0] * n
-        self._alias = [-1] * n
+        self._alias = list(range(n))
 
         s = sum(weights)
         weights = [w / s for w in weights]

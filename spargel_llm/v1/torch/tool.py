@@ -1,16 +1,17 @@
 import os
+import shutil
 import sys
 import time
 from argparse import ArgumentParser
 from codecs import getincrementaldecoder
 from datetime import datetime
 from enum import Enum
-from os.path import basename, dirname
 from pathlib import Path
-from typing import cast
+from typing import Optional, cast
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, NonNegativeInt
+from rich import print as rich_print
 from torch import Tensor
 from torch.optim import Adam, Optimizer
 from torch.utils.data import DataLoader
@@ -51,18 +52,28 @@ for i in range(len(reserved_words), 16):
     reserved_words.append(f"<|placeholder{i}|>".encode())
 
 
+class TrainConfig(BaseModel):
+    seq_len: NonNegativeInt
+    batch_size: NonNegativeInt
+    learning_rate: float
+    optimizer_state_file: str
+
+
 class ProjectInfo(BaseModel):
     # configuration (hyper-parameters) for the model
     config: Config
 
     # weight file location
-    weight_file: str
+    model_state_file: str
 
     # vocab file location
     vocab_file: str
 
     # training information & statistics
     train_info: TrainInfo
+
+    # training config
+    train_config: TrainConfig
 
 
 #### load/store helper functions ####
@@ -78,11 +89,11 @@ def save_project(path: StrOrPath, project_info: ProjectInfo):
         f.write(project_info.model_dump_json(indent=2))
 
 
-def load_weights(path: StrOrPath, model: LLM, *, device: str):
+def load_model_state(path: StrOrPath, model: LLM, *, device: str):
     model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
 
 
-def save_weights(path: StrOrPath, model: LLM):
+def save_model_state(path: StrOrPath, model: LLM):
     torch.save(model.state_dict(), path)
 
 
@@ -95,6 +106,10 @@ def save_optimizer_state(path: StrOrPath, optimizer: Optimizer):
 
 
 #### other helpers ####
+
+
+def resolve_parent(path: StrOrPath):
+    return Path(path).resolve().parent
 
 
 def create_tokenizer(words: list[bytes]) -> WordTokenizer:
@@ -111,7 +126,10 @@ def create_tokenizer(words: list[bytes]) -> WordTokenizer:
 
 
 def get_backup_path(path: StrOrPath):
-    return Path(dirname(path), f".{basename(path)}.{int(datetime.now().timestamp())}")
+    return (
+        resolve_parent(path)
+        / f".{Path(path).resolve().name}.{int(datetime.now().timestamp())}"
+    )
 
 
 class SampleType(Enum):
@@ -299,12 +317,7 @@ def action_info(path: StrOrPath):
 
     log_info("==== Project Info ====")
     print("Project file:", path)
-    print("Config:")
-    print(f"  {project_info.config}")
-    print("Weight file:", project_info.weight_file)
-    print("Vocabulary file:", project_info.vocab_file)
-    print("Train info:")
-    print(f"  {project_info.train_info}")
+    rich_print(project_info)
 
 
 def action_init(path: StrOrPath, *, yes: bool = False):
@@ -327,14 +340,20 @@ def action_init(path: StrOrPath, *, yes: bool = False):
         d_feed_forward=dim * 4,
     )
 
-    weight_file = "weights.pth"
+    model_state_file = "model_state.pth"
     vocab_file = "vocab.pkl.gz"
 
     project_info = ProjectInfo(
         config=config,
-        weight_file=weight_file,
+        model_state_file=model_state_file,
         vocab_file=vocab_file,
         train_info=TrainInfo(),
+        train_config=TrainConfig(
+            seq_len=0,
+            batch_size=0,
+            learning_rate=1e-3,
+            optimizer_state_file="optimizer_state.pth",
+        ),
     )
 
     save_project(path, project_info)
@@ -364,9 +383,11 @@ def action_gen(
 
     model = LLM(project_info.config).to(device)
 
-    load_weights(Path(dirname(path), project_info.weight_file), model, device=device)
+    load_model_state(
+        resolve_parent(path) / project_info.model_state_file, model, device=device
+    )
 
-    words = load_gzip_pickle(Path(dirname(path), project_info.vocab_file))
+    words = load_gzip_pickle(resolve_parent(path) / project_info.vocab_file)
     tokenizer = create_tokenizer(words)
 
     prompt_tokens = tokenizer.encode(prompt)
@@ -431,35 +452,51 @@ def action_gen(
 
 def action_train(
     path: StrOrPath,
-    seq_len: int,
-    batch_size: int,
     steps: int,
     data_paths: list[str],
     *,
-    learning_rate: float = 0.001,
-    val_paths: list[str] | None = None,
-    log_period: int = 10,
-    tensorboard_dir: str | None = None,
-    device: str = "cpu",
+    seq_len: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    learning_rate: Optional[float] = None,
     mark: bool = False,
+    val_paths: Optional[list[str]] = None,
+    log_period: int = 10,
+    tensorboard_dir: Optional[str] = None,
+    device: str = "cpu",
 ):
-    assert seq_len > 0
-    assert batch_size > 0
     assert log_period > 0
 
     project_info = load_project(path)
-    weight_file = Path(dirname(path), project_info.weight_file)
-    vocab_file = Path(dirname(path), project_info.vocab_file)
+    model_state_file = resolve_parent(path) / project_info.model_state_file
+    vocab_file = resolve_parent(path) / project_info.vocab_file
+    train_config = project_info.train_config
+    optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
 
-    model = LLM(project_info.config).to(device)
-    load_weights(weight_file, model, device=device)
+    should_reset_optimizer = (
+        batch_size is not None and batch_size != train_config.batch_size
+    )
+
+    if seq_len is None:
+        seq_len = train_config.seq_len
+    else:
+        train_config.seq_len = seq_len
+    assert seq_len > 0
+
+    if batch_size is None:
+        batch_size = train_config.batch_size
+    else:
+        train_config.batch_size = batch_size
+    assert batch_size > 0
+
+    if learning_rate is None:
+        learning_rate = train_config.learning_rate
+    else:
+        train_config.learning_rate = learning_rate
+
+    # data
 
     words = load_gzip_pickle(vocab_file)
     tokenizer = create_tokenizer(words)
-
-    log_info("Making backups.")
-    save_weights(get_backup_path(weight_file), model)
-    save_project(get_backup_path(path), project_info)
 
     log_info("Preparing data.")
     if mark:
@@ -484,7 +521,22 @@ def action_train(
             f"(len={len(val_example_tokens)}) {val_example_tokens} ({repr(tokenizer.decode(val_example_tokens))})"
         )
 
+    # model
+
+    model = LLM(project_info.config).to(device)
+    log_info("Loading model state.")
+    load_model_state(model_state_file, model, device=device)
+
+    # optimizer
+
     optimizer = Adam(model.parameters(), lr=learning_rate)
+    if should_reset_optimizer:
+        log_info("Batch size changed, optimizer reset.")
+    else:
+        log_info("Loading optimzier state.")
+        load_optimizer_state(optimizer_state_file, optimizer)
+
+    # TensorBoard
 
     writer = None
     if tensorboard_dir is not None:
@@ -499,6 +551,8 @@ def action_train(
         # show input word embedding
         writer_add_embedding(writer, model, tokenizer, device=device)
 
+    # helper functions
+
     def log_important(msg: str):
         log_info(msg)
         if writer is not None:
@@ -506,12 +560,15 @@ def action_train(
 
     def save():
         log_info(f"Saving. (train_info: {project_info.train_info})")
-        save_weights(weight_file, model)
         save_project(path, project_info)
+        save_model_state(model_state_file, model)
+        save_optimizer_state(optimizer_state_file, optimizer)
 
-    log_important(
-        f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}). Time: {datetime.now()}"
-    )
+    def backup():
+        log_info("Making backups.")
+        shutil.copyfile(path, get_backup_path(path))
+        shutil.copyfile(model_state_file, get_backup_path(model_state_file))
+        shutil.copyfile(optimizer_state_file, get_backup_path(optimizer_state_file))
 
     state = {
         "sum_loss": 0.0,
@@ -580,14 +637,20 @@ def action_train(
                 save()
 
                 if step % (log_period * 100) == 0:
-                    log_info("Making backups.")
-                    save_weights(get_backup_path(weight_file), model)
-                    save_project(get_backup_path(path), project_info)
+                    backup()
 
                     if writer is not None:
                         writer_add_embedding(writer, model, tokenizer, device=device)
 
+    # train
+
     t_start = time.perf_counter()
+
+    log_important(
+        f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}). Time: {datetime.now()}"
+    )
+
+    backup()
 
     train(
         info=project_info.train_info,
@@ -609,7 +672,6 @@ def action_train(
     log_important(f"Training completed. (time: {t_end - t_start:.6f})")
 
     if writer is not None:
-        # show input word embedding
         writer_add_embedding(writer, model, tokenizer, device=device)
 
         writer.close()
@@ -617,10 +679,13 @@ def action_train(
 
 def action_model_init(path: StrOrPath, *, yes: bool = False):
     project_info = load_project(path)
-    weight_file = Path(dirname(path), project_info.weight_file)
-    vocab_file = Path(dirname(path), project_info.vocab_file)
+    model_state_file = resolve_parent(path) / project_info.model_state_file
+    vocab_file = resolve_parent(path) / project_info.vocab_file
+    train_config = project_info.train_config
+    optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
 
-    prompt_overwrite(weight_file)
+    prompt_overwrite(model_state_file, yes=yes)
+    prompt_overwrite(optimizer_state_file, yes=yes)
 
     words = load_gzip_pickle(vocab_file)
     tokenizer = create_tokenizer(words)
@@ -647,13 +712,16 @@ def action_model_init(path: StrOrPath, *, yes: bool = False):
         print("Corrected.")
 
     model = LLM(config)
-    save_weights(weight_file, model)
+    save_model_state(model_state_file, model)
+    log_success(f"Initialized model state at {model_state_file}.")
+
+    optimizer = Adam(model.parameters(), lr=train_config.learning_rate)
+    save_optimizer_state(optimizer_state_file, optimizer)
+    log_success(f"Initialized optimizer state at {optimizer_state_file}.")
 
     project_info.train_info = TrainInfo()
 
     save_project(path, project_info)
-
-    log_success(f"Initialized model at {weight_file}.")
 
 
 #### main ####
@@ -732,13 +800,14 @@ def create_parser() -> ArgumentParser:
     # train
     train_parser = subparsers.add_parser("train", help="train model")
     train_parser.add_argument("path", help="project file")
-    train_parser.add_argument("seq_len", type=int, help="sequence length")
-    train_parser.add_argument("batch_size", type=int, help="batch size")
     train_parser.add_argument("steps", type=int, help="number of steps")
     train_parser.add_argument("data", nargs="+", help="token data file")
+    train_parser.add_argument("-l", "--seq-len", type=int, help="sequence length")
+    train_parser.add_argument("-b", "--batch-size", type=int, help="batch size")
+    train_parser.add_argument("-r", "--learning-rate", type=float, help="learning rate")
     train_parser.add_argument("-v", "--val", nargs="*", help="validation data file")
     train_parser.add_argument(
-        "-lr", "--learning-rate", type=float, default=0.001, help="learning rate"
+        "-m", "--mark", action="store_true", help="add markers (SOT, EOT, etc.)"
     )
     train_parser.add_argument(
         "-tb", "--tensorboard-dir", help="TensorBoard write directory"
@@ -749,9 +818,6 @@ def create_parser() -> ArgumentParser:
         type=int,
         default=10,
         help="log each this number of steps",
-    )
-    train_parser.add_argument(
-        "-m", "--mark", action="store_true", help="add markers (SOT, EOT, etc.)"
     )
 
     # model_init
@@ -801,16 +867,16 @@ def main():
         case "train":
             action_train(
                 args.path,
-                seq_len=args.seq_len,
-                batch_size=args.batch_size,
                 steps=args.steps,
                 data_paths=args.data,
+                seq_len=args.seq_len,
+                batch_size=args.batch_size,
                 learning_rate=args.learning_rate,
+                mark=args.mark,
                 val_paths=args.val,
                 device=device,
                 tensorboard_dir=args.tensorboard_dir,
                 log_period=args.log_period,
-                mark=args.mark,
             )
         case "model_init":
             action_model_init(args.path, yes=args.yes)
