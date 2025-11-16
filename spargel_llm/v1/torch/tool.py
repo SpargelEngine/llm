@@ -296,7 +296,11 @@ def compute_validation_loss(
                 inputs, masks, targets = next(iterator)
 
             loss = validation_loss_step(
-                model, inputs.to(device), masks.to(device), targets, pad_index=PAD
+                model,
+                inputs.to(device),
+                masks.to(device),
+                targets.to(device),
+                pad_index=PAD,
             )
 
             total_loss += loss.detach().item()
@@ -742,7 +746,6 @@ def create_parser() -> ArgumentParser:
         "-t",
         "--thread",
         type=int,
-        default=os.cpu_count() or 8,
         help="number of threads PyTorch will use",
     )
 
@@ -836,11 +839,17 @@ def main():
 
     torch.set_printoptions(linewidth=160)
 
-    log_info(f"PyTorch will use {args.thread} CPU thread(s).")
-    torch.set_num_threads(args.thread)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log_info(f"Using device: {device}")
+
+    num_threads = 8
+    if args.thread is not None:
+        num_threads = args.thread
+    elif device == "cpu":
+        num_threads = os.cpu_count() or 8
+
+    torch.set_num_threads(num_threads)
+    log_info(f"PyTorch will use {num_threads} CPU thread(s).")
 
     # CUDA
     if device == "cuda":
