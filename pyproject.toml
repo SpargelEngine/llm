@@ -4,8 +4,8 @@ version = "0.1.0"
 requires-python = ">=3.13"
 
 dependencies = [
-    "numpy>=2.3.4",
-    "pydantic>=2.12.3",
+    "numpy>=2.4.0",
+    "pydantic>=2.12.5",
     "regex>=2025.10.23",
     "rich>=14.2.0",
     "tqdm>=4.67.1",
@@ -13,18 +13,18 @@ dependencies = [
 
 [project.optional-dependencies]
 jax_cuda12 = [
-    "flax>=0.11.2",
-    "jax[cuda12]>=0.7.1",
+    "flax>=0.12.2",
+    "jax[cuda12]>=0.8.2",
     "optax>=0.2.5",
 ]
 matplotlib = [
-    "matplotlib>=3.10.7"
+    "matplotlib>=3.10.8"
 ]
 tensorboard = [
     "tensorboard>=2.20.0",
 ]
 torch_cpu = [
-    "torch>=2.9.0",
+    "torch>=2.9.1",
 ]
 
 [tool.uv.sources]
@@ -40,7 +40,7 @@ explicit = true
 [dependency-groups]
 dev = [
     "ipykernel>=7.1.0",
-    "ruff>=0.14.3",
+    "ruff>=0.14.10",
 ]
 
 [tool.ruff.lint]

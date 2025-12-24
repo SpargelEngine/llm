@@ -6,9 +6,10 @@ from typing import Optional, cast
 
 from tqdm import tqdm
 
+from spargel_llm.bpe import bpe_expand
 from spargel_llm.text_splitter import GPT2_SPLIT_PATTERN, RegexSplitter
 from spargel_llm.tokenizer import WordTokenizer
-from spargel_llm.utils import bpe_expand, demo_tokenization
+from spargel_llm.utils import demo_tokenization
 
 from .logging import log_info, log_success, log_warning
 from .source import get_texts
@@ -65,16 +66,13 @@ def action_expand(
     source_paths: list[str],
     *,
     random_seed=None,
-    parallel: bool = False,
+    processes=None,
 ):
     words = load_gzip_pickle(path)
 
     if size <= len(words):
         log_warning(f"Target size {size} <= current size {len(words)}, no nothing.")
         return
-
-    if parallel:
-        log_warning("Using experimental multi-processing feature.")
 
     text_splitter = RegexSplitter(GPT2_SPLIT_PATTERN)
     tokenizer = WordTokenizer(words)
@@ -89,10 +87,9 @@ def action_expand(
         source_path, count = parse_source(item)
         _texts = list(tqdm(get_texts(source_path), desc=source_path))
 
+        random.shuffle(_texts)
         if count > 0 and count < len(_texts):
-            random.shuffle(_texts)
             del _texts[count:]
-
         texts.extend(_texts)
 
     if len(texts) == 0:
@@ -112,7 +109,7 @@ def action_expand(
                 samples.append(tokens)
 
     # free memory
-    texts = None
+    texts.clear()
 
     log_info(f"Loaded {len(samples)} samples with length >= 2.")
     log_info(
@@ -121,7 +118,7 @@ def action_expand(
 
     log_info("Vocabulary expansion begins.")
 
-    bpe_expand(words, samples, size - len(words), parallel=parallel)
+    bpe_expand(words, samples, size - len(words), num_processes=processes)
 
     log_info(f"Finished. Vocabulary size expaned to {len(words)}")
 
@@ -309,10 +306,7 @@ def create_parser() -> ArgumentParser:
     expand_parser.add_argument("source", nargs="+", help="text source file")
     expand_parser.add_argument("-rs", "--random-seed", help="random seed")
     expand_parser.add_argument(
-        "-p",
-        "--parallel",
-        action="store_true",
-        help="use multi-processing (experimental)",
+        "-p", "--processes", type=int, help="number of processes"
     )
 
     # copy
@@ -383,7 +377,7 @@ def main():
                 args.size,
                 args.source,
                 random_seed=args.random_seed,
-                parallel=args.parallel,
+                processes=args.processes,
             )
         case "copy":
             action_copy(args.path, args.out_path, args.size, yes=args.yes)
