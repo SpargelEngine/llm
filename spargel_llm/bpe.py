@@ -1,9 +1,7 @@
-import multiprocessing
+import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import Pipe, Process, cpu_count
 from typing import Iterable, Optional, Sequence
-
-from .meta import ai_marker
 
 # Priority of merge.
 Rank = int
@@ -77,76 +75,210 @@ def byte_pair_merge(ranks: dict[bytes, Rank], piece: bytes) -> list[int]:
     return [segment[0] for segment in parts[:-1]]
 
 
-@ai_marker(human_checked=True)
-def _count_pairs_in_seqs(seqs: Iterable[Sequence[int]]) -> Counter[tuple[int, int]]:
-
-    def pairs[T](seqs: Iterable[Sequence[T]]):
-        for seq in seqs:
-            for i in range(len(seq) - 1):
-                yield seq[i], seq[i + 1]
-
-    return Counter(pairs(seqs))
+def _remove_length_one_samples(samples: list[list[int]]):
+    pos = 0
+    for sample in samples:
+        if len(sample) >= 2:
+            samples[pos] = sample
+            pos += 1
+    del samples[pos:]
 
 
-def find_most_frequent_pair(seqs: Iterable[Sequence[int]]) -> tuple[int, int, int]:
-    counter = _count_pairs_in_seqs(seqs)
-
-    most_common = counter.most_common(1)
-    if len(most_common) == 0:
-        return 0, 0, 0
-    else:
-        pair, cnt = most_common[0]
-        return *pair, cnt
+def _count_pairs_in_seqs(
+    counter: Counter[tuple[int, int]], seqs: Iterable[Sequence[int]]
+):
+    for seq in seqs:
+        counter.update((seq[i], seq[i + 1]) for i in range(len(seq) - 1))
 
 
-# experimental: it behaves even worse
-@ai_marker(human_checked=True)
-def find_most_frequent_pair_parallel(
-    seqs: Sequence[Sequence[int]],
+def _apply_merge(seq: list[int], id1: int, id2: int, new_id: int):
+    """
+    Find all adjacent pairs of (id1, id2) in a sequence and replace them with new_id.
+    """
+
+    # no pairs: nothing to do
+    if len(seq) <= 1:
+        return
+
+    # We do the merging in place so no extra memory allocation is needed.
+    # There won't be any RAW (Read After Write) since we always have pos <= cursor.
+    cursor = 0
+    pos = 0
+    while cursor < len(seq) - 1:
+        if seq[cursor] == id1 and seq[cursor + 1] == id2:
+            seq[pos] = new_id
+            cursor += 2
+        else:
+            seq[pos] = seq[cursor]
+            cursor += 1
+        pos += 1
+
+    # last one
+    if cursor == len(seq) - 1:
+        seq[pos] = seq[cursor]
+        pos += 1
+
+    del seq[pos:]
+
+
+def _apply_merge_to_chunk(
+    samples_chunk: list[list[int]], id1: int, id2: int, new_id: int
+):
+    for sample in samples_chunk:
+        _apply_merge(sample, id1, id2, new_id)
+
+
+def _bpe_expand_worker_func(samples: list[list[int]], conn):
+    counter = Counter()
+    while True:
+        signal = conn.recv()
+        match signal:
+            case 0:
+                break
+            case 1:
+                _remove_length_one_samples(samples)
+
+                counter.clear()
+                _count_pairs_in_seqs(counter, samples)
+                conn.send(counter)
+                counter.clear()
+
+                id1, id2, new_id = conn.recv()
+                if new_id == 0:
+                    continue
+                _apply_merge_to_chunk(samples, id1, id2, new_id)
+            case _:
+                raise ValueError(f"unknown signal: ${signal}")
+
+    conn.close()
+
+
+def bpe_expand(
+    words: list[bytes],
+    samples: list[list[int]],
+    count: int,
     *,
     num_processes: Optional[int] = None,
-) -> tuple[int, int, int]:
-    """
-    Args:
-        samples: from all these we count the frequencies of pairs
-        num_processes: number of parallel processes to use for counting (default: number of CPU cores)
+):
 
-    Return:
-        id1, id2, freq: the most frequent pair and its frequency (return freq = 0 when no pairs)
-    """
+    if count == 0:
+        return
 
-    if len(seqs) == 0:
-        return 0, 0, 0
-
-    # Use all available CPUs if not specified
     if num_processes is None:
-        num_processes = multiprocessing.cpu_count()
+        num_processes = cpu_count()
 
-    # For small datasets, use sequential processing to avoid overhead
-    if num_processes == 1 or len(seqs) < num_processes:
-        counter = _count_pairs_in_seqs(seqs)
-    else:
-        # Split samples into chunks
-        chunk_size = len(seqs) // num_processes
+    if num_processes == 1:
+        bpe_expand_simple(words, samples, count)
+        return
 
-        if len(seqs) % num_processes != 0:
-            chunk_size += 1
+    n_samples = len(samples)
+    base_size = n_samples // num_processes
+    remainder = n_samples % num_processes
 
-        chunks = [seqs[i : i + chunk_size] for i in range(0, len(seqs), chunk_size)]
+    processes: list[Process] = []
+    conns = []
 
-        # Process chunks in parallel
-        with ProcessPoolExecutor(max_workers=num_processes) as executor:
-            chunk_counters = list(executor.map(_count_pairs_in_seqs, chunks))
+    for i in range(num_processes):
+        start = i * base_size + min(i, remainder)
+        end = start + base_size + (1 if i < remainder else 0)
 
-        # Merge all counters
-        counter = Counter[tuple[int, int]]()
-        for chunk_counter in chunk_counters:
-            counter += chunk_counter
+        parent_conn, child_conn = Pipe()
+        conns.append(parent_conn)
+        process = Process(
+            target=_bpe_expand_worker_func, args=(samples[start:end], child_conn)
+        )
+        processes.append(process)
+        process.start()
 
-    # Find the most common pair
-    most_common = counter.most_common(1)
-    if len(most_common) == 0:
-        return 0, 0, 0
-    else:
-        pair, cnt = most_common[0]
-        return *pair, cnt
+    total_counter = Counter()
+    for _ in range(count):
+        t_start = time.perf_counter()
+
+        for conn in conns:
+            conn.send(1)
+
+        total_counter.clear()
+        for conn in conns:
+            counter = conn.recv()
+            total_counter.update(counter)
+
+        most_common = total_counter.most_common(1)
+        if len(most_common) == 0:
+            print("No more pairs. Stopping.")
+            for conn in conns:
+                conn.send((0, 0, 0))
+            break
+        total_counter.clear()
+
+        new_id = len(words)
+        (id1, id2), freq = most_common[0]
+        new_word = words[id1] + words[id2]
+        words.append(new_word)
+
+        for conn in conns:
+            conn.send((id1, id2, new_id))
+
+        t_end = time.perf_counter()
+
+        print(
+            f"word {new_id}: {id1}+{id2} freq={freq} \t{new_word} ({repr(new_word.decode(errors="ignore"))}) {t_end-t_start:.6f}s"
+        )
+
+    for conn in conns:
+        conn.send(0)
+
+    for process in processes:
+        process.join()
+
+
+def bpe_expand_simple(words: list[bytes], samples: list[list[int]], count: int):
+    """
+    Find frequent pairs and replace them with new words.
+
+    Args:
+        words: the list of words, id == index; new words will be appended to it.
+        samples: from these we find pairs (will be changed)
+        count: number of new words to find (will stop early if no more pairs)
+    """
+
+    counter = Counter()
+    for _ in range(count):
+
+        t_start = time.perf_counter()
+
+        # remove seqs with len=1
+        pos = 0
+        for sample in samples:
+            if len(sample) >= 2:
+                samples[pos] = sample
+                pos += 1
+        del samples[pos:]
+
+        new_id = len(words)
+
+        counter.clear()
+        _count_pairs_in_seqs(counter, samples)
+        most_common = counter.most_common(1)
+        if len(most_common) == 0:
+            print("No more pairs. Stopping.")
+            break
+        counter.clear()
+
+        (id1, id2), freq = most_common[0]
+
+        if freq == 0:
+            print("No more pairs. Stopping.")
+            break
+
+        new_word = words[id1] + words[id2]
+
+        words.append(new_word)
+
+        for sample in samples:
+            _apply_merge(sample, id1, id2, new_id)
+
+        t_end = time.perf_counter()
+
+        print(
+            f"word {new_id}: {id1}+{id2} freq={freq} \t{new_word} ({repr(new_word.decode(errors="ignore"))}) {t_end-t_start:.6f}s"
+        )
