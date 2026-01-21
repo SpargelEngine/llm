@@ -330,12 +330,12 @@ def action_init(path: StrOrPath, *, yes: bool = False):
     # default config
     dim = 256
     cnt_layer = 4
-    cnt_head = 16
+    cnt_head = 4
     assert dim % cnt_head == 0
 
     config = Config(
         vocab_size=1000,
-        max_seq_len=4096,
+        max_seq_len=256,
         cnt_layer=cnt_layer,
         cnt_head=cnt_head,
         dim=dim,
@@ -425,10 +425,16 @@ def action_gen(
     for _ in range(count) if count >= 0 else always_true():
         input = tokens[-seq_len:]
 
+        # pad length to a power of two
+        length = len(input)
+        if length < seq_len:
+            length_expected = 1 << (length - 1).bit_length()
+            input = input + [PAD] * (length_expected - length)
+
         with torch.no_grad():
             logits = generate_step(model, torch.tensor(input, device=device))
 
-        logits = logits[-1, :]  # get the last one
+        logits = logits[length - 1, :]  # get the new token
         probs = torch.softmax(logits / temperature, dim=-1)
         next = int(torch.multinomial(probs, num_samples=1).item())
 

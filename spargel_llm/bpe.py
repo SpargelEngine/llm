@@ -165,7 +165,7 @@ def bpe_expand(
         return
 
     if num_processes is None:
-        num_processes = cpu_count()
+        num_processes = 1
 
     if num_processes == 1:
         bpe_expand_simple(words, samples, count)
