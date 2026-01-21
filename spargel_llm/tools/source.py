@@ -1,3 +1,4 @@
+import gzip
 import json
 from pathlib import Path
 from typing import Iterable, Literal, Optional, override
@@ -8,6 +9,7 @@ from regex import Pattern
 
 from spargel_llm.meta import ai_marker
 
+from .logging import log_warning
 from .typing import StrOrPath
 
 
@@ -33,6 +35,7 @@ class FileListSource(SourceModel):
     type: Literal["file_list"]
     base: str = "."
     paths: list[str]
+    gzip: bool = False
 
     @override
     def get_texts(self, this_path):
@@ -44,12 +47,26 @@ class FileListSource(SourceModel):
                         file_path = line.strip()
                         if file_path:
                             real_path = resolve_parent(list_file_path) / file_path
-                            with open(real_path, "r") as file_f:
-                                yield file_f.read()
+                            try:
+                                if self.gzip:
+                                    with gzip.open(real_path, "rt") as file_f:
+                                        yield file_f.read()
+                                else:
+                                    with open(real_path, "r") as file_f:
+                                        yield file_f.read()
+                            except UnicodeDecodeError:
+                                log_warning(f"UnicodeDecodeError in file: {real_path}")
             else:
                 real_path = resolve_parent(this_path) / self.base / path
-                with open(real_path, "r") as f:
-                    yield f.read()
+                try:
+                    if self.gzip:
+                        with gzip.open(real_path, "rt") as f:
+                            yield f.read()
+                    else:
+                        with open(real_path, "r") as f:
+                            yield f.read()
+                except UnicodeDecodeError:
+                    log_warning(f"UnicodeDecodeError in file: {real_path}")
 
 
 class FindSource(SourceModel):
@@ -62,17 +79,20 @@ class FindSource(SourceModel):
     file_pattern: Optional[str] = None
     dir_pattern: Optional[str] = None
     bases: list[str]
+    prefix: Optional[str] = None
 
     @override
     def get_texts(self, this_path):
         dir_pattern = regex.compile(self.dir_pattern) if self.dir_pattern else None
         file_pattern = regex.compile(self.file_pattern) if self.file_pattern else None
 
-        for base in self.bases:
-            search_dir = resolve_parent(this_path) / base
+        path = resolve_parent(this_path)
+        if self.prefix is not None:
+            path = path / self.prefix
 
+        for base in self.bases:
             yield from self._search_dir(
-                search_dir, file_pattern=file_pattern, dir_pattern=dir_pattern
+                path / base, file_pattern=file_pattern, dir_pattern=dir_pattern
             )
 
     def _search_dir(
@@ -87,8 +107,11 @@ class FindSource(SourceModel):
                 if file_pattern is not None and not file_pattern.fullmatch(path.name):
                     continue
 
-                with open(path, "r") as f:
-                    yield f.read()
+                try:
+                    with open(path, "r") as f:
+                        yield f.read()
+                except UnicodeDecodeError:
+                    log_warning(f"UnicodeDecodeError in file: {path}")
 
             elif path.is_dir():
                 if dir_pattern is not None and not dir_pattern.fullmatch(path.name):
@@ -134,13 +157,18 @@ class RegexSource(SourceModel):
 
     type: Literal["regex"]
     pattern: str
+    group: int = 0
     sources: list["Source"]
 
     @override
     def get_texts(self, this_path):
         for source in self.sources:
             for text in source.get_texts(this_path):
-                yield from regex.findall(self.pattern, text)
+                for match in regex.findall(self.pattern, text):
+                    if isinstance(match, tuple) and self.group < len(match):
+                        yield match[self.group]
+                    else:
+                        yield str(match)
 
 
 class LengthFilterSource(SourceModel):

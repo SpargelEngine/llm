@@ -226,9 +226,9 @@ def action_source_show(path: StrOrPath, count: int = 1):
         if len(texts) == 0:
             raise ValueError("no texts")
 
+        chosen_texts = random.choices(texts, weights=list(map(len, texts)), k=count)
         print("Example:")
-        for i in range(count):
-            text = random.choice(texts)
+        for i, text in enumerate(chosen_texts):
             log_info(f"**** Sample {i} (len={len(text)})****")
             print(text, end="")
             if not text.endswith("\n"):
