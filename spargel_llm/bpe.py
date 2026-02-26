@@ -1,6 +1,6 @@
 import time
 from collections import Counter
-from multiprocessing import Pipe, Process, cpu_count
+from multiprocessing import Pipe, Process
 from typing import Iterable, Optional, Sequence
 
 # Priority of merge.
@@ -221,7 +221,7 @@ def bpe_expand(
         t_end = time.perf_counter()
 
         print(
-            f"word {new_id}: {id1}+{id2} freq={freq} \t{new_word} ({repr(new_word.decode(errors="ignore"))}) {t_end-t_start:.6f}s"
+            f"word {new_id}: {id1}+{id2} freq={freq} \t{new_word} ({repr(new_word.decode(errors='ignore'))}) {t_end - t_start:.6f}s"
         )
 
     for conn in conns:
@@ -243,7 +243,6 @@ def bpe_expand_simple(words: list[bytes], samples: list[list[int]], count: int):
 
     counter = Counter()
     for _ in range(count):
-
         t_start = time.perf_counter()
 
         # remove seqs with len=1
@@ -280,5 +279,5 @@ def bpe_expand_simple(words: list[bytes], samples: list[list[int]], count: int):
         t_end = time.perf_counter()
 
         print(
-            f"word {new_id}: {id1}+{id2} freq={freq} \t{new_word} ({repr(new_word.decode(errors="ignore"))}) {t_end-t_start:.6f}s"
+            f"word {new_id}: {id1}+{id2} freq={freq} \t{new_word} ({repr(new_word.decode(errors='ignore'))}) {t_end - t_start:.6f}s"
         )

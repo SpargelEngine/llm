@@ -22,11 +22,11 @@ class SeqDataSource[T](DataSource[T]):
     data: Sequence[T]
     random: Random
 
-    def __init__(self, data: Sequence[T], *, random: Random = Random()):
+    def __init__(self, data: Sequence[T], *, random: Random | None = None):
         assert len(data) > 0
 
         self.data = data
-        self.random = random
+        self.random = random if random is not None else Random()
 
     @override
     def sample(self) -> T:
@@ -43,9 +43,9 @@ class GeneratedDataSource[T](DataSource[T]):
     func: Callable[[Random], T]
     random: Random
 
-    def __init__(self, func: Callable[[Random], T], *, random: Random = Random()):
+    def __init__(self, func: Callable[[Random], T], *, random: Random | None = None):
         self.func = func
-        self.random = random
+        self.random = random if random is not None else Random()
 
     @override
     def sample(self) -> T:
@@ -66,10 +66,10 @@ class WeightedDataSource[T](DataSource[T]):
         sources: Sequence[DataSource[T]],
         weights: Sequence[float],
         *,
-        random: Random = Random(),
+        random: Random | None = None,
     ):
         self.picker = RandomPicker(sources, weights)
-        self.random = random
+        self.random = random if random is not None else Random()
 
     @override
     def sample(self) -> T:
@@ -90,7 +90,7 @@ class SliceDataSource[S: Sliceable](DataSource[S]):
         min_len: int,
         max_len: int = 0,
         *,
-        random: Random = Random(),
+        random: Random | None = None,
     ):
         if max_len == 0:
             max_len = min_len
@@ -99,7 +99,7 @@ class SliceDataSource[S: Sliceable](DataSource[S]):
 
         self.seq = seq
         self.min_len, self.max_len = min_len, max_len
-        self.random = random
+        self.random = random if random is not None else Random()
 
     @override
     def sample(self) -> S:
@@ -153,11 +153,11 @@ class DataLoader[T](Iterator[T]):
         datasets: Sequence[Dataset[T]],
         shuffle: bool = False,
         *,
-        random: Random = Random(),
+        random: Random | None = None,
     ):
         self.datasets = list(datasets)
         self.shuffle = shuffle
-        self.random = random
+        self.random = random if random is not None else Random()
 
         self._len = sum(len(dataset) for dataset in datasets)
         self._indices = []
