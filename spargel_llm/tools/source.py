@@ -236,7 +236,17 @@ class SplitSource(SourceModel):
                 yield from text.split(self.separator)
 
 
-type Source = FileListSource | FindSource | ReferenceSource | LinesSource | RegexSource | LengthFilterSource | ProcessSource | DuplicateFilterSource | SplitSource
+type Source = (
+    FileListSource
+    | FindSource
+    | ReferenceSource
+    | LinesSource
+    | RegexSource
+    | LengthFilterSource
+    | ProcessSource
+    | DuplicateFilterSource
+    | SplitSource
+)
 
 
 class SourceWrapperModel(BaseModel):
@@ -335,7 +345,12 @@ class RemoveShortLinesOperation(OperationModel):
         )
 
 
-type Operation = ReferenceOperation | StripOperation | RegexReplaceOperation | RemoveShortLinesOperation
+type Operation = (
+    ReferenceOperation
+    | StripOperation
+    | RegexReplaceOperation
+    | RemoveShortLinesOperation
+)
 
 
 class OperationWrapperModel(BaseModel):

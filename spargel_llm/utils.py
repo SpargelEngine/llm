@@ -61,7 +61,10 @@ class RandomPicker[T]:
         while large:
             self._prop[large.pop()] = 1.0
 
-    def sample(self, random: Random = Random()) -> T:
+    def sample(self, random: Random | None = None) -> T:
+        if random is None:
+            random = Random()
+
         x = random.random() * self._n
         i = math.floor(x)
         if (x - i) < self._prop[i]:

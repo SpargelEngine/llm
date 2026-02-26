@@ -50,7 +50,7 @@ def action_info(path: StrOrPath, *, dump: bool = False, min_len: Optional[int] =
     if dump:
         for i, word in enumerate(words):
             if min_len is None or len(word) >= min_len:
-                print(f"{i}:\t{word} ({repr(word.decode(errors="ignore"))})")
+                print(f"{i}:\t{word} ({repr(word.decode(errors='ignore'))})")
 
 
 def action_init(path: StrOrPath, *, yes: bool = False):
