@@ -82,6 +82,7 @@ class SliceDataSource[S: Sliceable](DataSource[S]):
     seq: S
     min_len: int
     max_len: int
+    end_partial: bool
     random: Random
 
     def __init__(
@@ -90,15 +91,20 @@ class SliceDataSource[S: Sliceable](DataSource[S]):
         min_len: int,
         max_len: int = 0,
         *,
+        end_partial: bool = False,
         random: Random | None = None,
     ):
         if max_len == 0:
             max_len = min_len
 
-        assert 0 <= min_len <= max_len <= len(seq)
+        assert 0 <= min_len <= max_len
+        if not end_partial:
+            assert max_len <= len(seq)
 
         self.seq = seq
         self.min_len, self.max_len = min_len, max_len
+
+        self.end_partial = end_partial
         self.random = random if random is not None else Random()
 
     @override
@@ -108,7 +114,10 @@ class SliceDataSource[S: Sliceable](DataSource[S]):
         else:
             length = self.random.randint(self.min_len, self.max_len)
 
-        index = self.random.randint(0, len(self.seq) - length)
+        if self.end_partial:
+            index = self.random.randint(0, len(self.seq) - 1)
+        else:
+            index = self.random.randint(0, len(self.seq) - length)
 
         return self.seq[index : index + length]
 

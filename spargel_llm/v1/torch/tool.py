@@ -3,15 +3,16 @@ import shutil
 import sys
 import time
 from argparse import ArgumentParser
-from codecs import getincrementaldecoder
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional, cast
+from typing import Optional
 
 import torch
+from datasets import load_from_disk
 from pydantic import BaseModel, NonNegativeInt
-from rich import print as rich_print
+from tokenizers import Tokenizer
+from tokenizers.decoders import DecodeStream
 from torch import Tensor
 from torch.optim import Adam, Optimizer
 from torch.utils.data import DataLoader
@@ -23,33 +24,19 @@ from spargel_llm.data import (
     SliceDataSource,
     WeightedDataSource,
 )
-from spargel_llm.text_splitter import GPT2_SPLIT_PATTERN, RegexSplitter
-from spargel_llm.tokenizer import WordTokenizer
-from spargel_llm.tools.logging import log_info, log_success
+from spargel_llm.tools.logging import log_error, log_info, log_success
 from spargel_llm.tools.typing import StrOrPath
 from spargel_llm.tools.utils import (
     NO_STRINGS,
     YES_STRINGS,
     PromptAbortError,
-    load_gzip_pickle,
     prompt_overwrite,
 )
 
 from .model import LLM, Config
 from .utils import StepInfo, TrainDataset, TrainInfo, generate_step, train
 
-reserved_words = [
-    b"<|pad|>",  # padding
-    b"<|unk|>",  # unknown
-    b"<|sot|>",  # start of text
-    b"<|eot|>",  # end of text
-]
-
-PAD, UNK, SOT, EOT = range(len(reserved_words))
-
-assert len(reserved_words) <= 16
-for i in range(len(reserved_words), 16):
-    reserved_words.append(f"<|placeholder{i}|>".encode())
+UNK, PAD, SOT, EOT = 0, 1, 2, 3
 
 
 class TrainConfig(BaseModel):
@@ -66,8 +53,8 @@ class ProjectInfo(BaseModel):
     # weight file location
     model_state_file: str
 
-    # vocab file location
-    vocab_file: str
+    # tokenizer file location (e.g. tokenizer.json)
+    tokenizer: str
 
     # training information & statistics
     train_info: TrainInfo
@@ -112,17 +99,29 @@ def resolve_parent(path: StrOrPath):
     return Path(path).resolve().parent
 
 
-def create_tokenizer(words: list[bytes]) -> WordTokenizer:
-    all_words = (
-        reserved_words + words + [b"<|?|>"]
-    )  # append one token due to a PyTorch bug
+def load_tokenizer(path: StrOrPath) -> Tokenizer:
+    """Load a HuggingFace ``tokenizers.Tokenizer`` from a JSON file."""
+    return Tokenizer.from_file(str(path))
 
-    return WordTokenizer(
-        all_words,
-        encode_blacklist=list(range(len(reserved_words))) + [len(all_words) - 1],
-        unknown=UNK,
-        text_splitter=RegexSplitter(GPT2_SPLIT_PATTERN),
-    )
+
+def load_token_ids(path: StrOrPath) -> list[list[int]]:
+    """Load a HuggingFace dataset directory and read pre-tokenized entries.
+
+    Assumes the dataset has a ``tokens`` column where each row is a list of token IDs.
+    """
+    path = Path(path).resolve()
+    dataset = load_from_disk(str(path))
+
+    log_info(f"Loading tokens from dataset ({len(dataset):,} rows).")
+
+    data: list[list[int]] = []
+    for item in dataset:
+        tokens = item["tokens"]
+        if tokens is None or len(tokens) == 0:
+            continue
+        data.append(list(tokens))
+
+    return data
 
 
 def get_backup_path(path: StrOrPath):
@@ -163,7 +162,12 @@ def parse_data(s: str) -> tuple[str, float, SampleType]:
     return path, weight, sample_type
 
 
-def create_data_source(paths: list[str], seq_len: int, mark: bool = False):
+def create_data_source(
+    paths: list[str],
+    seq_len: int,
+    *,
+    mark: bool = False,
+):
     assert len(paths) > 0
 
     data_sources: list[DataSource[list[int]]] = []
@@ -172,12 +176,7 @@ def create_data_source(paths: list[str], seq_len: int, mark: bool = False):
     count_total, count_selected = 0, 0
 
     for path, weight, sample_type in map(parse_data, paths):
-        data = cast(list[list[int]], load_gzip_pickle(path))
-
-        # Adjust token indices since we have special tokens.
-        for tokens in data:
-            for i in range(len(tokens)):
-                tokens[i] += len(reserved_words)
+        data = load_token_ids(path)
 
         count_total += len(data)
 
@@ -190,10 +189,9 @@ def create_data_source(paths: list[str], seq_len: int, mark: bool = False):
                     if mark:
                         tokens = [SOT] + tokens + [EOT]
 
-                    if len(tokens) < seq_len + 1:
-                        continue
-
-                    child_data_sources.append(SliceDataSource(tokens, seq_len + 1))
+                    child_data_sources.append(
+                        SliceDataSource(tokens, seq_len + 1, end_partial=True)
+                    )
                     child_weights.append(len(tokens))
 
                     count_selected += 1
@@ -237,22 +235,17 @@ def create_data_source(paths: list[str], seq_len: int, mark: bool = False):
 def writer_add_embedding(
     writer: SummaryWriter,
     model: LLM,
-    tokenizer: WordTokenizer,
+    tokenizer: Tokenizer,
     *,
     device: str = "cpu",
 ):
     model.eval()
     with torch.no_grad():
-        indices = torch.arange(len(tokenizer.words), dtype=torch.int, device=device)
+        vocab_size = tokenizer.get_vocab_size()
+        indices = torch.arange(vocab_size, dtype=torch.int, device=device)
         embed_vectors = model.embed(indices)
 
-        labels = []
-        for word in tokenizer.words:
-            try:
-                label = word.decode("utf-8")
-            except UnicodeDecodeError:
-                label = repr(word)
-            labels.append(label if len(label.strip()) == len(label) else repr(label))
+        labels = [tokenizer.id_to_token(i) for i in range(vocab_size)]
 
     writer.add_embedding(embed_vectors.cpu(), labels)
 
@@ -321,7 +314,7 @@ def action_info(path: StrOrPath):
 
     log_info("==== Project Info ====")
     print("Project file:", path)
-    rich_print(project_info)
+    print(project_info)
 
 
 def action_init(path: StrOrPath, *, yes: bool = False):
@@ -345,12 +338,12 @@ def action_init(path: StrOrPath, *, yes: bool = False):
     )
 
     model_state_file = "model_state.pth"
-    vocab_file = "vocab.pkl.gz"
+    tokenizer = "tokenizer.json"
 
     project_info = ProjectInfo(
         config=config,
         model_state_file=model_state_file,
-        vocab_file=vocab_file,
+        tokenizer=tokenizer,
         train_info=TrainInfo(),
         train_config=TrainConfig(
             seq_len=0,
@@ -391,10 +384,9 @@ def action_gen(
         resolve_parent(path) / project_info.model_state_file, model, device=device
     )
 
-    words = load_gzip_pickle(resolve_parent(path) / project_info.vocab_file)
-    tokenizer = create_tokenizer(words)
+    tokenizer = load_tokenizer(resolve_parent(path) / project_info.tokenizer)
 
-    prompt_tokens = tokenizer.encode(prompt)
+    prompt_tokens = tokenizer.encode(prompt).ids
 
     if mark:
         tokens = [SOT] + prompt_tokens
@@ -417,7 +409,7 @@ def action_gen(
 
     cnt = 0
 
-    decoder = getincrementaldecoder("utf-8")(errors="ignore")
+    decode_stream = DecodeStream() if stream else None
 
     if stream and all:
         print(tokenizer.decode(tokens), end="")
@@ -441,7 +433,9 @@ def action_gen(
         tokens.append(next)
 
         if stream:
-            print(decoder.decode(tokenizer.words[next]), end="", flush=True)
+            chunk = decode_stream.step(tokenizer, next)
+            if chunk is not None:
+                print(chunk, end="", flush=True)
 
         cnt += 1
 
@@ -478,7 +472,7 @@ def action_train(
 
     project_info = load_project(path)
     model_state_file = resolve_parent(path) / project_info.model_state_file
-    vocab_file = resolve_parent(path) / project_info.vocab_file
+    tokenizer_file = resolve_parent(path) / project_info.tokenizer
     train_config = project_info.train_config
     optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
 
@@ -505,8 +499,7 @@ def action_train(
 
     # data
 
-    words = load_gzip_pickle(vocab_file)
-    tokenizer = create_tokenizer(words)
+    tokenizer = load_tokenizer(tokenizer_file)
 
     log_info("Preparing data.")
     if mark:
@@ -690,38 +683,13 @@ def action_train(
 def action_model_init(path: StrOrPath, *, yes: bool = False):
     project_info = load_project(path)
     model_state_file = resolve_parent(path) / project_info.model_state_file
-    vocab_file = resolve_parent(path) / project_info.vocab_file
     train_config = project_info.train_config
     optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
 
     prompt_overwrite(model_state_file, yes=yes)
     prompt_overwrite(optimizer_state_file, yes=yes)
 
-    words = load_gzip_pickle(vocab_file)
-    tokenizer = create_tokenizer(words)
-
-    config = project_info.config
-
-    correct_vocab_size = False
-    if config.vocab_size != tokenizer.vocab_size():
-        if not yes:
-            ans = input(
-                f"Current config.vocab_size {config.vocab_size} != actual vocab_size {tokenizer.vocab_size()}. Correct it? "
-            )
-            if ans.strip().lower() in YES_STRINGS:
-                correct_vocab_size = True
-            elif ans.strip().lower() in NO_STRINGS:
-                pass
-            else:
-                raise PromptAbortError
-        else:
-            correct_vocab_size = True
-
-    if correct_vocab_size:
-        config.vocab_size = tokenizer.vocab_size()
-        print("Corrected.")
-
-    model = LLM(config)
+    model = LLM(project_info.config)
     save_model_state(model_state_file, model)
     log_success(f"Initialized model state at {model_state_file}.")
 
@@ -810,11 +778,13 @@ def create_parser() -> ArgumentParser:
     train_parser = subparsers.add_parser("train", help="train model")
     train_parser.add_argument("path", help="project file")
     train_parser.add_argument("steps", type=int, help="number of steps")
-    train_parser.add_argument("data", nargs="+", help="token data file")
+    train_parser.add_argument("data", nargs="+", help="text data directory")
     train_parser.add_argument("-l", "--seq-len", type=int, help="sequence length")
     train_parser.add_argument("-b", "--batch-size", type=int, help="batch size")
     train_parser.add_argument("-r", "--learning-rate", type=float, help="learning rate")
-    train_parser.add_argument("-v", "--val", nargs="*", help="validation data file")
+    train_parser.add_argument(
+        "-v", "--val", nargs="*", help="validation data directory"
+    )
     train_parser.add_argument(
         "-m", "--mark", action="store_true", help="add markers (SOT, EOT, etc.)"
     )

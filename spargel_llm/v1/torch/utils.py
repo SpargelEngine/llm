@@ -41,7 +41,7 @@ class TrainDataset(IterableDataset[Sample]):
             while True:
                 tokens = self.data_source.sample()
 
-                if len(tokens) == 0:
+                if len(tokens) <= 1:
                     continue
 
                 length = len(tokens) - 1

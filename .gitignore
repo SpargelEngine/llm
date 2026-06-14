@@ -9,7 +9,17 @@ wheels/
 # Virtual environments
 .venv
 
-.*.swp
+# Local environment variables
 .env
-.tmp*
+
+# Lock files
+uv.lock
+
+# IDE & Editor
+*.swp
 .vscode/
+
+# Cache & Temporary files
+.pytest_cache/
+.ruff_cache/
+.tmp*
