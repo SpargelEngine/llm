@@ -1,4 +1,5 @@
 import os
+import random
 import shutil
 import sys
 import time
@@ -107,29 +108,74 @@ def load_dataset(path: StrOrPath) -> Dataset:
     return dataset
 
 
+def show_random_example(
+    dataset: Dataset, seq_len: int, pad_index: int, tokenizer: Tokenizer
+):
+    """Print one random sample from a random window position."""
+    n = len(dataset)
+    for _ in range(100):  # retry in case of empty items
+        idx = random.randrange(n)
+        tokens: list[int] = dataset[idx]["tokens"]
+        if tokens and len(tokens) > 1:
+            max_pos = max(len(tokens) - 2, 0)
+            pos = random.randint(0, max_pos)
+            gen = iter_samples(
+                dataset, seq_len, pad_index, start_index=idx, start_offset=pos
+            )
+            input_ids, mask, target_ids = next(gen)
+            print(f"  sample_idx={idx}, offset={pos}")
+            print(f"  input_ids  {input_ids!r}")
+            print(f"  mask       {mask!r}")
+            print(f"  target_ids {target_ids!r}")
+            print(f"  decoded `{tokenizer.decode(input_ids)!r}`")
+            return
+    print("  (no valid samples found)")
+
+
 def iter_samples(
     dataset: Dataset,
     seq_len: int,
     pad_index: int,
-    offset: int = 0,
     stride: int | None = None,
+    start_index: int = 0,
+    start_offset: int = 0,
+    tracker: dict | None = None,
 ) -> Iterator[tuple[list[int], list[bool], list[int]]]:
     """Iterate through a dataset sequentially and yield individual samples.
 
-    For each row, a window of ``seq_len + 1`` tokens slides from *offset*
-    with the given *stride* (default: ``seq_len + 1``).  Each window
-    produces one sample: ``(input_ids, mask, target_ids)`` as plain Python
-    lists.  Short tails are padded with *pad_index*.
+    For each row, a window of ``seq_len + 1`` tokens slides with the given
+    *stride* (default: ``seq_len + 1``).  Each window produces one sample:
+    ``(input_ids, mask, target_ids)`` as plain Python lists.  Short tails
+    are padded with *pad_index*.
+
+    *start_index* skips the first N items of *dataset*.
+
+    *start_offset* is used as the initial window position only for the
+    first item (the one at *start_index*); all subsequent items start from
+    the beginning.  This allows resuming training from the exact position
+    where a previous run stopped.
+
+    If *tracker* is a dict, it is updated before each yield with keys
+    ``sample_idx`` (current dataset row) and ``offset`` (window position
+    within that row) so the caller can know how far the iterator
+    progressed.
     """
     if stride is None:
         stride = seq_len + 1
 
-    for item in dataset:
+    first = True
+
+    for i, item in enumerate(dataset):
+        if i < start_index:
+            continue
+
         tokens: list[int] = item["tokens"]
         if tokens is None or len(tokens) <= 1:
             continue
 
-        pos = offset
+        pos = start_offset if first else 0
+        first = False
+
         while pos + 1 < len(tokens):
             end = min(pos + seq_len + 1, len(tokens))
             segment = tokens[pos:end]
@@ -138,6 +184,10 @@ def iter_samples(
             input_ids = segment[:L] + [pad_index] * (seq_len - L)
             mask = [False] * L + [True] * (seq_len - L)
             target_ids = segment[1 : L + 1] + [pad_index] * (seq_len - L)
+
+            if tracker is not None:
+                tracker["sample_idx"] = i
+                tracker["offset"] = pos
 
             yield input_ids, mask, target_ids
 
@@ -180,12 +230,23 @@ def iter_batches(
     seq_len: int,
     batch_size: int,
     pad_index: int,
-    offset: int = 0,
     stride: int | None = None,
+    start_index: int = 0,
+    start_offset: int = 0,
+    tracker: dict | None = None,
 ) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
     """Convenience wrapper: ``make_batches(iter_samples(...))``."""
     return make_batches(
-        iter_samples(dataset, seq_len, pad_index, offset, stride), batch_size
+        iter_samples(
+            dataset,
+            seq_len,
+            pad_index,
+            stride=stride,
+            start_index=start_index,
+            start_offset=start_offset,
+            tracker=tracker,
+        ),
+        batch_size,
     )
 
 
@@ -430,6 +491,8 @@ def action_train(
     log_period: int = 10,
     tensorboard_dir: Optional[str] = None,
     device: str = "cpu",
+    start_index: int = 0,
+    start_offset: int = 0,
 ):
     assert log_period > 0
 
@@ -472,18 +535,20 @@ def action_train(
     log_info("Loading training dataset.")
     dataset = load_dataset(data_path)
 
-    # show a few samples as example
+    # show a random sample as example
     print("Data example:")
-    sample_iter = iter_samples(dataset, seq_len, PAD)
-    for i, (input_ids, mask, target_ids) in enumerate(sample_iter):
-        if i >= 3:
-            break
-        print(f"  input_ids  {input_ids!r}")
-        print(f"  mask       {mask!r}")
-        print(f"  target_ids {target_ids!r}")
-        print(f"  decoded `{tokenizer.decode(input_ids)!r}`")
+    show_random_example(dataset, seq_len, PAD, tokenizer)
 
-    batch_iterator = iter_batches(dataset, seq_len, batch_size, PAD)
+    train_tracker: dict = {"sample_idx": 0, "offset": 0}
+    batch_iterator = iter_batches(
+        dataset,
+        seq_len,
+        batch_size,
+        PAD,
+        start_index=start_index,
+        start_offset=start_offset,
+        tracker=train_tracker,
+    )
 
     val_batches = max(log_period // 10, 1)
     val_dataset = None
@@ -492,14 +557,7 @@ def action_train(
         val_dataset = load_dataset(val_path)
 
         print("Validation data example:")
-        val_sample_iter = iter_samples(val_dataset, seq_len, PAD)
-        for i, (input_ids, mask, target_ids) in enumerate(val_sample_iter):
-            if i >= 3:
-                break
-            print(f"  input   {input_ids!r}")
-            print(f"  mask    {mask!r}")
-            print(f"  target  {target_ids!r}")
-            print(f"  decoded `{tokenizer.decode(input_ids)!r}`")
+        show_random_example(val_dataset, seq_len, PAD, tokenizer)
 
     # model
 
@@ -649,6 +707,9 @@ def action_train(
     t_end = time.perf_counter()
 
     log_important(f"Training completed. (time: {t_end - t_start:.6f})")
+    log_info(
+        f"Reached sample {train_tracker['sample_idx']}, offset {train_tracker['offset']} in the dataset."
+    )
 
     if writer is not None:
         writer_add_embedding(writer, model, tokenizer, device=device)
@@ -788,6 +849,20 @@ def create_parser() -> ArgumentParser:
         default=10,
         help="log each this number of steps",
     )
+    train_parser.add_argument(
+        "-si",
+        "--start-index",
+        type=int,
+        default=0,
+        help="start training from this sample index in the dataset",
+    )
+    train_parser.add_argument(
+        "-so",
+        "--start-offset",
+        type=int,
+        default=0,
+        help="initial window offset for the first sample (subsequent samples start from 0)",
+    )
 
     # model_init
     model_init_parser = subparsers.add_parser(
@@ -856,6 +931,8 @@ def main():
                 device=device,
                 tensorboard_dir=args.tensorboard_dir,
                 log_period=args.log_period,
+                start_index=args.start_index,
+                start_offset=args.start_offset,
             )
         case "model_init":
             action_model_init(args.path, yes=args.yes)
