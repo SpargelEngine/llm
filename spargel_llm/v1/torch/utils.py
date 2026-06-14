@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, IterableDataset
 
 from spargel_llm.data import DataSource
 
-from .model import LLM
+from .model import Model
 
 
 class TrainInfo(BaseModel):
@@ -66,7 +66,7 @@ class TrainDataset(IterableDataset[Sample]):
 
 @torch.compile
 def forward_step(
-    model: LLM,
+    model: Model,
     optimizer: Optimizer,
     inputs: Tensor,
     masks: Tensor,
@@ -85,7 +85,7 @@ def backward_step(loss: Tensor, optimizer: Optimizer):
 
 
 @torch.compile
-def generate_step(model: LLM, input: Tensor) -> Tensor:
+def generate_step(model: Model, input: Tensor) -> Tensor:
     return model(input)
 
 
@@ -101,7 +101,7 @@ class StepInfo:
 
 def train(
     info: TrainInfo,
-    model: LLM,
+    model: Model,
     seq_len: int,
     optimizer: Optimizer,
     data_source: DataSource[list[int]],  # tokens

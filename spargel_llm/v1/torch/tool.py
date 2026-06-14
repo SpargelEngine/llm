@@ -11,10 +11,11 @@ from typing import Optional
 import torch
 from datasets import load_from_disk
 from pydantic import BaseModel, NonNegativeInt
+from rich import print as rich_print
 from tokenizers import Tokenizer
 from tokenizers.decoders import DecodeStream
 from torch import Tensor
-from torch.optim import Adam, Optimizer
+from torch.optim import AdamW, Optimizer
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -24,16 +25,14 @@ from spargel_llm.data import (
     SliceDataSource,
     WeightedDataSource,
 )
-from spargel_llm.tools.logging import log_error, log_info, log_success
+from spargel_llm.tools.logging import log_info, log_success
 from spargel_llm.tools.typing import StrOrPath
 from spargel_llm.tools.utils import (
-    NO_STRINGS,
-    YES_STRINGS,
     PromptAbortError,
     prompt_overwrite,
 )
 
-from .model import LLM, Config
+from .model import Config, Model
 from .utils import StepInfo, TrainDataset, TrainInfo, generate_step, train
 
 UNK, PAD, SOT, EOT = 0, 1, 2, 3
@@ -43,6 +42,7 @@ class TrainConfig(BaseModel):
     seq_len: NonNegativeInt
     batch_size: NonNegativeInt
     learning_rate: float
+    weight_decay: float
     optimizer_state_file: str
 
 
@@ -76,11 +76,11 @@ def save_project(path: StrOrPath, project_info: ProjectInfo):
         f.write(project_info.model_dump_json(indent=2))
 
 
-def load_model_state(path: StrOrPath, model: LLM, *, device: str):
+def load_model_state(path: StrOrPath, model: Model, *, device: str):
     model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
 
 
-def save_model_state(path: StrOrPath, model: LLM):
+def save_model_state(path: StrOrPath, model: Model):
     torch.save(model.state_dict(), path)
 
 
@@ -234,7 +234,7 @@ def create_data_source(
 
 def writer_add_embedding(
     writer: SummaryWriter,
-    model: LLM,
+    model: Model,
     tokenizer: Tokenizer,
     *,
     device: str = "cpu",
@@ -243,7 +243,7 @@ def writer_add_embedding(
     with torch.no_grad():
         vocab_size = tokenizer.get_vocab_size()
         indices = torch.arange(vocab_size, dtype=torch.int, device=device)
-        embed_vectors = model.embed(indices)
+        embed_vectors = model.embedding(indices)
 
         labels = [tokenizer.id_to_token(i) for i in range(vocab_size)]
 
@@ -252,7 +252,7 @@ def writer_add_embedding(
 
 @torch.compile
 def validation_loss_step(
-    model: LLM,
+    model: Model,
     inputs: Tensor,
     masks: Tensor,
     targets: Tensor,
@@ -262,7 +262,7 @@ def validation_loss_step(
 
 
 def compute_validation_loss(
-    model: LLM,
+    model: Model,
     data_source: DataSource[list[int]],
     seq_len: int,
     batch_size: int,
@@ -314,7 +314,7 @@ def action_info(path: StrOrPath):
 
     log_info("==== Project Info ====")
     print("Project file:", path)
-    print(project_info)
+    rich_print(project_info)
 
 
 def action_init(path: StrOrPath, *, yes: bool = False):
@@ -322,19 +322,19 @@ def action_init(path: StrOrPath, *, yes: bool = False):
 
     # default config
     dim = 256
-    cnt_layer = 4
-    cnt_head = 4
-    assert dim % cnt_head == 0
+    num_layer = 4
+    num_head = 4
+    assert dim % num_head == 0
 
     config = Config(
         vocab_size=1000,
         max_seq_len=256,
-        cnt_layer=cnt_layer,
-        cnt_head=cnt_head,
+        num_layer=num_layer,
+        num_head=num_head,
         dim=dim,
-        d_key=dim // cnt_head,
-        d_value=dim // cnt_head,
-        d_feed_forward=dim * 4,
+        dim_key=dim // num_head,
+        dim_value=dim // num_head,
+        dim_feed_forward=dim * 4,
     )
 
     model_state_file = "model_state.pth"
@@ -349,6 +349,7 @@ def action_init(path: StrOrPath, *, yes: bool = False):
             seq_len=0,
             batch_size=0,
             learning_rate=1e-3,
+            weight_decay=0.1,
             optimizer_state_file="optimizer_state.pth",
         ),
     )
@@ -378,7 +379,7 @@ def action_gen(
 
     project_info = load_project(path)
 
-    model = LLM(project_info.config).to(device)
+    model = Model(project_info.config).to(device)
 
     load_model_state(
         resolve_parent(path) / project_info.model_state_file, model, device=device
@@ -462,6 +463,7 @@ def action_train(
     seq_len: Optional[int] = None,
     batch_size: Optional[int] = None,
     learning_rate: Optional[float] = None,
+    weight_decay: Optional[float] = None,
     mark: bool = False,
     val_paths: Optional[list[str]] = None,
     log_period: int = 10,
@@ -497,6 +499,11 @@ def action_train(
     else:
         train_config.learning_rate = learning_rate
 
+    if weight_decay is None:
+        weight_decay = train_config.weight_decay
+    else:
+        train_config.weight_decay = weight_decay
+
     # data
 
     tokenizer = load_tokenizer(tokenizer_file)
@@ -526,13 +533,13 @@ def action_train(
 
     # model
 
-    model = LLM(project_info.config).to(device)
+    model = Model(project_info.config).to(device)
     log_info("Loading model state.")
     load_model_state(model_state_file, model, device=device)
 
     # optimizer
 
-    optimizer = Adam(model.parameters(), lr=learning_rate)
+    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     if should_reset_optimizer:
         log_info("Batch size changed, optimizer reset.")
     else:
@@ -689,11 +696,15 @@ def action_model_init(path: StrOrPath, *, yes: bool = False):
     prompt_overwrite(model_state_file, yes=yes)
     prompt_overwrite(optimizer_state_file, yes=yes)
 
-    model = LLM(project_info.config)
+    model = Model(project_info.config)
     save_model_state(model_state_file, model)
     log_success(f"Initialized model state at {model_state_file}.")
 
-    optimizer = Adam(model.parameters(), lr=train_config.learning_rate)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=train_config.learning_rate,
+        weight_decay=train_config.weight_decay,
+    )
     save_optimizer_state(optimizer_state_file, optimizer)
     log_success(f"Initialized optimizer state at {optimizer_state_file}.")
 
@@ -780,8 +791,11 @@ def create_parser() -> ArgumentParser:
     train_parser.add_argument("steps", type=int, help="number of steps")
     train_parser.add_argument("data", nargs="+", help="text data directory")
     train_parser.add_argument("-l", "--seq-len", type=int, help="sequence length")
-    train_parser.add_argument("-b", "--batch-size", type=int, help="batch size")
-    train_parser.add_argument("-r", "--learning-rate", type=float, help="learning rate")
+    train_parser.add_argument("-bs", "--batch-size", type=int, help="batch size")
+    train_parser.add_argument(
+        "-lr", "--learning-rate", type=float, help="learning rate"
+    )
+    train_parser.add_argument("-wd", "--weight-decay", type=float, help="weight decay")
     train_parser.add_argument(
         "-v", "--val", nargs="*", help="validation data directory"
     )
@@ -857,6 +871,7 @@ def main():
                 seq_len=args.seq_len,
                 batch_size=args.batch_size,
                 learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
                 mark=args.mark,
                 val_paths=args.val,
                 device=device,

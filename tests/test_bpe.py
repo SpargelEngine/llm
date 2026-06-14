@@ -1,7 +1,6 @@
 import unittest
 
 from spargel_llm.bpe import byte_pair_merge
-from spargel_llm.meta import ai_marker
 
 
 class TestBPE(unittest.TestCase):
@@ -72,7 +71,6 @@ class TestBPE(unittest.TestCase):
             ),
             [0],
         )
-
 
 
 if __name__ == "__main__":
