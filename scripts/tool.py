@@ -23,9 +23,8 @@ from spargel_llm.tools.utils import (
     PromptAbortError,
     prompt_overwrite,
 )
-
-from .model import Config, Model
-from .utils import StepInfo, TrainInfo, generate_step, train
+from spargel_llm.v1.torch.model import Config, Model
+from spargel_llm.v1.torch.utils import StepInfo, TrainInfo, generate_step, train
 
 PAD, EOT = 1, 2
 
@@ -683,6 +682,20 @@ def action_model_init(path: StrOrPath, *, yes: bool = False):
     save_project(path, project_info)
 
 
+def action_dump_param(path: StrOrPath):
+    project_info = load_project(path)
+    model_state_file = resolve_parent(path) / project_info.model_state_file
+
+    device = "cpu"
+    model = Model(project_info.config).to(device)
+    log_info("Loading model state.")
+    load_model_state(model_state_file, model, device=device)
+
+    for name, param in model.named_parameters():
+        print(f"==== {name} ====")
+        print(param)
+
+
 #### main ####
 
 
@@ -764,9 +777,7 @@ def create_parser() -> ArgumentParser:
         "-lr", "--learning-rate", type=float, help="learning rate"
     )
     train_parser.add_argument("-wd", "--weight-decay", type=float, help="weight decay")
-    train_parser.add_argument(
-        "-v", "--val", help="validation dataset directory"
-    )
+    train_parser.add_argument("-v", "--val", help="validation dataset directory")
     train_parser.add_argument(
         "-tb", "--tensorboard-dir", help="TensorBoard write directory"
     )
@@ -784,6 +795,10 @@ def create_parser() -> ArgumentParser:
         help="initialize model accroding to configuration and fill with random weights",
     )
     model_init_parser.add_argument("path", help="project file")
+
+    # param
+    dump_param_parser = subparsers.add_parser("dump_param", help="dump parameters")
+    dump_param_parser.add_argument("path", help="project file")
 
     return parser
 
@@ -844,6 +859,8 @@ def main():
             )
         case "model_init":
             action_model_init(args.path, yes=args.yes)
+        case "dump_param":
+            action_dump_param(args.path)
         case _:
             raise ValueError(f"unrecognized action: {args.action}")
 

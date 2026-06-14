@@ -30,8 +30,6 @@ def attention(
         (..., num_q, dim_v)
     """
 
-    num_q, num_k = q.size(-2), k.size(-2)
-
     # (..., num_q, num_k)
     scores = q @ k.transpose(-2, -1)
 
