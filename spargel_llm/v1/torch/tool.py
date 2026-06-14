@@ -4,27 +4,19 @@ import sys
 import time
 from argparse import ArgumentParser
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import torch
-from datasets import load_from_disk
+from datasets import Dataset, load_from_disk
 from pydantic import BaseModel, NonNegativeInt
 from rich import print as rich_print
 from tokenizers import Tokenizer
 from tokenizers.decoders import DecodeStream
 from torch import Tensor
 from torch.optim import AdamW, Optimizer
-from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from spargel_llm.data import (
-    DataSource,
-    SeqDataSource,
-    SliceDataSource,
-    WeightedDataSource,
-)
 from spargel_llm.tools.logging import log_info, log_success
 from spargel_llm.tools.typing import StrOrPath
 from spargel_llm.tools.utils import (
@@ -33,9 +25,9 @@ from spargel_llm.tools.utils import (
 )
 
 from .model import Config, Model
-from .utils import StepInfo, TrainDataset, TrainInfo, generate_step, train
+from .utils import StepInfo, TrainInfo, generate_step, train
 
-UNK, PAD, SOT, EOT = 0, 1, 2, 3
+PAD, EOT = 1, 2
 
 
 class TrainConfig(BaseModel):
@@ -104,24 +96,98 @@ def load_tokenizer(path: StrOrPath) -> Tokenizer:
     return Tokenizer.from_file(str(path))
 
 
-def load_token_ids(path: StrOrPath) -> list[list[int]]:
-    """Load a HuggingFace dataset directory and read pre-tokenized entries.
+def load_dataset(path: StrOrPath) -> Dataset:
+    """Load a HuggingFace dataset directory.
 
-    Assumes the dataset has a ``tokens`` column where each row is a list of token IDs.
+    The returned ``Dataset`` uses memory-mapped Arrow tables so the data
+    is not fully loaded into memory.
     """
     path = Path(path).resolve()
     dataset = load_from_disk(str(path))
+    log_info(f"Loaded dataset from {path} ({len(dataset):,} rows).")
+    return dataset
 
-    log_info(f"Loading tokens from dataset ({len(dataset):,} rows).")
 
-    data: list[list[int]] = []
+def iter_samples(
+    dataset: Dataset,
+    seq_len: int,
+    pad_index: int,
+    offset: int = 0,
+    stride: int | None = None,
+) -> Iterator[tuple[list[int], list[bool], list[int]]]:
+    """Iterate through a dataset sequentially and yield individual samples.
+
+    For each row, a window of ``seq_len + 1`` tokens slides from *offset*
+    with the given *stride* (default: ``seq_len + 1``).  Each window
+    produces one sample: ``(input_ids, mask, target_ids)`` as plain Python
+    lists.  Short tails are padded with *pad_index*.
+    """
+    if stride is None:
+        stride = seq_len + 1
+
     for item in dataset:
-        tokens = item["tokens"]
-        if tokens is None or len(tokens) == 0:
+        tokens: list[int] = item["tokens"]
+        if tokens is None or len(tokens) <= 1:
             continue
-        data.append(list(tokens))
 
-    return data
+        pos = offset
+        while pos + 1 < len(tokens):
+            end = min(pos + seq_len + 1, len(tokens))
+            segment = tokens[pos:end]
+            L = len(segment) - 1
+
+            input_ids = segment[:L] + [pad_index] * (seq_len - L)
+            mask = [False] * L + [True] * (seq_len - L)
+            target_ids = segment[1 : L + 1] + [pad_index] * (seq_len - L)
+
+            yield input_ids, mask, target_ids
+
+            pos += stride
+
+
+def make_batches(
+    samples: Iterator[tuple[list[int], list[bool], list[int]]],
+    batch_size: int,
+) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
+    """Accumulate samples into tensor batches.
+
+    Samples are collected into a buffer; when the buffer reaches
+    *batch_size* the lists are converted to tensors, stacked, and yielded.
+    At the end any partial buffer is silently discarded — training stops
+    early.
+    """
+    buffer: list[tuple[Tensor, Tensor, Tensor]] = []
+
+    for input_ids, mask, target_ids in samples:
+        buffer.append(
+            (
+                torch.tensor(input_ids, dtype=torch.int),
+                torch.tensor(mask, dtype=torch.bool),
+                torch.tensor(target_ids, dtype=torch.int),
+            )
+        )
+
+        if len(buffer) == batch_size:
+            yield (
+                torch.stack([x[0] for x in buffer]),
+                torch.stack([x[1] for x in buffer]),
+                torch.stack([x[2] for x in buffer]),
+            )
+            buffer.clear()
+
+
+def iter_batches(
+    dataset: Dataset,
+    seq_len: int,
+    batch_size: int,
+    pad_index: int,
+    offset: int = 0,
+    stride: int | None = None,
+) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
+    """Convenience wrapper: ``make_batches(iter_samples(...))``."""
+    return make_batches(
+        iter_samples(dataset, seq_len, pad_index, offset, stride), batch_size
+    )
 
 
 def get_backup_path(path: StrOrPath):
@@ -129,107 +195,6 @@ def get_backup_path(path: StrOrPath):
         resolve_parent(path)
         / f".{Path(path).resolve().name}.{int(datetime.now().timestamp())}"
     )
-
-
-class SampleType(Enum):
-    NORMAL = 0
-    START = 1
-
-
-def parse_data(s: str) -> tuple[str, float, SampleType]:
-    parts = s.split(":")
-
-    path = parts[0]
-
-    if len(parts) >= 2:
-        weight = float(parts[1])
-        if weight <= 0:
-            raise ValueError(f"weight {weight} for {path} should be > 0")
-    else:
-        weight = 1.0
-
-    if len(parts) >= 3:
-        match parts[2]:
-            case "n":
-                sample_type = SampleType.NORMAL
-            case "s":
-                sample_type = SampleType.START
-            case _:
-                raise ValueError(f"unrecognized sample type {parts[2]} for {path}")
-    else:
-        sample_type = SampleType.NORMAL
-
-    return path, weight, sample_type
-
-
-def create_data_source(
-    paths: list[str],
-    seq_len: int,
-    *,
-    mark: bool = False,
-):
-    assert len(paths) > 0
-
-    data_sources: list[DataSource[list[int]]] = []
-    weights: list[float] = []
-
-    count_total, count_selected = 0, 0
-
-    for path, weight, sample_type in map(parse_data, paths):
-        data = load_token_ids(path)
-
-        count_total += len(data)
-
-        match sample_type:
-            case SampleType.NORMAL:
-                child_data_sources = []
-                child_weights = []
-
-                for tokens in data:
-                    if mark:
-                        tokens = [SOT] + tokens + [EOT]
-
-                    child_data_sources.append(
-                        SliceDataSource(tokens, seq_len + 1, end_partial=True)
-                    )
-                    child_weights.append(len(tokens))
-
-                    count_selected += 1
-
-                if len(child_data_sources) == 0:
-                    raise ValueError(
-                        f"no data meet requirement in {path} (sample type: {sample_type.name})"
-                    )
-
-                data_sources.append(
-                    WeightedDataSource(child_data_sources, child_weights)
-                )
-            case SampleType.START:
-                selected = []
-
-                for tokens in data:
-                    if len(tokens) <= 0:
-                        continue
-
-                    if mark:
-                        tokens = [SOT] + tokens + [EOT]
-
-                    selected.append(tokens[: seq_len + 1])
-
-                    count_selected += 1
-
-                if len(selected) == 0:
-                    raise ValueError(
-                        f"no data meet requirement in {path} (sample type: {sample_type})"
-                    )
-
-                data_sources.append(SeqDataSource(selected))
-
-        weights.append(weight)
-
-    log_info(f"Sample selection ratio: {count_selected}/{count_total}.")
-
-    return WeightedDataSource(data_sources, weights)
 
 
 def writer_add_embedding(
@@ -263,7 +228,7 @@ def validation_loss_step(
 
 def compute_validation_loss(
     model: Model,
-    data_source: DataSource[list[int]],
+    dataset: Dataset,
     seq_len: int,
     batch_size: int,
     pad_index: int,
@@ -274,9 +239,10 @@ def compute_validation_loss(
 
     total_loss = 0.0
 
-    dataset = TrainDataset(data_source, seq_len, pad_index)
-    loader = DataLoader(dataset, batch_size=batch_size)
-    iterator = iter(loader)
+    def make_iterator():
+        return iter_batches(dataset, seq_len, batch_size, pad_index)
+
+    iterator = make_iterator()
 
     model.eval()
 
@@ -285,7 +251,7 @@ def compute_validation_loss(
             try:
                 inputs, masks, targets = next(iterator)
             except StopIteration:
-                iterator = iter(loader)
+                iterator = make_iterator()
                 inputs, masks, targets = next(iterator)
 
             loss = validation_loss_step(
@@ -369,12 +335,12 @@ def action_gen(
     stream: bool = False,
     all: bool = False,
     stop_token: int = EOT,
-    mark: bool = False,
+    add_eot: bool = False,
 ):
     assert seq_len > 0
     assert temperature > 0
 
-    if not mark:
+    if not add_eot:
         assert len(prompt) > 0
 
     project_info = load_project(path)
@@ -389,10 +355,7 @@ def action_gen(
 
     prompt_tokens = tokenizer.encode(prompt).ids
 
-    if mark:
-        tokens = [SOT] + prompt_tokens
-    else:
-        tokens = list(prompt_tokens)
+    tokens = list(prompt_tokens)
 
     print("Prompt:", repr(tokenizer.decode(tokens)))
     print("Prompt token count:", len(tokens))
@@ -433,7 +396,7 @@ def action_gen(
 
         tokens.append(next)
 
-        if stream:
+        if stream and decode_stream:
             chunk = decode_stream.step(tokenizer, next)
             if chunk is not None:
                 print(chunk, end="", flush=True)
@@ -458,14 +421,13 @@ def action_gen(
 def action_train(
     path: StrOrPath,
     steps: int,
-    data_paths: list[str],
+    data_path: str,
     *,
     seq_len: Optional[int] = None,
     batch_size: Optional[int] = None,
     learning_rate: Optional[float] = None,
     weight_decay: Optional[float] = None,
-    mark: bool = False,
-    val_paths: Optional[list[str]] = None,
+    val_path: Optional[str] = None,
     log_period: int = 10,
     tensorboard_dir: Optional[str] = None,
     device: str = "cpu",
@@ -508,28 +470,37 @@ def action_train(
 
     tokenizer = load_tokenizer(tokenizer_file)
 
-    log_info("Preparing data.")
-    if mark:
-        log_info("Markers (SOT, EOT, etc.) will be added.")
-    data_source = create_data_source(data_paths, seq_len, mark=mark)
+    log_info("Loading training dataset.")
+    dataset = load_dataset(data_path)
 
+    # show a few samples as example
     print("Data example:")
-    example_tokens = data_source.sample()
-    print(
-        f"(len={len(example_tokens)}) {example_tokens} ({repr(tokenizer.decode(example_tokens))})"
-    )
+    sample_iter = iter_samples(dataset, seq_len, PAD)
+    for i, (input_ids, mask, target_ids) in enumerate(sample_iter):
+        if i >= 3:
+            break
+        print(f"  input_ids  {input_ids!r}")
+        print(f"  mask       {mask!r}")
+        print(f"  target_ids {target_ids!r}")
+        print(f"  decoded `{tokenizer.decode(input_ids)!r}`")
+
+    batch_iterator = iter_batches(dataset, seq_len, batch_size, PAD)
 
     val_batches = max(log_period // 10, 1)
-    val_data_source = None
-    if val_paths and len(val_paths) > 0:
-        log_info("Preparing validation data.")
-        val_data_source = create_data_source(val_paths, seq_len, mark=mark)
+    val_dataset = None
+    if val_path is not None:
+        log_info("Loading validation dataset.")
+        val_dataset = load_dataset(val_path)
 
         print("Validation data example:")
-        val_example_tokens = val_data_source.sample()
-        print(
-            f"(len={len(val_example_tokens)}) {val_example_tokens} ({repr(tokenizer.decode(val_example_tokens))})"
-        )
+        val_sample_iter = iter_samples(val_dataset, seq_len, PAD)
+        for i, (input_ids, mask, target_ids) in enumerate(val_sample_iter):
+            if i >= 3:
+                break
+            print(f"  input   {input_ids!r}")
+            print(f"  mask    {mask!r}")
+            print(f"  target  {target_ids!r}")
+            print(f"  decoded `{tokenizer.decode(input_ids)!r}`")
 
     # model
 
@@ -554,8 +525,8 @@ def action_train(
         writer = SummaryWriter(tensorboard_dir)
 
         # show graph
-        data_loader = DataLoader(TrainDataset(data_source, seq_len, PAD))
-        dummy_input, dummy_mask, _ = next(iter(data_loader))
+        dummy_iter = iter_batches(dataset, seq_len, 1, PAD)
+        dummy_input, dummy_mask, _ = next(dummy_iter)
         writer.add_graph(model, (dummy_input.to(device), dummy_mask.to(device)))
 
         # show input word embedding
@@ -622,10 +593,10 @@ def action_train(
             state["sum_time_backward"] = 0.0
 
             val_loss = None
-            if val_data_source is not None:
+            if val_dataset is not None:
                 val_loss = compute_validation_loss(
                     model=model,
-                    data_source=val_data_source,
+                    dataset=val_dataset,
                     seq_len=seq_len,
                     batch_size=batch_size,
                     pad_index=PAD,
@@ -665,9 +636,8 @@ def action_train(
     train(
         info=project_info.train_info,
         model=model,
-        seq_len=seq_len,
         optimizer=optimizer,
-        data_source=data_source,
+        batch_iterator=batch_iterator,
         pad_index=PAD,
         batch_size=batch_size,
         steps=steps,
@@ -781,15 +751,13 @@ def create_parser() -> ArgumentParser:
         default=EOT,
         help="stop token id (-1: never stop)",
     )
-    gen_parser.add_argument(
-        "-m", "--mark", action="store_true", help="add markers (SOT, EOT, etc.)"
-    )
+    gen_parser.add_argument("--eot", action="store_true", help="add EOT")
 
     # train
     train_parser = subparsers.add_parser("train", help="train model")
     train_parser.add_argument("path", help="project file")
     train_parser.add_argument("steps", type=int, help="number of steps")
-    train_parser.add_argument("data", nargs="+", help="text data directory")
+    train_parser.add_argument("data", help="dataset directory")
     train_parser.add_argument("-l", "--seq-len", type=int, help="sequence length")
     train_parser.add_argument("-bs", "--batch-size", type=int, help="batch size")
     train_parser.add_argument(
@@ -797,10 +765,7 @@ def create_parser() -> ArgumentParser:
     )
     train_parser.add_argument("-wd", "--weight-decay", type=float, help="weight decay")
     train_parser.add_argument(
-        "-v", "--val", nargs="*", help="validation data directory"
-    )
-    train_parser.add_argument(
-        "-m", "--mark", action="store_true", help="add markers (SOT, EOT, etc.)"
+        "-v", "--val", help="validation dataset directory"
     )
     train_parser.add_argument(
         "-tb", "--tensorboard-dir", help="TensorBoard write directory"
@@ -861,19 +826,18 @@ def main():
                 stream=args.stream,
                 all=args.all,
                 stop_token=args.stop_token,
-                mark=args.mark,
+                add_eot=args.eot,
             )
         case "train":
             action_train(
                 args.path,
                 steps=args.steps,
-                data_paths=args.data,
+                data_path=args.data,
                 seq_len=args.seq_len,
                 batch_size=args.batch_size,
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
-                mark=args.mark,
-                val_paths=args.val,
+                val_path=args.val,
                 device=device,
                 tensorboard_dir=args.tensorboard_dir,
                 log_period=args.log_period,

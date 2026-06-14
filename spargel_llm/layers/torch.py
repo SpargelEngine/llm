@@ -30,15 +30,7 @@ def attention(
         (..., num_q, dim_v)
     """
 
-    assert q.size(-1) == k.size(-1), "dimensions of queries & keys do not match"
-    assert k.size(-2) == v.size(-2), "numbers of keys & values do not match"
-
     num_q, num_k = q.size(-2), k.size(-2)
-
-    if mask is not None:
-        assert mask.dtype == torch.bool, "mask.dtype != bool"
-        assert mask.size(-2) in {1, num_q}, "bad mask size (-2)"
-        assert mask.size(-1) == num_k, "bad mask size (-1)"
 
     # (..., num_q, num_k)
     scores = q @ k.transpose(-2, -1)
@@ -113,10 +105,7 @@ class Attention(nn.Module):
             (..., seq_len, dim_out)
         """
 
-        assert x.size(-1) == self.dim_in
         seq_len = x.size(-2)
-        if mask is not None:
-            assert mask.size(-1) == seq_len, "bad mask shape"
 
         # (..., num_head, seq_len, dim_k)
         q = torch.einsum("ijk, ...lj -> ...ilk", self.W_q, x)
@@ -208,9 +197,6 @@ class PositionalEncoding(nn.Module):
         Returns:
             (..., seq_len, dim)
         """
-
-        assert x.size(-1) == self.dim
-        assert x.size(-2) <= self.max_seq_len, "seq_len too large"
 
         seq_len = x.size(-2)
         x += self.pe[:seq_len, :]
