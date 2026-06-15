@@ -1,5 +1,4 @@
 import os
-import random
 import shutil
 import sys
 import time
@@ -8,8 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
+import pyarrow.parquet as pq
 import torch
-from datasets import Dataset, load_from_disk
 from pydantic import BaseModel, NonNegativeInt
 from rich import print as rich_print
 from tokenizers import Tokenizer
@@ -96,44 +95,32 @@ def load_tokenizer(path: StrOrPath) -> Tokenizer:
     return Tokenizer.from_file(str(path))
 
 
-def load_dataset(path: StrOrPath) -> Dataset:
-    """Load a HuggingFace dataset directory.
+def load_dataset(path: StrOrPath) -> pq.ParquetFile:
+    """Load a pre-tokenized Parquet dataset.
 
-    The returned ``Dataset`` uses memory-mapped Arrow tables so the data
-    is not fully loaded into memory.
+    The returned ``ParquetFile`` provides streaming batch iteration and
+    does not fully load the data into memory.
     """
     path = Path(path).resolve()
-    dataset = load_from_disk(str(path))
-    log_info(f"Loaded dataset from {path} ({len(dataset):,} rows).")
-    return dataset
+    parquet_file = pq.ParquetFile(str(path))
+    log_info(
+        f"Loaded dataset from {path} "
+        f"({parquet_file.metadata.num_rows:,} rows, "
+        f"{parquet_file.metadata.num_row_groups} row groups)."
+    )
+    return parquet_file
 
 
-def show_random_example(
-    dataset: Dataset, seq_len: int, pad_index: int, tokenizer: Tokenizer
-):
-    """Print one random sample from a random window position."""
-    n = len(dataset)
-    for _ in range(100):  # retry in case of empty items
-        idx = random.randrange(n)
-        tokens: list[int] = dataset[idx]["tokens"]
-        if tokens and len(tokens) > 1:
-            max_pos = max(len(tokens) - 2, 0)
-            pos = random.randint(0, max_pos)
-            gen = iter_samples(
-                dataset, seq_len, pad_index, start_index=idx, start_offset=pos
-            )
-            input_ids, mask, target_ids = next(gen)
-            print(f"  sample_idx={idx}, offset={pos}")
-            print(f"  input_ids  {input_ids!r}")
-            print(f"  mask       {mask!r}")
-            print(f"  target_ids {target_ids!r}")
-            print(f"  decoded `{tokenizer.decode(input_ids)!r}`")
-            return
-    print("  (no valid samples found)")
+def get_dataset_id(parquet_file: pq.ParquetFile) -> str:
+    """Extract the ``dataset_id`` from a Parquet file's schema metadata."""
+    metadata = parquet_file.schema_arrow.metadata
+    if metadata is None:
+        return ""
+    return metadata.get(b"dataset_id", b"").decode()
 
 
 def iter_samples(
-    dataset: Dataset,
+    dataset: pq.ParquetFile,
     seq_len: int,
     pad_index: int,
     stride: int | None = None,
@@ -164,34 +151,40 @@ def iter_samples(
         stride = seq_len + 1
 
     first = True
+    row_index = 0
 
-    for i, item in enumerate(dataset):
-        if i < start_index:
-            continue
+    for rg_idx in range(dataset.metadata.num_row_groups):
+        batch = dataset.read_row_group(rg_idx)
+        for tokens in batch.column("tokens").to_pylist():
+            if row_index < start_index:
+                row_index += 1
+                continue
 
-        tokens: list[int] = item["tokens"]
-        if tokens is None or len(tokens) <= 1:
-            continue
+            if tokens is None or len(tokens) <= 1:
+                row_index += 1
+                continue
 
-        pos = start_offset if first else 0
-        first = False
+            pos = start_offset if first else 0
+            first = False
 
-        while pos + 1 < len(tokens):
-            end = min(pos + seq_len + 1, len(tokens))
-            segment = tokens[pos:end]
-            L = len(segment) - 1
+            while pos + 1 < len(tokens):
+                end = min(pos + seq_len + 1, len(tokens))
+                segment = tokens[pos:end]
+                L = len(segment) - 1
 
-            input_ids = segment[:L] + [pad_index] * (seq_len - L)
-            mask = [False] * L + [True] * (seq_len - L)
-            target_ids = segment[1 : L + 1] + [pad_index] * (seq_len - L)
+                input_ids = segment[:L] + [pad_index] * (seq_len - L)
+                mask = [False] * L + [True] * (seq_len - L)
+                target_ids = segment[1 : L + 1] + [pad_index] * (seq_len - L)
 
-            if tracker is not None:
-                tracker["sample_idx"] = i
-                tracker["offset"] = pos
+                if tracker is not None:
+                    tracker["sample_idx"] = row_index
+                    tracker["offset"] = pos
 
-            yield input_ids, mask, target_ids
+                yield input_ids, mask, target_ids
 
-            pos += stride
+                pos += stride
+
+            row_index += 1
 
 
 def make_batches(
@@ -226,7 +219,7 @@ def make_batches(
 
 
 def iter_batches(
-    dataset: Dataset,
+    dataset: pq.ParquetFile,
     seq_len: int,
     batch_size: int,
     pad_index: int,
@@ -288,7 +281,7 @@ def validation_loss_step(
 
 def compute_validation_loss(
     model: Model,
-    dataset: Dataset,
+    dataset: pq.ParquetFile,
     seq_len: int,
     batch_size: int,
     pad_index: int,
@@ -491,8 +484,8 @@ def action_train(
     log_period: int = 10,
     tensorboard_dir: Optional[str] = None,
     device: str = "cpu",
-    start_index: int = 0,
-    start_offset: int = 0,
+    start_index: Optional[int] = None,
+    start_offset: Optional[int] = None,
 ):
     assert log_period > 0
 
@@ -535,11 +528,28 @@ def action_train(
     log_info("Loading training dataset.")
     dataset = load_dataset(data_path)
 
-    # show a random sample as example
-    print("Data example:")
-    show_random_example(dataset, seq_len, PAD, tokenizer)
+    # detect dataset replacement
+    new_id = get_dataset_id(dataset)
+    old_id = project_info.train_info.dataset_id
+    if new_id and new_id != old_id:
+        log_info(f"Dataset changed ({old_id!r} -> {new_id!r}).")
+        if start_index is None:
+            project_info.train_info.index = 0
+        if start_offset is None:
+            project_info.train_info.offset = 0
+        project_info.train_info.dataset_id = new_id
 
-    train_tracker: dict = {"sample_idx": 0, "offset": 0}
+    # start position: CLI args override TrainInfo
+    if start_index is None:
+        start_index = project_info.train_info.index
+    if start_offset is None:
+        start_offset = project_info.train_info.offset
+
+    log_info(
+        f"Start position: index={start_index}, offset={start_offset}"
+    )
+
+    train_tracker: dict = {"sample_idx": start_index, "offset": start_offset}
     batch_iterator = iter_batches(
         dataset,
         seq_len,
@@ -555,9 +565,6 @@ def action_train(
     if val_path is not None:
         log_info("Loading validation dataset.")
         val_dataset = load_dataset(val_path)
-
-        print("Validation data example:")
-        show_random_example(val_dataset, seq_len, PAD, tokenizer)
 
     # model
 
@@ -597,6 +604,8 @@ def action_train(
             writer.add_text("train/log", msg, project_info.train_info.token_count)
 
     def save():
+        project_info.train_info.index = train_tracker["sample_idx"]
+        project_info.train_info.offset = train_tracker["offset"]
         log_info(f"Saving. (train_info: {project_info.train_info})")
         save_project(path, project_info)
         save_model_state(model_state_file, model)
@@ -853,15 +862,15 @@ def create_parser() -> ArgumentParser:
         "-si",
         "--start-index",
         type=int,
-        default=0,
-        help="start training from this sample index in the dataset",
+        default=None,
+        help="start training from this sample index in the dataset (default: read from project)",
     )
     train_parser.add_argument(
         "-so",
         "--start-offset",
         type=int,
-        default=0,
-        help="initial window offset for the first sample (subsequent samples start from 0)",
+        default=None,
+        help="initial window offset for the first sample (default: read from project)",
     )
 
     # model_init

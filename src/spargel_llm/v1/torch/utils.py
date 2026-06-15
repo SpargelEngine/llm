@@ -13,6 +13,9 @@ from .model import Model
 class TrainInfo(BaseModel):
     time: NonNegativeFloat = 0
     token_count: NonNegativeInt = 0
+    index: NonNegativeInt = 0
+    offset: NonNegativeInt = 0
+    dataset_id: str = ""
 
 
 @torch.compile

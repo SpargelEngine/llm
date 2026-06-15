@@ -4,8 +4,8 @@ version = "0.1.0"
 requires-python = ">=3.14"
 
 dependencies = [
-    "datasets>=5.0.0",
     "numpy>=2.4.2",
+    "pyarrow>=24.0.0",
     "pydantic>=2.12.5",
     "regex>=2026.2.19",
     "rich>=15.0.0",
