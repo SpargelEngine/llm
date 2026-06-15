@@ -64,10 +64,11 @@ def train(
     *,
     device: str = "cpu",
     step_callback: Optional[Callable[[StepInfo], None]] = None,
-):
-    """
-    Args:
-        step_callback: (step, token_count, loss, step_time) -> None
+) -> int:
+    """Run up to *steps* training steps.
+
+    Returns the number of steps actually executed (may be less than *steps*
+    if the data iterator is exhausted).
     """
 
     for step in range(steps):
@@ -77,7 +78,7 @@ def train(
             inputs, masks, targets = next(batch_iterator)
         except StopIteration:
             print("Stopping early because there are no more data.")
-            break
+            return step
 
         t1 = time.perf_counter()
 
@@ -122,3 +123,5 @@ def train(
                     time_backward=t4 - t3,
                 )
             )
+
+    return steps

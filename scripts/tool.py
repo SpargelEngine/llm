@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
+import numpy as np
 import pyarrow.parquet as pq
 import torch
 from pydantic import BaseModel, NonNegativeInt
@@ -119,105 +120,6 @@ def get_dataset_id(parquet_file: pq.ParquetFile) -> str:
     return metadata.get(b"dataset_id", b"").decode()
 
 
-def iter_samples(
-    dataset: pq.ParquetFile,
-    seq_len: int,
-    pad_index: int,
-    stride: int | None = None,
-    start_index: int = 0,
-    start_offset: int = 0,
-    tracker: dict | None = None,
-) -> Iterator[tuple[list[int], list[bool], list[int]]]:
-    """Iterate through a dataset sequentially and yield individual samples.
-
-    For each row, a window of ``seq_len + 1`` tokens slides with the given
-    *stride* (default: ``seq_len + 1``).  Each window produces one sample:
-    ``(input_ids, mask, target_ids)`` as plain Python lists.  Short tails
-    are padded with *pad_index*.
-
-    *start_index* skips the first N items of *dataset*.
-
-    *start_offset* is used as the initial window position only for the
-    first item (the one at *start_index*); all subsequent items start from
-    the beginning.  This allows resuming training from the exact position
-    where a previous run stopped.
-
-    If *tracker* is a dict, it is updated before each yield with keys
-    ``sample_idx`` (current dataset row) and ``offset`` (window position
-    within that row) so the caller can know how far the iterator
-    progressed.
-    """
-    if stride is None:
-        stride = seq_len + 1
-
-    first = True
-    row_index = 0
-
-    for rg_idx in range(dataset.metadata.num_row_groups):
-        batch = dataset.read_row_group(rg_idx)
-        for tokens in batch.column("tokens").to_pylist():
-            if row_index < start_index:
-                row_index += 1
-                continue
-
-            if tokens is None or len(tokens) <= 1:
-                row_index += 1
-                continue
-
-            pos = start_offset if first else 0
-            first = False
-
-            while pos + 1 < len(tokens):
-                end = min(pos + seq_len + 1, len(tokens))
-                segment = tokens[pos:end]
-                L = len(segment) - 1
-
-                input_ids = segment[:L] + [pad_index] * (seq_len - L)
-                mask = [False] * L + [True] * (seq_len - L)
-                target_ids = segment[1 : L + 1] + [pad_index] * (seq_len - L)
-
-                if tracker is not None:
-                    tracker["sample_idx"] = row_index
-                    tracker["offset"] = pos
-
-                yield input_ids, mask, target_ids
-
-                pos += stride
-
-            row_index += 1
-
-
-def make_batches(
-    samples: Iterator[tuple[list[int], list[bool], list[int]]],
-    batch_size: int,
-) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
-    """Accumulate samples into tensor batches.
-
-    Samples are collected into a buffer; when the buffer reaches
-    *batch_size* the lists are converted to tensors, stacked, and yielded.
-    At the end any partial buffer is silently discarded — training stops
-    early.
-    """
-    buffer: list[tuple[Tensor, Tensor, Tensor]] = []
-
-    for input_ids, mask, target_ids in samples:
-        buffer.append(
-            (
-                torch.tensor(input_ids, dtype=torch.int),
-                torch.tensor(mask, dtype=torch.bool),
-                torch.tensor(target_ids, dtype=torch.int),
-            )
-        )
-
-        if len(buffer) == batch_size:
-            yield (
-                torch.stack([x[0] for x in buffer]),
-                torch.stack([x[1] for x in buffer]),
-                torch.stack([x[2] for x in buffer]),
-            )
-            buffer.clear()
-
-
 def iter_batches(
     dataset: pq.ParquetFile,
     seq_len: int,
@@ -227,20 +129,125 @@ def iter_batches(
     start_index: int = 0,
     start_offset: int = 0,
     tracker: dict | None = None,
+    eot_index: int | None = None,
 ) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
-    """Convenience wrapper: ``make_batches(iter_samples(...))``."""
-    return make_batches(
-        iter_samples(
-            dataset,
-            seq_len,
-            pad_index,
-            stride=stride,
-            start_index=start_index,
-            start_offset=start_offset,
-            tracker=tracker,
-        ),
-        batch_size,
-    )
+    """Iterate through a pre-tokenized Parquet dataset and yield tensor batches.
+
+    For each row, a window of ``seq_len + 1`` tokens slides with the given
+    *stride* (default: ``seq_len + 1``).  Each window produces one sample:
+    ``(input_ids, mask, target_ids)``.  Short tails are padded with
+    *pad_index*.
+
+    Works directly on Arrow's underlying NumPy buffers to avoid the
+    Python-object overhead of ``to_pylist()``.  Samples are accumulated
+    into pre-allocated tensor batches.  Partial batches at the end are
+    silently discarded.
+
+    *start_index* skips the first N items of *dataset*.
+
+    *start_offset* is used as the initial window position only for the
+    first item (the one at *start_index*); all subsequent items start from
+    the beginning.
+
+    If *tracker* is a dict, it is updated before each sample with keys
+    ``sample_idx`` (current dataset row) and ``offset`` (window position
+    within that row).
+
+    If *eot_index* is not ``None``, each row is treated as if it ends with
+    an additional token of that value, so the effective row length becomes
+    ``row_len + 1`` and the final window's target includes the EOT token.
+    """
+    if stride is None:
+        stride = seq_len + 1
+
+    first = True
+    row_index = 0
+
+    # Pre-allocate batch buffers as numpy arrays (reused across batches).
+    batch_inputs = np.full((batch_size, seq_len), pad_index, dtype=np.int32)
+    batch_masks = np.ones((batch_size, seq_len), dtype=bool)
+    batch_targets = np.full((batch_size, seq_len), pad_index, dtype=np.int32)
+    sample_in_batch = 0
+
+    # Skip row groups that are entirely before start_index.
+    start_rg = 0
+    rg_start = 0
+    while start_rg < dataset.metadata.num_row_groups:
+        rg_rows = dataset.metadata.row_group(start_rg).num_rows
+        if rg_start + rg_rows <= start_index:
+            rg_start += rg_rows
+            row_index += rg_rows
+            start_rg += 1
+            continue
+        break
+
+    for rg_idx in range(start_rg, dataset.metadata.num_row_groups):
+        table = dataset.read_row_group(rg_idx)
+        col = table.column("tokens").combine_chunks()
+        offsets = col.offsets.to_numpy()
+        values = col.values.to_numpy().astype(np.int32)
+
+        n_rows = len(col)
+
+        for i in range(n_rows):
+            if row_index < start_index:
+                row_index += 1
+                continue
+
+            row_start = int(offsets[i])
+            row_end = int(offsets[i + 1])
+            row_len = row_end - row_start
+
+            row_len_with_eot = row_len + 1 if eot_index is not None else row_len
+
+            if row_len_with_eot <= 1:
+                row_index += 1
+                continue
+
+            pos = start_offset if first else 0
+            first = False
+
+            while pos + 1 < row_len_with_eot:
+                end = min(pos + seq_len + 1, row_len_with_eot)
+                L = end - pos - 1
+
+                # Write sample directly into the pre-allocated batch row.
+                batch_inputs[sample_in_batch, :L] = values[row_start + pos : row_start + pos + L]
+                batch_inputs[sample_in_batch, L:] = pad_index
+                batch_masks[sample_in_batch, :L] = False
+                batch_masks[sample_in_batch, L:] = True
+
+                # Target: may include EOT at the final position.
+                orig_target_len = min(L, row_len - (pos + 1))
+                if orig_target_len > 0:
+                    batch_targets[sample_in_batch, :orig_target_len] = values[
+                        row_start + pos + 1 : row_start + pos + 1 + orig_target_len
+                    ]
+                if end > row_len:
+                    batch_targets[sample_in_batch, orig_target_len] = eot_index
+                batch_targets[sample_in_batch, L:] = pad_index
+
+                if tracker is not None:
+                    tracker["sample_idx"] = row_index
+                    tracker["offset"] = pos
+
+                sample_in_batch += 1
+
+                if sample_in_batch == batch_size:
+                    yield (
+                        torch.tensor(batch_inputs),
+                        torch.tensor(batch_masks),
+                        torch.tensor(batch_targets),
+                    )
+                    # Reset for reuse.
+                    batch_inputs.fill(pad_index)
+                    batch_masks.fill(True)
+                    batch_targets.fill(pad_index)
+                    sample_in_batch = 0
+
+                pos += stride
+
+            row_index += 1
 
 
 def get_backup_path(path: StrOrPath):
@@ -287,13 +294,14 @@ def compute_validation_loss(
     pad_index: int,
     device: str,
     num_batches: int = 10,
+    eot_index: int | None = None,
 ) -> float:
     assert num_batches > 0
 
     total_loss = 0.0
 
     def make_iterator():
-        return iter_batches(dataset, seq_len, batch_size, pad_index)
+        return iter_batches(dataset, seq_len, batch_size, pad_index, eot_index=eot_index)
 
     iterator = make_iterator()
 
@@ -486,6 +494,7 @@ def action_train(
     device: str = "cpu",
     start_index: Optional[int] = None,
     start_offset: Optional[int] = None,
+    add_eot: bool = False,
 ):
     assert log_period > 0
 
@@ -549,6 +558,8 @@ def action_train(
         f"Start position: index={start_index}, offset={start_offset}"
     )
 
+    eot_index = EOT if add_eot else None
+
     train_tracker: dict = {"sample_idx": start_index, "offset": start_offset}
     batch_iterator = iter_batches(
         dataset,
@@ -558,6 +569,7 @@ def action_train(
         start_index=start_index,
         start_offset=start_offset,
         tracker=train_tracker,
+        eot_index=eot_index,
     )
 
     val_batches = max(log_period // 10, 1)
@@ -589,7 +601,7 @@ def action_train(
         writer = SummaryWriter(tensorboard_dir)
 
         # show graph
-        dummy_iter = iter_batches(dataset, seq_len, 1, PAD)
+        dummy_iter = iter_batches(dataset, seq_len, 1, PAD, eot_index=eot_index)
         dummy_input, dummy_mask, _ = next(dummy_iter)
         writer.add_graph(model, (dummy_input.to(device), dummy_mask.to(device)))
 
@@ -668,6 +680,7 @@ def action_train(
                     pad_index=PAD,
                     device=device,
                     num_batches=val_batches,
+                    eot_index=eot_index,
                 )
 
             time_log_msg = f"avg_time={avg_time:.6f} (({avg_time_load_batch:.6f} + {avg_time_transfer_batch:.6f}) + ({avg_time_forward:.6f} + {avg_time_backward:.6f}))"
@@ -699,7 +712,7 @@ def action_train(
 
     backup()
 
-    train(
+    actual_steps = train(
         info=project_info.train_info,
         model=model,
         optimizer=optimizer,
@@ -710,6 +723,14 @@ def action_train(
         device=device,
         step_callback=step_callback,
     )
+
+    if actual_steps < steps:
+        log_info("Dataset exhausted – resetting train_info position to zero.")
+        project_info.train_info.index = 0
+        project_info.train_info.offset = 0
+        project_info.train_info.dataset_id = ""
+        train_tracker["sample_idx"] = 0
+        train_tracker["offset"] = 0
 
     save()
 
@@ -872,6 +893,12 @@ def create_parser() -> ArgumentParser:
         default=None,
         help="initial window offset for the first sample (default: read from project)",
     )
+    train_parser.add_argument(
+        "-et",
+        "--eot",
+        action="store_true",
+        help="append EOT to each training/validation text (effective length +1)",
+    )
 
     # model_init
     model_init_parser = subparsers.add_parser(
@@ -942,6 +969,7 @@ def main():
                 log_period=args.log_period,
                 start_index=args.start_index,
                 start_offset=args.start_offset,
+                add_eot=args.eot,
             )
         case "model_init":
             action_model_init(args.path, yes=args.yes)
