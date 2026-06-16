@@ -36,6 +36,7 @@ class TrainConfig(BaseModel):
     learning_rate: float
     weight_decay: float
     optimizer_state_file: str
+    gradient_accumulation_steps: NonNegativeInt = 1
 
 
 class ProjectInfo(BaseModel):
@@ -212,7 +213,9 @@ def iter_batches(
                 L = end - pos - 1
 
                 # Write sample directly into the pre-allocated batch row.
-                batch_inputs[sample_in_batch, :L] = values[row_start + pos : row_start + pos + L]
+                batch_inputs[sample_in_batch, :L] = values[
+                    row_start + pos : row_start + pos + L
+                ]
                 batch_inputs[sample_in_batch, L:] = pad_index
                 batch_masks[sample_in_batch, :L] = False
                 batch_masks[sample_in_batch, L:] = True
@@ -223,7 +226,7 @@ def iter_batches(
                     batch_targets[sample_in_batch, :orig_target_len] = values[
                         row_start + pos + 1 : row_start + pos + 1 + orig_target_len
                     ]
-                if end > row_len:
+                if end > row_len and eot_index is not None:
                     batch_targets[sample_in_batch, orig_target_len] = eot_index
                 batch_targets[sample_in_batch, L:] = pad_index
 
@@ -301,7 +304,9 @@ def compute_validation_loss(
     total_loss = 0.0
 
     def make_iterator():
-        return iter_batches(dataset, seq_len, batch_size, pad_index, eot_index=eot_index)
+        return iter_batches(
+            dataset, seq_len, batch_size, pad_index, eot_index=eot_index
+        )
 
     iterator = make_iterator()
 
@@ -481,8 +486,8 @@ def action_gen(
 
 def action_train(
     path: StrOrPath,
-    steps: int,
     data_path: str,
+    steps: int,
     *,
     seq_len: Optional[int] = None,
     batch_size: Optional[int] = None,
@@ -495,6 +500,7 @@ def action_train(
     start_index: Optional[int] = None,
     start_offset: Optional[int] = None,
     add_eot: bool = False,
+    gradient_accumulation_steps: Optional[int] = None,
 ):
     assert log_period > 0
 
@@ -504,9 +510,18 @@ def action_train(
     train_config = project_info.train_config
     optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
 
-    should_reset_optimizer = (
-        batch_size is not None and batch_size != train_config.batch_size
+    # Effective batch size = batch_size × gradient_accumulation_steps.
+    # Optimizer state (momentum, etc.) depends on the effective batch —
+    # reset whenever it changes.
+    new_bs = batch_size if batch_size is not None else train_config.batch_size
+    new_ga = (
+        gradient_accumulation_steps
+        if gradient_accumulation_steps is not None
+        else (train_config.gradient_accumulation_steps or 1)
     )
+    prev_bs = train_config.batch_size
+    prev_ga = train_config.gradient_accumulation_steps or 1
+    should_reset_optimizer = (new_bs * new_ga) != (prev_bs * prev_ga)
 
     if seq_len is None:
         seq_len = train_config.seq_len
@@ -529,6 +544,12 @@ def action_train(
         weight_decay = train_config.weight_decay
     else:
         train_config.weight_decay = weight_decay
+
+    if gradient_accumulation_steps is None:
+        gradient_accumulation_steps = train_config.gradient_accumulation_steps or 1
+    else:
+        train_config.gradient_accumulation_steps = gradient_accumulation_steps
+    assert gradient_accumulation_steps >= 1
 
     # data
 
@@ -554,9 +575,7 @@ def action_train(
     if start_offset is None:
         start_offset = project_info.train_info.offset
 
-    log_info(
-        f"Start position: index={start_index}, offset={start_offset}"
-    )
+    log_info(f"Start position: index={start_index}, offset={start_offset}")
 
     eot_index = EOT if add_eot else None
 
@@ -706,9 +725,20 @@ def action_train(
 
     t_start = time.perf_counter()
 
-    log_important(
-        f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}). Time: {datetime.now()}"
-    )
+    if gradient_accumulation_steps > 1:
+        effective_batch = batch_size * gradient_accumulation_steps
+        train_msg = (
+            f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}, "
+            f"gradient_accumulation_steps={gradient_accumulation_steps}, "
+            f"effective_batch_size={effective_batch}). Time: {datetime.now()}"
+        )
+    else:
+        train_msg = (
+            f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}). "
+            f"Time: {datetime.now()}"
+        )
+
+    log_important(train_msg)
 
     backup()
 
@@ -722,6 +752,7 @@ def action_train(
         steps=steps,
         device=device,
         step_callback=step_callback,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
 
     if actual_steps < steps:
@@ -860,8 +891,8 @@ def create_parser() -> ArgumentParser:
     # train
     train_parser = subparsers.add_parser("train", help="train model")
     train_parser.add_argument("path", help="project file")
-    train_parser.add_argument("steps", type=int, help="number of steps")
     train_parser.add_argument("data", help="dataset directory")
+    train_parser.add_argument("steps", type=int, help="number of steps")
     train_parser.add_argument("-l", "--seq-len", type=int, help="sequence length")
     train_parser.add_argument("-bs", "--batch-size", type=int, help="batch size")
     train_parser.add_argument(
@@ -898,6 +929,13 @@ def create_parser() -> ArgumentParser:
         "--eot",
         action="store_true",
         help="append EOT to each training/validation text (effective length +1)",
+    )
+    train_parser.add_argument(
+        "-ga",
+        "--gradient-accumulation-steps",
+        type=int,
+        default=None,
+        help="accumulate gradients over N batches before each optimizer step (default: 1)",
     )
 
     # model_init
@@ -957,8 +995,8 @@ def main():
         case "train":
             action_train(
                 args.path,
-                steps=args.steps,
                 data_path=args.data,
+                steps=args.steps,
                 seq_len=args.seq_len,
                 batch_size=args.batch_size,
                 learning_rate=args.learning_rate,
@@ -970,6 +1008,7 @@ def main():
                 start_index=args.start_index,
                 start_offset=args.start_offset,
                 add_eot=args.eot,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
             )
         case "model_init":
             action_model_init(args.path, yes=args.yes)
