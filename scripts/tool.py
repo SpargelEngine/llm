@@ -3,60 +3,40 @@ import shutil
 import sys
 import time
 from argparse import ArgumentParser
-from codecs import getincrementaldecoder
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
-from typing import Optional, cast
+from typing import Iterator, Optional
 
+import numpy as np
+import pyarrow.parquet as pq
 import torch
 from pydantic import BaseModel, NonNegativeInt
 from rich import print as rich_print
+from tokenizers import Tokenizer
+from tokenizers.decoders import DecodeStream
 from torch import Tensor
-from torch.optim import Adam, Optimizer
-from torch.utils.data import DataLoader
+from torch.optim import AdamW, Optimizer
 from torch.utils.tensorboard import SummaryWriter
 
-from spargel_llm.data import (
-    DataSource,
-    SeqDataSource,
-    SliceDataSource,
-    WeightedDataSource,
-)
-from spargel_llm.text_splitter import GPT2_SPLIT_PATTERN, RegexSplitter
-from spargel_llm.tokenizer import WordTokenizer
 from spargel_llm.tools.logging import log_info, log_success
 from spargel_llm.tools.typing import StrOrPath
 from spargel_llm.tools.utils import (
-    NO_STRINGS,
-    YES_STRINGS,
     PromptAbortError,
-    load_gzip_pickle,
     prompt_overwrite,
 )
+from spargel_llm.model import Config, Model
+from spargel_llm.utils import StepInfo, TrainInfo, generate_step, train
 
-from .model import LLM, Config
-from .utils import StepInfo, TrainDataset, TrainInfo, generate_step, train
-
-reserved_words = [
-    b"<|pad|>",  # padding
-    b"<|unk|>",  # unknown
-    b"<|sot|>",  # start of text
-    b"<|eot|>",  # end of text
-]
-
-PAD, UNK, SOT, EOT = range(len(reserved_words))
-
-assert len(reserved_words) <= 16
-for i in range(len(reserved_words), 16):
-    reserved_words.append(f"<|placeholder{i}|>".encode())
+PAD, EOT = 1, 2
 
 
 class TrainConfig(BaseModel):
     seq_len: NonNegativeInt
     batch_size: NonNegativeInt
     learning_rate: float
+    weight_decay: float
     optimizer_state_file: str
+    gradient_accumulation_steps: NonNegativeInt = 1
 
 
 class ProjectInfo(BaseModel):
@@ -66,8 +46,8 @@ class ProjectInfo(BaseModel):
     # weight file location
     model_state_file: str
 
-    # vocab file location
-    vocab_file: str
+    # tokenizer file location (e.g. tokenizer.json)
+    tokenizer: str
 
     # training information & statistics
     train_info: TrainInfo
@@ -89,11 +69,11 @@ def save_project(path: StrOrPath, project_info: ProjectInfo):
         f.write(project_info.model_dump_json(indent=2))
 
 
-def load_model_state(path: StrOrPath, model: LLM, *, device: str):
+def load_model_state(path: StrOrPath, model: Model, *, device: str):
     model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
 
 
-def save_model_state(path: StrOrPath, model: LLM):
+def save_model_state(path: StrOrPath, model: Model):
     torch.save(model.state_dict(), path)
 
 
@@ -112,17 +92,165 @@ def resolve_parent(path: StrOrPath):
     return Path(path).resolve().parent
 
 
-def create_tokenizer(words: list[bytes]) -> WordTokenizer:
-    all_words = (
-        reserved_words + words + [b"<|?|>"]
-    )  # append one token due to a PyTorch bug
+def load_tokenizer(path: StrOrPath) -> Tokenizer:
+    """Load a HuggingFace ``tokenizers.Tokenizer`` from a JSON file."""
+    return Tokenizer.from_file(str(path))
 
-    return WordTokenizer(
-        all_words,
-        encode_blacklist=list(range(len(reserved_words))) + [len(all_words) - 1],
-        unknown=UNK,
-        text_splitter=RegexSplitter(GPT2_SPLIT_PATTERN),
+
+def load_dataset(path: StrOrPath) -> pq.ParquetFile:
+    """Load a pre-tokenized Parquet dataset.
+
+    The returned ``ParquetFile`` provides streaming batch iteration and
+    does not fully load the data into memory.
+    """
+    path = Path(path).resolve()
+    parquet_file = pq.ParquetFile(str(path))
+    log_info(
+        f"Loaded dataset from {path} "
+        f"({parquet_file.metadata.num_rows:,} rows, "
+        f"{parquet_file.metadata.num_row_groups} row groups)."
     )
+    return parquet_file
+
+
+def get_dataset_id(parquet_file: pq.ParquetFile) -> str:
+    """Extract the ``dataset_id`` from a Parquet file's schema metadata."""
+    metadata = parquet_file.schema_arrow.metadata
+    if metadata is None:
+        return ""
+    return metadata.get(b"dataset_id", b"").decode()
+
+
+def iter_batches(
+    dataset: pq.ParquetFile,
+    seq_len: int,
+    batch_size: int,
+    pad_index: int,
+    stride: int | None = None,
+    start_index: int = 0,
+    start_offset: int = 0,
+    tracker: dict | None = None,
+    eot_index: int | None = None,
+) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
+    """Iterate through a pre-tokenized Parquet dataset and yield tensor batches.
+
+    For each row, a window of ``seq_len + 1`` tokens slides with the given
+    *stride* (default: ``seq_len + 1``).  Each window produces one sample:
+    ``(input_ids, mask, target_ids)``.  Short tails are padded with
+    *pad_index*.
+
+    Works directly on Arrow's underlying NumPy buffers to avoid the
+    Python-object overhead of ``to_pylist()``.  Samples are accumulated
+    into pre-allocated tensor batches.  Partial batches at the end are
+    silently discarded.
+
+    *start_index* skips the first N items of *dataset*.
+
+    *start_offset* is used as the initial window position only for the
+    first item (the one at *start_index*); all subsequent items start from
+    the beginning.
+
+    If *tracker* is a dict, it is updated before each sample with keys
+    ``sample_idx`` (current dataset row) and ``offset`` (window position
+    within that row).
+
+    If *eot_index* is not ``None``, each row is treated as if it ends with
+    an additional token of that value, so the effective row length becomes
+    ``row_len + 1`` and the final window's target includes the EOT token.
+    """
+    if stride is None:
+        stride = seq_len + 1
+
+    first = True
+    row_index = 0
+
+    # Pre-allocate batch buffers as numpy arrays (reused across batches).
+    batch_inputs = np.full((batch_size, seq_len), pad_index, dtype=np.int32)
+    batch_masks = np.ones((batch_size, seq_len), dtype=bool)
+    batch_targets = np.full((batch_size, seq_len), pad_index, dtype=np.int32)
+    sample_in_batch = 0
+
+    # Skip row groups that are entirely before start_index.
+    start_rg = 0
+    rg_start = 0
+    while start_rg < dataset.metadata.num_row_groups:
+        rg_rows = dataset.metadata.row_group(start_rg).num_rows
+        if rg_start + rg_rows <= start_index:
+            rg_start += rg_rows
+            row_index += rg_rows
+            start_rg += 1
+            continue
+        break
+
+    for rg_idx in range(start_rg, dataset.metadata.num_row_groups):
+        table = dataset.read_row_group(rg_idx)
+        col = table.column("tokens").combine_chunks()
+        offsets = col.offsets.to_numpy()
+        values = col.values.to_numpy().astype(np.int32)
+
+        n_rows = len(col)
+
+        for i in range(n_rows):
+            if row_index < start_index:
+                row_index += 1
+                continue
+
+            row_start = int(offsets[i])
+            row_end = int(offsets[i + 1])
+            row_len = row_end - row_start
+
+            row_len_with_eot = row_len + 1 if eot_index is not None else row_len
+
+            if row_len_with_eot <= 1:
+                row_index += 1
+                continue
+
+            pos = start_offset if first else 0
+            first = False
+
+            while pos + 1 < row_len_with_eot:
+                end = min(pos + seq_len + 1, row_len_with_eot)
+                L = end - pos - 1
+
+                # Write sample directly into the pre-allocated batch row.
+                batch_inputs[sample_in_batch, :L] = values[
+                    row_start + pos : row_start + pos + L
+                ]
+                batch_inputs[sample_in_batch, L:] = pad_index
+                batch_masks[sample_in_batch, :L] = False
+                batch_masks[sample_in_batch, L:] = True
+
+                # Target: may include EOT at the final position.
+                orig_target_len = min(L, row_len - (pos + 1))
+                if orig_target_len > 0:
+                    batch_targets[sample_in_batch, :orig_target_len] = values[
+                        row_start + pos + 1 : row_start + pos + 1 + orig_target_len
+                    ]
+                if end > row_len and eot_index is not None:
+                    batch_targets[sample_in_batch, orig_target_len] = eot_index
+                batch_targets[sample_in_batch, L:] = pad_index
+
+                if tracker is not None:
+                    tracker["sample_idx"] = row_index
+                    tracker["offset"] = pos
+
+                sample_in_batch += 1
+
+                if sample_in_batch == batch_size:
+                    yield (
+                        torch.tensor(batch_inputs),
+                        torch.tensor(batch_masks),
+                        torch.tensor(batch_targets),
+                    )
+                    # Reset for reuse.
+                    batch_inputs.fill(pad_index)
+                    batch_masks.fill(True)
+                    batch_targets.fill(pad_index)
+                    sample_in_batch = 0
+
+                pos += stride
+
+            row_index += 1
 
 
 def get_backup_path(path: StrOrPath):
@@ -132,134 +260,27 @@ def get_backup_path(path: StrOrPath):
     )
 
 
-class SampleType(Enum):
-    NORMAL = 0
-    START = 1
-
-
-def parse_data(s: str) -> tuple[str, float, SampleType]:
-    parts = s.split(":")
-
-    path = parts[0]
-
-    if len(parts) >= 2:
-        weight = float(parts[1])
-        if weight <= 0:
-            raise ValueError(f"weight {weight} for {path} should be > 0")
-    else:
-        weight = 1.0
-
-    if len(parts) >= 3:
-        match parts[2]:
-            case "n":
-                sample_type = SampleType.NORMAL
-            case "s":
-                sample_type = SampleType.START
-            case _:
-                raise ValueError(f"unrecognized sample type {parts[2]} for {path}")
-    else:
-        sample_type = SampleType.NORMAL
-
-    return path, weight, sample_type
-
-
-def create_data_source(paths: list[str], seq_len: int, mark: bool = False):
-    assert len(paths) > 0
-
-    data_sources: list[DataSource[list[int]]] = []
-    weights: list[float] = []
-
-    count_total, count_selected = 0, 0
-
-    for path, weight, sample_type in map(parse_data, paths):
-        data = cast(list[list[int]], load_gzip_pickle(path))
-
-        # Adjust token indices since we have special tokens.
-        for tokens in data:
-            for i in range(len(tokens)):
-                tokens[i] += len(reserved_words)
-
-        count_total += len(data)
-
-        match sample_type:
-            case SampleType.NORMAL:
-                child_data_sources = []
-                child_weights = []
-
-                for tokens in data:
-                    if mark:
-                        tokens = [SOT] + tokens + [EOT]
-
-                    if len(tokens) < seq_len + 1:
-                        continue
-
-                    child_data_sources.append(SliceDataSource(tokens, seq_len + 1))
-                    child_weights.append(len(tokens))
-
-                    count_selected += 1
-
-                if len(child_data_sources) == 0:
-                    raise ValueError(
-                        f"no data meet requirement in {path} (sample type: {sample_type.name})"
-                    )
-
-                data_sources.append(
-                    WeightedDataSource(child_data_sources, child_weights)
-                )
-            case SampleType.START:
-                selected = []
-
-                for tokens in data:
-                    if len(tokens) <= 0:
-                        continue
-
-                    if mark:
-                        tokens = [SOT] + tokens + [EOT]
-
-                    selected.append(tokens[: seq_len + 1])
-
-                    count_selected += 1
-
-                if len(selected) == 0:
-                    raise ValueError(
-                        f"no data meet requirement in {path} (sample type: {sample_type})"
-                    )
-
-                data_sources.append(SeqDataSource(selected))
-
-        weights.append(weight)
-
-    log_info(f"Sample selection ratio: {count_selected}/{count_total}.")
-
-    return WeightedDataSource(data_sources, weights)
-
-
 def writer_add_embedding(
     writer: SummaryWriter,
-    model: LLM,
-    tokenizer: WordTokenizer,
+    model: Model,
+    tokenizer: Tokenizer,
     *,
     device: str = "cpu",
 ):
     model.eval()
     with torch.no_grad():
-        indices = torch.arange(len(tokenizer.words), dtype=torch.int, device=device)
-        embed_vectors = model.embed(indices)
+        vocab_size = tokenizer.get_vocab_size()
+        indices = torch.arange(vocab_size, dtype=torch.int, device=device)
+        embed_vectors = model.embedding(indices)
 
-        labels = []
-        for word in tokenizer.words:
-            try:
-                label = word.decode("utf-8")
-            except UnicodeDecodeError:
-                label = repr(word)
-            labels.append(label if len(label.strip()) == len(label) else repr(label))
+        labels = [tokenizer.id_to_token(i) for i in range(vocab_size)]
 
     writer.add_embedding(embed_vectors.cpu(), labels)
 
 
 @torch.compile
 def validation_loss_step(
-    model: LLM,
+    model: Model,
     inputs: Tensor,
     masks: Tensor,
     targets: Tensor,
@@ -269,21 +290,25 @@ def validation_loss_step(
 
 
 def compute_validation_loss(
-    model: LLM,
-    data_source: DataSource[list[int]],
+    model: Model,
+    dataset: pq.ParquetFile,
     seq_len: int,
     batch_size: int,
     pad_index: int,
     device: str,
     num_batches: int = 10,
+    eot_index: int | None = None,
 ) -> float:
     assert num_batches > 0
 
     total_loss = 0.0
 
-    dataset = TrainDataset(data_source, seq_len, pad_index)
-    loader = DataLoader(dataset, batch_size=batch_size)
-    iterator = iter(loader)
+    def make_iterator():
+        return iter_batches(
+            dataset, seq_len, batch_size, pad_index, eot_index=eot_index
+        )
+
+    iterator = make_iterator()
 
     model.eval()
 
@@ -292,7 +317,7 @@ def compute_validation_loss(
             try:
                 inputs, masks, targets = next(iterator)
             except StopIteration:
-                iterator = iter(loader)
+                iterator = make_iterator()
                 inputs, masks, targets = next(iterator)
 
             loss = validation_loss_step(
@@ -329,33 +354,34 @@ def action_init(path: StrOrPath, *, yes: bool = False):
 
     # default config
     dim = 256
-    cnt_layer = 4
-    cnt_head = 4
-    assert dim % cnt_head == 0
+    num_layer = 4
+    num_head = 4
+    assert dim % num_head == 0
 
     config = Config(
         vocab_size=1000,
         max_seq_len=256,
-        cnt_layer=cnt_layer,
-        cnt_head=cnt_head,
+        num_layer=num_layer,
+        num_head=num_head,
         dim=dim,
-        d_key=dim // cnt_head,
-        d_value=dim // cnt_head,
-        d_feed_forward=dim * 4,
+        dim_key=dim // num_head,
+        dim_value=dim // num_head,
+        dim_feed_forward=dim * 4,
     )
 
     model_state_file = "model_state.pth"
-    vocab_file = "vocab.pkl.gz"
+    tokenizer = "tokenizer.json"
 
     project_info = ProjectInfo(
         config=config,
         model_state_file=model_state_file,
-        vocab_file=vocab_file,
+        tokenizer=tokenizer,
         train_info=TrainInfo(),
         train_config=TrainConfig(
             seq_len=0,
             batch_size=0,
             learning_rate=1e-3,
+            weight_decay=0.1,
             optimizer_state_file="optimizer_state.pth",
         ),
     )
@@ -375,31 +401,27 @@ def action_gen(
     stream: bool = False,
     all: bool = False,
     stop_token: int = EOT,
-    mark: bool = False,
+    add_eot: bool = False,
 ):
     assert seq_len > 0
     assert temperature > 0
 
-    if not mark:
+    if not add_eot:
         assert len(prompt) > 0
 
     project_info = load_project(path)
 
-    model = LLM(project_info.config).to(device)
+    model = Model(project_info.config).to(device)
 
     load_model_state(
         resolve_parent(path) / project_info.model_state_file, model, device=device
     )
 
-    words = load_gzip_pickle(resolve_parent(path) / project_info.vocab_file)
-    tokenizer = create_tokenizer(words)
+    tokenizer = load_tokenizer(resolve_parent(path) / project_info.tokenizer)
 
-    prompt_tokens = tokenizer.encode(prompt)
+    prompt_tokens = tokenizer.encode(prompt).ids
 
-    if mark:
-        tokens = [SOT] + prompt_tokens
-    else:
-        tokens = list(prompt_tokens)
+    tokens = list(prompt_tokens)
 
     print("Prompt:", repr(tokenizer.decode(tokens)))
     print("Prompt token count:", len(tokens))
@@ -417,7 +439,7 @@ def action_gen(
 
     cnt = 0
 
-    decoder = getincrementaldecoder("utf-8")(errors="ignore")
+    decode_stream = DecodeStream() if stream else None
 
     if stream and all:
         print(tokenizer.decode(tokens), end="")
@@ -440,8 +462,10 @@ def action_gen(
 
         tokens.append(next)
 
-        if stream:
-            print(decoder.decode(tokenizer.words[next]), end="", flush=True)
+        if stream and decode_stream:
+            chunk = decode_stream.step(tokenizer, next)
+            if chunk is not None:
+                print(chunk, end="", flush=True)
 
         cnt += 1
 
@@ -462,29 +486,42 @@ def action_gen(
 
 def action_train(
     path: StrOrPath,
+    data_path: str,
     steps: int,
-    data_paths: list[str],
     *,
     seq_len: Optional[int] = None,
     batch_size: Optional[int] = None,
     learning_rate: Optional[float] = None,
-    mark: bool = False,
-    val_paths: Optional[list[str]] = None,
+    weight_decay: Optional[float] = None,
+    val_path: Optional[str] = None,
     log_period: int = 10,
     tensorboard_dir: Optional[str] = None,
     device: str = "cpu",
+    start_index: Optional[int] = None,
+    start_offset: Optional[int] = None,
+    add_eot: bool = False,
+    gradient_accumulation_steps: Optional[int] = None,
 ):
     assert log_period > 0
 
     project_info = load_project(path)
     model_state_file = resolve_parent(path) / project_info.model_state_file
-    vocab_file = resolve_parent(path) / project_info.vocab_file
+    tokenizer_file = resolve_parent(path) / project_info.tokenizer
     train_config = project_info.train_config
     optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
 
-    should_reset_optimizer = (
-        batch_size is not None and batch_size != train_config.batch_size
+    # Effective batch size = batch_size × gradient_accumulation_steps.
+    # Optimizer state (momentum, etc.) depends on the effective batch —
+    # reset whenever it changes.
+    new_bs = batch_size if batch_size is not None else train_config.batch_size
+    new_ga = (
+        gradient_accumulation_steps
+        if gradient_accumulation_steps is not None
+        else (train_config.gradient_accumulation_steps or 1)
     )
+    prev_bs = train_config.batch_size
+    prev_ga = train_config.gradient_accumulation_steps or 1
+    should_reset_optimizer = (new_bs * new_ga) != (prev_bs * prev_ga)
 
     if seq_len is None:
         seq_len = train_config.seq_len
@@ -503,43 +540,72 @@ def action_train(
     else:
         train_config.learning_rate = learning_rate
 
+    if weight_decay is None:
+        weight_decay = train_config.weight_decay
+    else:
+        train_config.weight_decay = weight_decay
+
+    if gradient_accumulation_steps is None:
+        gradient_accumulation_steps = train_config.gradient_accumulation_steps or 1
+    else:
+        train_config.gradient_accumulation_steps = gradient_accumulation_steps
+    assert gradient_accumulation_steps >= 1
+
     # data
 
-    words = load_gzip_pickle(vocab_file)
-    tokenizer = create_tokenizer(words)
+    tokenizer = load_tokenizer(tokenizer_file)
 
-    log_info("Preparing data.")
-    if mark:
-        log_info("Markers (SOT, EOT, etc.) will be added.")
-    data_source = create_data_source(data_paths, seq_len, mark=mark)
+    log_info("Loading training dataset.")
+    dataset = load_dataset(data_path)
 
-    print("Data example:")
-    example_tokens = data_source.sample()
-    print(
-        f"(len={len(example_tokens)}) {example_tokens} ({repr(tokenizer.decode(example_tokens))})"
+    # detect dataset replacement
+    new_id = get_dataset_id(dataset)
+    old_id = project_info.train_info.dataset_id
+    if new_id and new_id != old_id:
+        log_info(f"Dataset changed ({old_id!r} -> {new_id!r}).")
+        if start_index is None:
+            project_info.train_info.index = 0
+        if start_offset is None:
+            project_info.train_info.offset = 0
+        project_info.train_info.dataset_id = new_id
+
+    # start position: CLI args override TrainInfo
+    if start_index is None:
+        start_index = project_info.train_info.index
+    if start_offset is None:
+        start_offset = project_info.train_info.offset
+
+    log_info(f"Start position: index={start_index}, offset={start_offset}")
+
+    eot_index = EOT if add_eot else None
+
+    train_tracker: dict = {"sample_idx": start_index, "offset": start_offset}
+    batch_iterator = iter_batches(
+        dataset,
+        seq_len,
+        batch_size,
+        PAD,
+        start_index=start_index,
+        start_offset=start_offset,
+        tracker=train_tracker,
+        eot_index=eot_index,
     )
 
     val_batches = max(log_period // 10, 1)
-    val_data_source = None
-    if val_paths and len(val_paths) > 0:
-        log_info("Preparing validation data.")
-        val_data_source = create_data_source(val_paths, seq_len, mark=mark)
-
-        print("Validation data example:")
-        val_example_tokens = val_data_source.sample()
-        print(
-            f"(len={len(val_example_tokens)}) {val_example_tokens} ({repr(tokenizer.decode(val_example_tokens))})"
-        )
+    val_dataset = None
+    if val_path is not None:
+        log_info("Loading validation dataset.")
+        val_dataset = load_dataset(val_path)
 
     # model
 
-    model = LLM(project_info.config).to(device)
+    model = Model(project_info.config).to(device)
     log_info("Loading model state.")
     load_model_state(model_state_file, model, device=device)
 
     # optimizer
 
-    optimizer = Adam(model.parameters(), lr=learning_rate)
+    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     if should_reset_optimizer:
         log_info("Batch size changed, optimizer reset.")
     else:
@@ -554,8 +620,8 @@ def action_train(
         writer = SummaryWriter(tensorboard_dir)
 
         # show graph
-        data_loader = DataLoader(TrainDataset(data_source, seq_len, PAD))
-        dummy_input, dummy_mask, _ = next(iter(data_loader))
+        dummy_iter = iter_batches(dataset, seq_len, 1, PAD, eot_index=eot_index)
+        dummy_input, dummy_mask, _ = next(dummy_iter)
         writer.add_graph(model, (dummy_input.to(device), dummy_mask.to(device)))
 
         # show input word embedding
@@ -569,6 +635,8 @@ def action_train(
             writer.add_text("train/log", msg, project_info.train_info.token_count)
 
     def save():
+        project_info.train_info.index = train_tracker["sample_idx"]
+        project_info.train_info.offset = train_tracker["offset"]
         log_info(f"Saving. (train_info: {project_info.train_info})")
         save_project(path, project_info)
         save_model_state(model_state_file, model)
@@ -622,15 +690,16 @@ def action_train(
             state["sum_time_backward"] = 0.0
 
             val_loss = None
-            if val_data_source is not None:
+            if val_dataset is not None:
                 val_loss = compute_validation_loss(
                     model=model,
-                    data_source=val_data_source,
+                    dataset=val_dataset,
                     seq_len=seq_len,
                     batch_size=batch_size,
                     pad_index=PAD,
                     device=device,
                     num_batches=val_batches,
+                    eot_index=eot_index,
                 )
 
             time_log_msg = f"avg_time={avg_time:.6f} (({avg_time_load_batch:.6f} + {avg_time_transfer_batch:.6f}) + ({avg_time_forward:.6f} + {avg_time_backward:.6f}))"
@@ -656,30 +725,52 @@ def action_train(
 
     t_start = time.perf_counter()
 
-    log_important(
-        f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}). Time: {datetime.now()}"
-    )
+    if gradient_accumulation_steps > 1:
+        effective_batch = batch_size * gradient_accumulation_steps
+        train_msg = (
+            f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}, "
+            f"gradient_accumulation_steps={gradient_accumulation_steps}, "
+            f"effective_batch_size={effective_batch}). Time: {datetime.now()}"
+        )
+    else:
+        train_msg = (
+            f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}). "
+            f"Time: {datetime.now()}"
+        )
+
+    log_important(train_msg)
 
     backup()
 
-    train(
+    actual_steps = train(
         info=project_info.train_info,
         model=model,
-        seq_len=seq_len,
         optimizer=optimizer,
-        data_source=data_source,
+        batch_iterator=batch_iterator,
         pad_index=PAD,
         batch_size=batch_size,
         steps=steps,
         device=device,
         step_callback=step_callback,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
+
+    if actual_steps < steps:
+        log_info("Dataset exhausted – resetting train_info position to zero.")
+        project_info.train_info.index = 0
+        project_info.train_info.offset = 0
+        project_info.train_info.dataset_id = ""
+        train_tracker["sample_idx"] = 0
+        train_tracker["offset"] = 0
 
     save()
 
     t_end = time.perf_counter()
 
     log_important(f"Training completed. (time: {t_end - t_start:.6f})")
+    log_info(
+        f"Reached sample {train_tracker['sample_idx']}, offset {train_tracker['offset']} in the dataset."
+    )
 
     if writer is not None:
         writer_add_embedding(writer, model, tokenizer, device=device)
@@ -690,48 +781,41 @@ def action_train(
 def action_model_init(path: StrOrPath, *, yes: bool = False):
     project_info = load_project(path)
     model_state_file = resolve_parent(path) / project_info.model_state_file
-    vocab_file = resolve_parent(path) / project_info.vocab_file
     train_config = project_info.train_config
     optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
 
     prompt_overwrite(model_state_file, yes=yes)
     prompt_overwrite(optimizer_state_file, yes=yes)
 
-    words = load_gzip_pickle(vocab_file)
-    tokenizer = create_tokenizer(words)
-
-    config = project_info.config
-
-    correct_vocab_size = False
-    if config.vocab_size != tokenizer.vocab_size():
-        if not yes:
-            ans = input(
-                f"Current config.vocab_size {config.vocab_size} != actual vocab_size {tokenizer.vocab_size()}. Correct it? "
-            )
-            if ans.strip().lower() in YES_STRINGS:
-                correct_vocab_size = True
-            elif ans.strip().lower() in NO_STRINGS:
-                pass
-            else:
-                raise PromptAbortError
-        else:
-            correct_vocab_size = True
-
-    if correct_vocab_size:
-        config.vocab_size = tokenizer.vocab_size()
-        print("Corrected.")
-
-    model = LLM(config)
+    model = Model(project_info.config)
     save_model_state(model_state_file, model)
     log_success(f"Initialized model state at {model_state_file}.")
 
-    optimizer = Adam(model.parameters(), lr=train_config.learning_rate)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=train_config.learning_rate,
+        weight_decay=train_config.weight_decay,
+    )
     save_optimizer_state(optimizer_state_file, optimizer)
     log_success(f"Initialized optimizer state at {optimizer_state_file}.")
 
     project_info.train_info = TrainInfo()
 
     save_project(path, project_info)
+
+
+def action_dump_param(path: StrOrPath):
+    project_info = load_project(path)
+    model_state_file = resolve_parent(path) / project_info.model_state_file
+
+    device = "cpu"
+    model = Model(project_info.config).to(device)
+    log_info("Loading model state.")
+    load_model_state(model_state_file, model, device=device)
+
+    for name, param in model.named_parameters():
+        print(f"==== {name} ====")
+        print(param)
 
 
 #### main ####
@@ -802,22 +886,20 @@ def create_parser() -> ArgumentParser:
         default=EOT,
         help="stop token id (-1: never stop)",
     )
-    gen_parser.add_argument(
-        "-m", "--mark", action="store_true", help="add markers (SOT, EOT, etc.)"
-    )
+    gen_parser.add_argument("--eot", action="store_true", help="add EOT")
 
     # train
     train_parser = subparsers.add_parser("train", help="train model")
     train_parser.add_argument("path", help="project file")
+    train_parser.add_argument("data", help="dataset directory")
     train_parser.add_argument("steps", type=int, help="number of steps")
-    train_parser.add_argument("data", nargs="+", help="token data file")
     train_parser.add_argument("-l", "--seq-len", type=int, help="sequence length")
-    train_parser.add_argument("-b", "--batch-size", type=int, help="batch size")
-    train_parser.add_argument("-r", "--learning-rate", type=float, help="learning rate")
-    train_parser.add_argument("-v", "--val", nargs="*", help="validation data file")
+    train_parser.add_argument("-bs", "--batch-size", type=int, help="batch size")
     train_parser.add_argument(
-        "-m", "--mark", action="store_true", help="add markers (SOT, EOT, etc.)"
+        "-lr", "--learning-rate", type=float, help="learning rate"
     )
+    train_parser.add_argument("-wd", "--weight-decay", type=float, help="weight decay")
+    train_parser.add_argument("-v", "--val", help="validation dataset directory")
     train_parser.add_argument(
         "-tb", "--tensorboard-dir", help="TensorBoard write directory"
     )
@@ -828,6 +910,33 @@ def create_parser() -> ArgumentParser:
         default=10,
         help="log each this number of steps",
     )
+    train_parser.add_argument(
+        "-si",
+        "--start-index",
+        type=int,
+        default=None,
+        help="start training from this sample index in the dataset (default: read from project)",
+    )
+    train_parser.add_argument(
+        "-so",
+        "--start-offset",
+        type=int,
+        default=None,
+        help="initial window offset for the first sample (default: read from project)",
+    )
+    train_parser.add_argument(
+        "-et",
+        "--eot",
+        action="store_true",
+        help="append EOT to each training/validation text (effective length +1)",
+    )
+    train_parser.add_argument(
+        "-ga",
+        "--gradient-accumulation-steps",
+        type=int,
+        default=None,
+        help="accumulate gradients over N batches before each optimizer step (default: 1)",
+    )
 
     # model_init
     model_init_parser = subparsers.add_parser(
@@ -835,6 +944,10 @@ def create_parser() -> ArgumentParser:
         help="initialize model accroding to configuration and fill with random weights",
     )
     model_init_parser.add_argument("path", help="project file")
+
+    # param
+    dump_param_parser = subparsers.add_parser("dump_param", help="dump parameters")
+    dump_param_parser.add_argument("path", help="project file")
 
     return parser
 
@@ -877,24 +990,30 @@ def main():
                 stream=args.stream,
                 all=args.all,
                 stop_token=args.stop_token,
-                mark=args.mark,
+                add_eot=args.eot,
             )
         case "train":
             action_train(
                 args.path,
+                data_path=args.data,
                 steps=args.steps,
-                data_paths=args.data,
                 seq_len=args.seq_len,
                 batch_size=args.batch_size,
                 learning_rate=args.learning_rate,
-                mark=args.mark,
-                val_paths=args.val,
+                weight_decay=args.weight_decay,
+                val_path=args.val,
                 device=device,
                 tensorboard_dir=args.tensorboard_dir,
                 log_period=args.log_period,
+                start_index=args.start_index,
+                start_offset=args.start_offset,
+                add_eot=args.eot,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
             )
         case "model_init":
             action_model_init(args.path, yes=args.yes)
+        case "dump_param":
+            action_dump_param(args.path)
         case _:
             raise ValueError(f"unrecognized action: {args.action}")
 
