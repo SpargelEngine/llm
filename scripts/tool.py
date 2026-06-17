@@ -24,8 +24,8 @@ from spargel_llm.tools.utils import (
     PromptAbortError,
     prompt_overwrite,
 )
-from spargel_llm.v1.torch.model import Config, Model
-from spargel_llm.v1.torch.utils import StepInfo, TrainInfo, generate_step, train
+from spargel_llm.model import Config, Model
+from spargel_llm.utils import StepInfo, TrainInfo, generate_step, train
 
 PAD, EOT = 1, 2
 
