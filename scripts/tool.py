@@ -18,14 +18,14 @@ from torch import Tensor
 from torch.optim import AdamW, Optimizer
 from torch.utils.tensorboard import SummaryWriter
 
-from spargel_llm.tools.logging import log_info, log_success
-from spargel_llm.tools.typing import StrOrPath
-from spargel_llm.tools.utils import (
+from spargel_llm.logging import log_info, log_success
+from spargel_llm.typing import StrOrPath
+from spargel_llm.utils import (
     PromptAbortError,
     prompt_overwrite,
 )
 from spargel_llm.model import Config, Model
-from spargel_llm.utils import StepInfo, TrainInfo, generate_step, train
+from spargel_llm.train import StepInfo, TrainInfo, generate_step, train
 
 PAD, EOT = 1, 2
 
@@ -790,14 +790,6 @@ def action_train(
             project_info.train_info.dataset_id = ""
             train_tracker["sample_idx"] = 0
             train_tracker["offset"] = 0
-
-    if actual_steps < steps:
-        log_info("Dataset exhausted – resetting train_info position to zero.")
-        project_info.train_info.index = 0
-        project_info.train_info.offset = 0
-        project_info.train_info.dataset_id = ""
-        train_tracker["sample_idx"] = 0
-        train_tracker["offset"] = 0
 
     save()
 

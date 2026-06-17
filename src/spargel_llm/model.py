@@ -5,12 +5,10 @@ import torch.nn as nn
 from pydantic import BaseModel, PositiveInt
 from torch import Tensor
 
-from spargel_llm.layers.torch import (
-    Attention,
-    FeedForward,
-    PositionalEncoding,
-    RMSNorm,
-)
+from spargel_llm.layer.attention import Attention
+from spargel_llm.layer.feed_forward import FeedForward
+from spargel_llm.layer.positional_encoding import PositionalEncoding
+from spargel_llm.layer.rms_norm import RMSNorm
 
 
 class Config(BaseModel):
