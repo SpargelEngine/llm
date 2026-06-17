@@ -1,5 +1,3 @@
-from typing import Protocol, Sized
+from os import PathLike
 
-
-class Sliceable(Sized, Protocol):
-    def __getitem__[T: Sliceable](self: T, key: slice, /) -> T: ...
+type StrOrPath = str | PathLike[str]

@@ -501,6 +501,7 @@ def action_train(
     start_offset: Optional[int] = None,
     add_eot: bool = False,
     gradient_accumulation_steps: Optional[int] = None,
+    loop_dataset: bool = False,
 ):
     assert log_period > 0
 
@@ -580,16 +581,18 @@ def action_train(
     eot_index = EOT if add_eot else None
 
     train_tracker: dict = {"sample_idx": start_index, "offset": start_offset}
-    batch_iterator = iter_batches(
-        dataset,
-        seq_len,
-        batch_size,
-        PAD,
-        start_index=start_index,
-        start_offset=start_offset,
-        tracker=train_tracker,
-        eot_index=eot_index,
-    )
+
+    def make_iterator():
+        return iter_batches(
+            dataset,
+            seq_len,
+            batch_size,
+            PAD,
+            start_index=start_index or 0,
+            start_offset=start_offset or 0,
+            tracker=train_tracker,
+            eot_index=eot_index,
+        )
 
     val_batches = max(log_period // 10, 1)
     val_dataset = None
@@ -742,26 +745,51 @@ def action_train(
 
     backup()
 
-    actual_steps = train(
-        info=project_info.train_info,
-        model=model,
-        optimizer=optimizer,
-        batch_iterator=batch_iterator,
-        pad_index=PAD,
-        batch_size=batch_size,
-        steps=steps,
-        device=device,
-        step_callback=step_callback,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-    )
+    if loop_dataset:
+        steps_remaining = steps
+        while steps_remaining > 0:
+            batch_iterator = make_iterator()
+            actual_steps = train(
+                info=project_info.train_info,
+                model=model,
+                optimizer=optimizer,
+                batch_iterator=batch_iterator,
+                pad_index=PAD,
+                batch_size=batch_size,
+                steps=steps_remaining,
+                device=device,
+                step_callback=step_callback,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+            )
+            steps_remaining -= actual_steps
+            if steps_remaining > 0:
+                log_info("Dataset exhausted - restarting from beginning.")
+                start_index = 0
+                start_offset = 0
+                train_tracker["sample_idx"] = 0
+                train_tracker["offset"] = 0
+    else:
+        batch_iterator = make_iterator()
+        actual_steps = train(
+            info=project_info.train_info,
+            model=model,
+            optimizer=optimizer,
+            batch_iterator=batch_iterator,
+            pad_index=PAD,
+            batch_size=batch_size,
+            steps=steps,
+            device=device,
+            step_callback=step_callback,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
 
-    if actual_steps < steps:
-        log_info("Dataset exhausted – resetting train_info position to zero.")
-        project_info.train_info.index = 0
-        project_info.train_info.offset = 0
-        project_info.train_info.dataset_id = ""
-        train_tracker["sample_idx"] = 0
-        train_tracker["offset"] = 0
+        if actual_steps < steps:
+            log_info("Dataset exhausted - resetting train_info position to zero.")
+            project_info.train_info.index = 0
+            project_info.train_info.offset = 0
+            project_info.train_info.dataset_id = ""
+            train_tracker["sample_idx"] = 0
+            train_tracker["offset"] = 0
 
     save()
 
@@ -937,6 +965,12 @@ def create_parser() -> ArgumentParser:
         default=None,
         help="accumulate gradients over N batches before each optimizer step (default: 1)",
     )
+    train_parser.add_argument(
+        "-ld",
+        "--loop-dataset",
+        action="store_true",
+        help="restart from the beginning when the dataset is exhausted instead of stopping early",
+    )
 
     # model_init
     model_init_parser = subparsers.add_parser(
@@ -1009,6 +1043,7 @@ def main():
                 start_offset=args.start_offset,
                 add_eot=args.eot,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
+                loop_dataset=args.loop_dataset,
             )
         case "model_init":
             action_model_init(args.path, yes=args.yes)
