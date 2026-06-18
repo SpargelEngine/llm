@@ -36,7 +36,7 @@ class TrainConfig(BaseModel):
     learning_rate: float
     weight_decay: float
     optimizer_state_file: str
-    gradient_accumulation_steps: NonNegativeInt = 1
+    micro_batches: NonNegativeInt = 1
 
 
 class ProjectInfo(BaseModel):
@@ -525,18 +525,11 @@ def action_train(
     train_config = project_info.train_config
     optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
 
-    # Effective batch size = batch_size × gradient_accumulation_steps.
-    # Optimizer state (momentum, etc.) depends on the effective batch —
+    # Optimizer state (momentum, etc.) depends on the effective batch size —
     # reset whenever it changes.
     new_bs = batch_size if batch_size is not None else train_config.batch_size
-    new_ga = (
-        gradient_accumulation_steps
-        if gradient_accumulation_steps is not None
-        else (train_config.gradient_accumulation_steps or 1)
-    )
     prev_bs = train_config.batch_size
-    prev_ga = train_config.gradient_accumulation_steps or 1
-    should_reset_optimizer = (new_bs * new_ga) != (prev_bs * prev_ga)
+    should_reset_optimizer = new_bs != prev_bs
 
     if seq_len is None:
         seq_len = train_config.seq_len
@@ -561,10 +554,17 @@ def action_train(
         train_config.weight_decay = weight_decay
 
     if gradient_accumulation_steps is None:
-        gradient_accumulation_steps = train_config.gradient_accumulation_steps or 1
+        micro_batches = train_config.micro_batches or 1
     else:
-        train_config.gradient_accumulation_steps = gradient_accumulation_steps
-    assert gradient_accumulation_steps >= 1
+        micro_batches = gradient_accumulation_steps
+        train_config.micro_batches = micro_batches
+    assert micro_batches >= 1
+    assert batch_size % micro_batches == 0, (
+        f"batch_size ({batch_size}) must be divisible by "
+        f"micro_batches ({micro_batches})"
+    )
+
+    micro_batch_size = batch_size // micro_batches
 
     # data
 
@@ -598,7 +598,7 @@ def action_train(
         return iter_batches(
             dataset,
             seq_len,
-            batch_size,
+            micro_batch_size,
             PAD,
             start_index=start_index or 0,
             start_offset=start_offset or 0,
@@ -706,7 +706,7 @@ def action_train(
                     model=model,
                     dataset=val_dataset,
                     seq_len=seq_len,
-                    batch_size=batch_size,
+                    batch_size=micro_batch_size,
                     pad_index=PAD,
                     device=device,
                     num_batches=val_batches,
@@ -733,12 +733,11 @@ def action_train(
 
     t_start = time.perf_counter()
 
-    if gradient_accumulation_steps > 1:
-        effective_batch = batch_size * gradient_accumulation_steps
+    if micro_batches > 1:
         train_msg = (
             f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}, "
-            f"gradient_accumulation_steps={gradient_accumulation_steps}, "
-            f"effective_batch_size={effective_batch}). Time: {datetime.now()}"
+            f"micro_batches={micro_batches}, "
+            f"micro_batch_size={micro_batch_size}). Time: {datetime.now()}"
         )
     else:
         train_msg = (
@@ -760,11 +759,10 @@ def action_train(
                 optimizer=optimizer,
                 batch_iterator=batch_iterator,
                 pad_index=PAD,
-                batch_size=batch_size,
                 steps=steps_remaining,
                 device=device,
                 step_callback=step_callback,
-                gradient_accumulation_steps=gradient_accumulation_steps,
+                micro_batches=micro_batches,
             )
             steps_remaining -= actual_steps
             if steps_remaining > 0:
@@ -781,11 +779,10 @@ def action_train(
             optimizer=optimizer,
             batch_iterator=batch_iterator,
             pad_index=PAD,
-            batch_size=batch_size,
             steps=steps,
             device=device,
             step_callback=step_callback,
-            gradient_accumulation_steps=gradient_accumulation_steps,
+            micro_batches=micro_batches,
         )
 
         if actual_steps < steps:
@@ -995,11 +992,12 @@ def create_parser() -> ArgumentParser:
         help="append EOT to each training/validation text (effective length +1)",
     )
     train_parser.add_argument(
-        "-ga",
-        "--gradient-accumulation-steps",
+        "-mb",
+        "--micro-batches",
         type=int,
         default=None,
-        help="accumulate gradients over N batches before each optimizer step (default: 1)",
+        dest="gradient_accumulation_steps",
+        help="split each step into N micro-batches with accumulated gradients (default: 1)",
     )
     train_parser.add_argument(
         "-ld",
