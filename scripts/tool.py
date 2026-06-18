@@ -19,13 +19,13 @@ from torch.optim import AdamW, Optimizer
 from torch.utils.tensorboard import SummaryWriter
 
 from spargel_llm.logging import log_info, log_success
+from spargel_llm.model import Config, Model
+from spargel_llm.train import StepInfo, TrainInfo, generate_step, train
 from spargel_llm.typing import StrOrPath
 from spargel_llm.utils import (
     PromptAbortError,
     prompt_overwrite,
 )
-from spargel_llm.model import Config, Model
-from spargel_llm.train import StepInfo, TrainInfo, generate_step, train
 
 PAD, EOT = 1, 2
 
@@ -507,7 +507,6 @@ def action_train(
 
     project_info = load_project(path)
     model_state_file = resolve_parent(path) / project_info.model_state_file
-    tokenizer_file = resolve_parent(path) / project_info.tokenizer
     train_config = project_info.train_config
     optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
 
@@ -553,8 +552,6 @@ def action_train(
     assert gradient_accumulation_steps >= 1
 
     # data
-
-    tokenizer = load_tokenizer(tokenizer_file)
 
     log_info("Loading training dataset.")
     dataset = load_dataset(data_path)
@@ -626,9 +623,6 @@ def action_train(
         dummy_iter = iter_batches(dataset, seq_len, 1, PAD, eot_index=eot_index)
         dummy_input, dummy_mask, _ = next(dummy_iter)
         writer.add_graph(model, (dummy_input.to(device), dummy_mask.to(device)))
-
-        # show input word embedding
-        writer_add_embedding(writer, model, tokenizer, device=device)
 
     # helper functions
 
@@ -721,9 +715,6 @@ def action_train(
                 if step % (log_period * 100) == 0:
                     backup()
 
-                    if writer is not None:
-                        writer_add_embedding(writer, model, tokenizer, device=device)
-
     # train
 
     t_start = time.perf_counter()
@@ -801,8 +792,6 @@ def action_train(
     )
 
     if writer is not None:
-        writer_add_embedding(writer, model, tokenizer, device=device)
-
         writer.close()
 
 
@@ -844,6 +833,24 @@ def action_dump_param(path: StrOrPath):
     for name, param in model.named_parameters():
         print(f"==== {name} ====")
         print(param)
+
+
+def action_embed(path: StrOrPath, tensorboard_dir: str, *, device: str = "cpu"):
+    project_info = load_project(path)
+    model_state_file = resolve_parent(path) / project_info.model_state_file
+    tokenizer_file = resolve_parent(path) / project_info.tokenizer
+
+    model = Model(project_info.config).to(device)
+    log_info("Loading model state.")
+    load_model_state(model_state_file, model, device=device)
+
+    tokenizer = load_tokenizer(tokenizer_file)
+
+    log_info("Opening TensorBoard writer.")
+    writer = SummaryWriter(tensorboard_dir)
+    writer_add_embedding(writer, model, tokenizer, device=device)
+    writer.close()
+    log_success(f"Embedding projection written to {tensorboard_dir}.")
 
 
 #### main ####
@@ -979,6 +986,13 @@ def create_parser() -> ArgumentParser:
     )
     model_init_parser.add_argument("path", help="project file")
 
+    # embed
+    embed_parser = subparsers.add_parser(
+        "embed", help="write embedding projection to TensorBoard"
+    )
+    embed_parser.add_argument("path", help="project file")
+    embed_parser.add_argument("tensorboard_dir", help="TensorBoard write directory")
+
     # param
     dump_param_parser = subparsers.add_parser("dump_param", help="dump parameters")
     dump_param_parser.add_argument("path", help="project file")
@@ -1047,6 +1061,8 @@ def main():
             )
         case "model_init":
             action_model_init(args.path, yes=args.yes)
+        case "embed":
+            action_embed(args.path, args.tensorboard_dir, device=device)
         case "dump_param":
             action_dump_param(args.path)
         case _:
