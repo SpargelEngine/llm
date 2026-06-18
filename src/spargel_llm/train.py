@@ -77,6 +77,7 @@ def train(
         step_time_backward = 0.0
         step_token_count = 0
 
+        actual_mb = 0
         for mb in range(micro_batches):
             t0 = time.perf_counter()
 
@@ -88,6 +89,8 @@ def train(
                     return step
                 # partial step — still apply what we've accumulated
                 break
+
+            actual_mb += 1
 
             t1 = time.perf_counter()
 
@@ -114,12 +117,14 @@ def train(
 
             t4 = time.perf_counter()
 
-            step_loss += loss.detach().item()
+            step_loss += loss.detach().item() * micro_batches
             step_time_load_batch += t1 - t0
             step_time_transfer_batch += t2 - t1
             step_time_forward += t3 - t2
             step_time_backward += t4 - t3
             step_token_count += int(torch.sum(~masks).item())
+
+        step_loss = step_loss / actual_mb
 
         optimizer.step()
 
