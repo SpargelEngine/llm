@@ -260,6 +260,21 @@ def get_backup_path(path: StrOrPath):
     )
 
 
+def writer_add_graph(
+    writer: SummaryWriter,
+    model: Model,
+    *,
+    device: str = "cpu",
+    pad_index: int = PAD,
+):
+    """Write the model graph to TensorBoard using dummy input."""
+    model.eval()
+    seq_len = model.config.max_seq_len
+    dummy_input = torch.full((1, seq_len), pad_index, dtype=torch.long, device=device)
+    dummy_mask = torch.ones((1, seq_len), dtype=torch.bool, device=device)
+    writer.add_graph(model, (dummy_input, dummy_mask))
+
+
 def writer_add_embedding(
     writer: SummaryWriter,
     model: Model,
@@ -619,10 +634,9 @@ def action_train(
         log_info("Opening TensorBoard writer.")
         writer = SummaryWriter(tensorboard_dir)
 
-        # show graph
-        dummy_iter = iter_batches(dataset, seq_len, 1, PAD, eot_index=eot_index)
-        dummy_input, dummy_mask, _ = next(dummy_iter)
-        writer.add_graph(model, (dummy_input.to(device), dummy_mask.to(device)))
+        if project_info.train_info.token_count == 0:
+            log_info("Writing model graph to TensorBoard.")
+            writer_add_graph(writer, model, device=device)
 
     # helper functions
 
@@ -821,6 +835,21 @@ def action_model_init(path: StrOrPath, *, yes: bool = False):
     save_project(path, project_info)
 
 
+def action_graph(path: StrOrPath, tensorboard_dir: str, *, device: str = "cpu"):
+    project_info = load_project(path)
+    model_state_file = resolve_parent(path) / project_info.model_state_file
+
+    model = Model(project_info.config).to(device)
+    log_info("Loading model state.")
+    load_model_state(model_state_file, model, device=device)
+
+    log_info("Opening TensorBoard writer.")
+    writer = SummaryWriter(tensorboard_dir)
+    writer_add_graph(writer, model, device=device)
+    writer.close()
+    log_success(f"Model graph written to {tensorboard_dir}.")
+
+
 def action_dump_param(path: StrOrPath):
     project_info = load_project(path)
     model_state_file = resolve_parent(path) / project_info.model_state_file
@@ -993,6 +1022,13 @@ def create_parser() -> ArgumentParser:
     embed_parser.add_argument("path", help="project file")
     embed_parser.add_argument("tensorboard_dir", help="TensorBoard write directory")
 
+    # graph
+    graph_parser = subparsers.add_parser(
+        "graph", help="write model graph to TensorBoard"
+    )
+    graph_parser.add_argument("path", help="project file")
+    graph_parser.add_argument("tensorboard_dir", help="TensorBoard write directory")
+
     # param
     dump_param_parser = subparsers.add_parser("dump_param", help="dump parameters")
     dump_param_parser.add_argument("path", help="project file")
@@ -1063,6 +1099,8 @@ def main():
             action_model_init(args.path, yes=args.yes)
         case "embed":
             action_embed(args.path, args.tensorboard_dir, device=device)
+        case "graph":
+            action_graph(args.path, args.tensorboard_dir, device=device)
         case "dump_param":
             action_dump_param(args.path)
         case _:
