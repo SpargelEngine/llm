@@ -8,6 +8,23 @@ import torch.nn as nn
 from torch import Tensor
 
 
+def rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """
+    Compute: x R_k
+    Args:
+        x (..., seq_len, dim)       actually (batch, num_head, seq_len, dim_head)
+        cos (seq_len, dim // 2)
+        sin (seq_len, dim // 2)
+    Returns:
+        (..., seq_len, dim)
+    """
+    dim = x.size(-1)
+    assert dim % 2 == 0
+    half_dim = dim // 2
+    x1, x2 = x[..., :half_dim], x[..., half_dim:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+
+
 def attention(
     q: Tensor,
     k: Tensor,
@@ -61,6 +78,8 @@ class Attention(nn.Module):
         dim_out: int,
         dim_k: int,
         dim_v: int,
+        *,
+        use_rope=False,
     ):
         super().__init__()
         self.num_head = num_head
@@ -75,6 +94,17 @@ class Attention(nn.Module):
         self.W_k = nn.Parameter(torch.empty(num_head, dim_in, dim_k))
         self.W_v = nn.Parameter(torch.empty(num_head, dim_in, dim_v))
         self.W_o = nn.Parameter(torch.empty(num_head, dim_v, dim_out))
+
+        self.use_rope = use_rope
+        if self.use_rope:
+            assert self.dim_k % 2 == 0, f"head dim must be even, got {self.dim_k}"
+            self.thetas = nn.Buffer(
+                1.0 / (10000.0 ** (torch.arange(0, self.dim_k, 2) / self.dim_k)),
+                persistent=False,
+            )
+            self.cos_values = nn.Buffer(None, persistent=False)
+            self.sin_values = nn.Buffer(None, persistent=False)
+            self.seq_len = None
 
         def _xavier_init(w: Tensor, d1: int, d2: int):
             a = math.sqrt(6 / (d1 + d2))
@@ -110,6 +140,18 @@ class Attention(nn.Module):
         k = torch.einsum("ijk, ...lj -> ...ilk", self.W_k, x)
         # (..., num_head, seq_len, dim_v)
         v = torch.einsum("ijk, ...lj -> ...ilk", self.W_v, x)
+
+        if self.use_rope:
+            if self.seq_len is None or self.seq_len != seq_len:
+                self.seq_len = seq_len
+                positions = torch.arange(0, seq_len, device=x.device, dtype=q.dtype)
+                thetas = self.thetas.to(dtype=q.dtype)
+                freqs = torch.outer(positions, thetas)
+                self.cos_values = freqs.cos()
+                self.sin_values = freqs.sin()
+
+            q = rope(q, self.cos_values, self.sin_values)
+            k = rope(k, self.cos_values, self.sin_values)
 
         if causal:
             causal_mask = torch.triu(
