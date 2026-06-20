@@ -98,12 +98,19 @@ class StepInfo:
     tokens: int
     tokens_non_pad: int
 
+@dataclass
+class BatchData:
+    input_ids: Tensor
+    mask: Tensor
+    target_ids: Tensor
+    tokens: int
+    tokens_non_pad: int
 
 def train(
     info: TrainInfo,
     model: Model,
     optimizer: Optimizer,
-    batch_iterator: Iterator[tuple[Tensor, Tensor, Tensor, int, int]],
+    batch_iterator: Iterator[BatchData],
     pad_index: int,
     steps: int,
     *,
@@ -135,19 +142,20 @@ def train(
         t_start = time.perf_counter()
 
         # fetch micro batches
-        cpu_batches: list[tuple[Tensor, Tensor, Tensor, int, int]] = []
+        cpu_batches: list[BatchData] = []
         step_tokens = 0
         step_tokens_non_pad = 0
         for _ in range(micro_batches):
             try:
-                inputs, masks, targets, tokens, tokens_non_pad = next(batch_iterator)
+                batch_data = next(batch_iterator)
+                # inputs, masks, targets, tokens, tokens_non_pad = 
             except StopIteration:
                 if not cpu_batches:
                     return step
                 break
-            step_tokens += tokens
-            step_tokens_non_pad += tokens_non_pad
-            cpu_batches.append((inputs, masks, targets, tokens, tokens_non_pad))
+            step_tokens += batch_data.tokens
+            step_tokens_non_pad += batch_data.tokens_non_pad
+            cpu_batches.append(batch_data)
 
         step_loss = torch.tensor(0.0, device=torch_device, dtype=torch.float32)
 
@@ -157,10 +165,10 @@ def train(
         optimizer.zero_grad()
 
         # forward / backward
-        for inputs, masks, targets, _, _ in cpu_batches:
-            inputs = inputs.to(torch_device)
-            masks = masks.to(torch_device)
-            targets = targets.to(torch_device)
+        for batch_data in cpu_batches:
+            inputs = batch_data.input_ids.to(torch_device)
+            masks = batch_data.mask.to(torch_device)
+            targets = batch_data.target_ids.to(torch_device)
 
             with torch.autocast(
                 device_type=device_type, dtype=torch.bfloat16, enabled=use_bf16
@@ -248,13 +256,14 @@ def compute_validation_metrics(
     with torch.no_grad():
         for _ in range(num_batches):
             try:
-                inputs, masks, targets, _, n_non_pad = next(iterator)
+                batch_data = next(iterator)
             except StopIteration:
                 break
 
-            inputs = inputs.to(torch_device)
-            masks = masks.to(torch_device)
-            targets = targets.to(torch_device)
+            inputs = batch_data.input_ids.to(torch_device)
+            masks = batch_data.mask.to(torch_device)
+            targets = batch_data.target_ids.to(torch_device)
+            n_non_pad = batch_data.tokens_non_pad
 
             with torch.autocast(
                 device_type=device_type, dtype=torch.bfloat16, enabled=use_bf16
@@ -327,7 +336,7 @@ def iter_batches(
     tracker: TrainTracker | None = None,
     eot_index: int | None = None,
     sot_index: int | None = None,
-) -> Iterator[tuple[Tensor, Tensor, Tensor, int, int]]:
+) -> Iterator[BatchData]:
     """Iterate through a pre-tokenized Parquet dataset and yield tensor batches.
 
     For each row, a window of ``seq_len + 1`` tokens slides with the given
@@ -436,7 +445,7 @@ def iter_batches(
                 sample_in_batch += 1
 
                 if sample_in_batch == batch_size:
-                    yield (
+                    yield BatchData(
                         torch.from_numpy(batch_inputs.copy()),
                         torch.from_numpy(batch_masks.copy()),
                         torch.from_numpy(batch_targets.copy()),
