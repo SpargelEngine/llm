@@ -64,6 +64,7 @@ class Model(nn.Module):
         self.blocks = nn.ModuleList(
             TransformerBlock(config) for _ in range(config.num_layer)
         )
+        self.final_norm = RMSNorm(config.dim)
         self.out = nn.Linear(config.dim, config.vocab_size)
 
     @override
@@ -72,6 +73,7 @@ class Model(nn.Module):
         x = self.positional_encoding(x)
         for block in self.blocks:
             x = block(x, mask)
+        x = self.final_norm(x)
         x = self.out(x)
         return x
 
