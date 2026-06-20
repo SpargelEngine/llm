@@ -55,6 +55,7 @@ def train(
     device: str = "cpu",
     step_callback: Optional[Callable[[StepInfo], None]] = None,
     micro_batches: int = 1,
+    use_bf16: bool = True,
 ) -> int:
     """Run up to *steps* training steps.
 
@@ -66,6 +67,9 @@ def train(
     if the data iterator is exhausted).
     """
     assert micro_batches >= 1
+
+    torch_device = torch.device(device)
+    device_type = torch_device.type
 
     for step in range(steps):
         optimizer.zero_grad()
@@ -94,21 +98,22 @@ def train(
 
             t1 = time.perf_counter()
 
-            inputs2 = inputs.to(device)
-            masks2 = masks.to(device)
-            targets2 = targets.to(device)
+            inputs2 = inputs.to(torch_device)
+            masks2 = masks.to(torch_device)
+            targets2 = targets.to(torch_device)
 
             t2 = time.perf_counter()
 
             model.train()
 
-            loss = compute_loss_step(
-                model=model,
-                inputs=inputs2,
-                masks=masks2,
-                targets=targets2,
-                pad_index=pad_index,
-            )
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_bf16):
+                loss = compute_loss_step(
+                    model=model,
+                    inputs=inputs2,
+                    masks=masks2,
+                    targets=targets2,
+                    pad_index=pad_index,
+                )
             loss = loss / micro_batches
 
             t3 = time.perf_counter()
