@@ -35,7 +35,7 @@ class PositionalEncoding(nn.Module):
         """
 
         seq_len = x.size(-2)
-        x += self.pe[:seq_len, :]
+        x = x + self.pe[:seq_len, :]
 
         return x
 

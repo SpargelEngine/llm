@@ -6,7 +6,7 @@ from pydantic import BaseModel, PositiveInt
 from torch import Tensor
 
 from spargel_llm.layer.attention import Attention
-from spargel_llm.layer.feed_forward import FeedForward
+from spargel_llm.layer.feed_forward import FeedForward, FeedForwardConfig
 from spargel_llm.layer.positional_encoding import PositionalEncoding
 from spargel_llm.layer.rms_norm import RMSNorm
 
@@ -19,8 +19,8 @@ class Config(BaseModel):
     dim: PositiveInt
     dim_key: PositiveInt
     dim_value: PositiveInt
-    dim_feed_forward: PositiveInt
     use_rope: bool
+    feed_forward: FeedForwardConfig
 
 
 class TransformerBlock(nn.Module):
@@ -43,7 +43,7 @@ class TransformerBlock(nn.Module):
             use_rope=config.use_rope,
         )
 
-        self.feed_forward = FeedForward(config.dim, config.dim_feed_forward)
+        self.feed_forward = FeedForward(config.feed_forward)
 
     @override
     def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
