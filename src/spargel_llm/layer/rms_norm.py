@@ -17,7 +17,11 @@ class RMSNorm(nn.Module):
         self.dim = dim
         self.epsilon = epsilon
 
-        self.weight = nn.Parameter(torch.ones(dim))
+        # NOTE(tianjiao):
+        # 1. Experiment shows that learnable weights don't improve loss.
+        # 2. With learnable weights we lose variance control.
+        self.weight = 1
+        # self.weight = nn.Parameter(torch.ones(dim))
 
     @override
     def forward(self, x: Tensor) -> Tensor:
