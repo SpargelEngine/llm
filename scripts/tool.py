@@ -20,6 +20,7 @@ from torch import Tensor
 from torch.optim import AdamW, Optimizer
 from torch.utils.tensorboard import SummaryWriter
 
+from spargel_llm.layer.feed_forward import FeedForwardConfig
 from spargel_llm.logging import log_info, log_success
 from spargel_llm.model import Config, Model
 from spargel_llm.train import StepInfo, TrainInfo, generate_step, train
@@ -87,12 +88,8 @@ def save_optimizer_state(path: StrOrPath, optimizer: Optimizer):
     torch.save(optimizer.state_dict(), path)
 
 
-def create_optimizer(
-    model: Model, learning_rate: float, weight_decay: float
-) -> AdamW:
-    return AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay
-    )
+def create_optimizer(model: Model, learning_rate: float, weight_decay: float) -> AdamW:
+    return AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
 
 #### other helpers ####
@@ -290,31 +287,56 @@ def writer_add_embedding(
     model: Model,
     tokenizer: Tokenizer,
     *,
+    layer: str = "embedding",
     device: str = "cpu",
 ):
     model.eval()
     with torch.no_grad():
         vocab_size = tokenizer.get_vocab_size()
-        indices = torch.arange(vocab_size, dtype=torch.int, device=device)
-        embed_vectors = model.embedding(indices)
-
         labels = [tokenizer.id_to_token(i) for i in range(vocab_size)]
 
-    writer.add_embedding(embed_vectors.cpu(), labels)
+        def add_token_vectors(tag: str, vectors: Tensor):
+            writer.add_embedding(vectors.detach().float().cpu(), labels, tag=tag)
+
+        if layer in ("embedding", "both"):
+            indices = torch.arange(vocab_size, dtype=torch.long, device=device)
+            embed_vectors = model.embedding(indices)
+            tag = "default" if layer == "embedding" else "embedding"
+            add_token_vectors(tag, embed_vectors)
+
+        if layer in ("head", "both"):
+            add_token_vectors("lm_head", model.out.weight)
 
 
 @torch.compile
-def validation_loss_step(
+def validation_metrics_step(
     model: Model,
     inputs: Tensor,
     masks: Tensor,
     targets: Tensor,
     pad_index: int,
 ):
-    return model.loss(inputs, masks, targets, pad_index=pad_index)
+    logits: Tensor = model(inputs, masks)
+    flattened_logits = logits.flatten(0, -2)
+    flattened_targets = targets.flatten(0, -1).to(torch.long)
+
+    loss = torch.nn.functional.cross_entropy(
+        flattened_logits,
+        flattened_targets,
+        ignore_index=pad_index,
+    )
+
+    valid_targets = flattened_targets != pad_index
+    log_probs = torch.log_softmax(flattened_logits.float(), dim=-1)
+    entropy_by_token = -(log_probs.exp() * log_probs).sum(dim=-1)
+    valid_weights = valid_targets.to(entropy_by_token.dtype)
+    entropy_sum = (entropy_by_token * valid_weights).sum()
+    valid_token_count = valid_targets.sum()
+
+    return loss, entropy_sum, valid_token_count
 
 
-def compute_validation_loss(
+def compute_validation_metrics(
     model: Model,
     dataset: pq.ParquetFile,
     seq_len: int,
@@ -323,10 +345,12 @@ def compute_validation_loss(
     device: str,
     num_batches: int = 10,
     eot_index: int | None = None,
-) -> float:
+) -> tuple[float, float]:
     assert num_batches > 0
 
     total_loss = 0.0
+    total_entropy = 0.0
+    total_entropy_tokens = 0
 
     def make_iterator():
         return iter_batches(
@@ -345,17 +369,42 @@ def compute_validation_loss(
                 iterator = make_iterator()
                 inputs, masks, targets = next(iterator)
 
-            loss = validation_loss_step(
+            loss, entropy_sum, entropy_token_count = validation_metrics_step(
                 model,
                 inputs.to(device),
                 masks.to(device),
                 targets.to(device),
-                pad_index=PAD,
+                pad_index=pad_index,
             )
 
             total_loss += loss.detach().item()
+            total_entropy += entropy_sum.detach().item()
+            total_entropy_tokens += int(entropy_token_count.detach().item())
 
-    return total_loss / num_batches
+    return total_loss / num_batches, total_entropy / max(total_entropy_tokens, 1)
+
+
+def compute_validation_loss(
+    model: Model,
+    dataset: pq.ParquetFile,
+    seq_len: int,
+    batch_size: int,
+    pad_index: int,
+    device: str,
+    num_batches: int = 10,
+    eot_index: int | None = None,
+) -> float:
+    loss, _ = compute_validation_metrics(
+        model=model,
+        dataset=dataset,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        pad_index=pad_index,
+        device=device,
+        num_batches=num_batches,
+        eot_index=eot_index,
+    )
+    return loss
 
 
 def always_true():
@@ -377,21 +426,20 @@ def action_info(path: StrOrPath):
 def action_init(path: StrOrPath, *, yes: bool = False):
     prompt_overwrite(path, yes=yes)
 
-    # default config
-    dim = 256
-    num_layer = 4
-    num_head = 4
-    assert dim % num_head == 0
-
     config = Config(
-        vocab_size=1000,
-        max_seq_len=256,
-        num_layer=num_layer,
-        num_head=num_head,
-        dim=dim,
-        dim_key=dim // num_head,
-        dim_value=dim // num_head,
-        dim_feed_forward=dim * 4,
+        vocab_size=8192,
+        max_seq_len=4096,
+        num_layer=4,
+        num_head=4,
+        dim=256,
+        dim_key=64,
+        dim_value=64,
+        use_rope=True,
+        feed_forward=FeedForwardConfig(
+            dim=256,
+            hidden=1024,
+            activation="relu",
+        ),
     )
 
     model_state_file = "model_state.pth"
@@ -493,11 +541,12 @@ def action_gen(
     for _ in range(count) if count >= 0 else always_true():
         input = tokens[-seq_len:]
 
-        # pad length to a power of two
+        # Keep generation at a fixed shape so torch.compile does not recompile
+        # as the prompt grows. Right padding preserves RoPE positions for real
+        # tokens because the selected logit is still at length - 1.
         length = len(input)
         if length < seq_len:
-            length_expected = 1 << (length - 1).bit_length()
-            input = input + [PAD] * (length_expected - length)
+            input = input + [PAD] * (seq_len - length)
 
         with torch.no_grad():
             logits = generate_step(model, torch.tensor(input, device=device))
@@ -741,9 +790,9 @@ def action_train(
             state["sum_time_forward"] = 0.0
             state["sum_time_backward"] = 0.0
 
-            val_loss = None
+            val_metrics = None
             if val_dataset is not None:
-                val_loss = compute_validation_loss(
+                val_metrics = compute_validation_metrics(
                     model=model,
                     dataset=val_dataset,
                     seq_len=seq_len,
@@ -755,12 +804,14 @@ def action_train(
                 )
 
             time_log_msg = f"avg_time={avg_time:.6f} ({avg_time_load_batch:.6f} + {avg_time_forward:.6f} + {avg_time_backward:.6f})"
-            if val_loss is not None:
+            if val_metrics is not None:
+                val_loss, val_entropy = val_metrics
                 print(
-                    f"  {step}: avg_loss={avg_loss:.6f}, val_loss={val_loss:.6f}, {time_log_msg}"
+                    f"  {step}: avg_loss={avg_loss:.6f}, val_loss={val_loss:.6f}, val_entropy={val_entropy:.6f}, {time_log_msg}"
                 )
                 if writer is not None:
                     writer.add_scalar("loss/val", val_loss, token_count)
+                    writer.add_scalar("entropy/val", val_entropy, token_count)
             else:
                 print(f"  {step}: avg_loss={avg_loss:.6f}, {time_log_msg}")
 
@@ -914,7 +965,13 @@ def action_dump_param(path: StrOrPath):
         print(param)
 
 
-def action_embed(path: StrOrPath, tensorboard_dir: str, *, device: str = "cpu"):
+def action_embed(
+    path: StrOrPath,
+    tensorboard_dir: str,
+    *,
+    layer: str = "embedding",
+    device: str = "cpu",
+):
     project_info = load_project(path)
     model_state_file = resolve_parent(path) / project_info.model_state_file
     tokenizer_file = resolve_parent(path) / project_info.tokenizer
@@ -927,7 +984,7 @@ def action_embed(path: StrOrPath, tensorboard_dir: str, *, device: str = "cpu"):
 
     log_info("Opening TensorBoard writer.")
     writer = SummaryWriter(tensorboard_dir)
-    writer_add_embedding(writer, model, tokenizer, device=device)
+    writer_add_embedding(writer, model, tokenizer, layer=layer, device=device)
     writer.close()
     log_success(f"Embedding projection written to {tensorboard_dir}.")
 
@@ -1092,6 +1149,12 @@ def create_parser() -> ArgumentParser:
     )
     embed_parser.add_argument("path", help="project file")
     embed_parser.add_argument("tensorboard_dir", help="TensorBoard write directory")
+    embed_parser.add_argument(
+        "--layer",
+        choices=("embedding", "head", "both"),
+        default="embedding",
+        help="token vectors to visualize (default: embedding)",
+    )
 
     # graph
     graph_parser = subparsers.add_parser(
@@ -1177,7 +1240,9 @@ def main():
         case "model_init":
             action_model_init(args.path, yes=args.yes)
         case "embed":
-            action_embed(args.path, args.tensorboard_dir, device=device)
+            action_embed(
+                args.path, args.tensorboard_dir, layer=args.layer, device=device
+            )
         case "graph":
             action_graph(args.path, args.tensorboard_dir, args.seq_len, device=device)
         case "dump_param":
