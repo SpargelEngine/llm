@@ -20,6 +20,7 @@ class Config(BaseModel):
     dim_key: PositiveInt
     dim_value: PositiveInt
     dim_feed_forward: PositiveInt
+    use_rope: bool
 
 
 class TransformerBlock(nn.Module):
@@ -39,6 +40,7 @@ class TransformerBlock(nn.Module):
             dim_out=config.dim,
             dim_k=config.dim_key,
             dim_v=config.dim_value,
+            use_rope=config.use_rope,
         )
 
         self.feed_forward = FeedForward(config.dim, config.dim_feed_forward)
@@ -60,7 +62,10 @@ class Model(nn.Module):
         self.config = config
 
         self.embedding = nn.Embedding(config.vocab_size, config.dim)
-        self.positional_encoding = PositionalEncoding(config.max_seq_len, config.dim)
+        if not self.config.use_rope:
+            self.positional_encoding = PositionalEncoding(
+                config.max_seq_len, config.dim
+            )
         self.blocks = nn.ModuleList(
             TransformerBlock(config) for _ in range(config.num_layer)
         )
@@ -70,7 +75,8 @@ class Model(nn.Module):
     @override
     def forward(self, tokens: Tensor, mask: Tensor | None = None) -> Tensor:
         x = self.embedding(tokens)
-        x = self.positional_encoding(x)
+        if not self.config.use_rope:
+            x = self.positional_encoding(x)
         for block in self.blocks:
             x = block(x, mask)
         x = self.final_norm(x)
