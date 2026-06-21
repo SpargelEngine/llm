@@ -1,4 +1,6 @@
+import json
 import os
+import random
 import shutil
 import sys
 import time
@@ -264,12 +266,12 @@ def writer_add_graph(
     writer: SummaryWriter,
     model: Model,
     *,
+    seq_len: int,
     device: str = "cpu",
     pad_index: int = PAD,
 ):
     """Write the model graph to TensorBoard using dummy input."""
     model.eval()
-    seq_len = model.config.max_seq_len
     dummy_input = torch.full((1, seq_len), pad_index, dtype=torch.long, device=device)
     dummy_mask = torch.ones((1, seq_len), dtype=torch.bool, device=device)
     writer.add_graph(model, (dummy_input, dummy_mask))
@@ -417,6 +419,8 @@ def action_gen(
     all: bool = False,
     stop_token: int = EOT,
     add_eot: bool = False,
+    dump_file: Optional[str] = None,
+    random_seed: Optional[int] = None,
 ):
     assert seq_len > 0
     assert temperature > 0
@@ -436,6 +440,24 @@ def action_gen(
 
     prompt_tokens = tokenizer.encode(prompt).ids
 
+    if random_seed is None:
+        random_seed = random.randrange(2**63)
+    torch.manual_seed(random_seed)
+
+    dump_f = None
+    if dump_file is not None:
+        dump_f = open(dump_file, "w")
+        json.dump(
+            {
+                "type": "info",
+                "temperature": temperature,
+                "prompt": prompt_tokens,
+                "random_seed": random_seed,
+            },
+            dump_f,
+        )
+        dump_f.write("\n")
+
     tokens = list(prompt_tokens)
 
     print("Prompt:", repr(tokenizer.decode(tokens)))
@@ -444,6 +466,7 @@ def action_gen(
     print("Temperature:", temperature)
     print("Max generation count:", count)
     print("Stop token id:", stop_token)
+    print("Random seed:", random_seed)
 
     print("Generated text:")
     log_info("********")
@@ -477,6 +500,17 @@ def action_gen(
 
         tokens.append(next)
 
+        if dump_f is not None:
+            json.dump(
+                {
+                    "type": "gen",
+                    "id": next,
+                    "logits": logits.cpu().tolist(),
+                },
+                dump_f,
+            )
+            dump_f.write("\n")
+
         if stream and decode_stream:
             chunk = decode_stream.step(tokenizer, next)
             if chunk is not None:
@@ -497,6 +531,9 @@ def action_gen(
 
     log_info("********")
     print("Generated token count:", len(tokens) - start_pos)
+
+    if dump_f is not None:
+        dump_f.close()
 
 
 def action_train(
@@ -628,16 +665,14 @@ def action_train(
         log_info("Loading optimzier state.")
         load_optimizer_state(optimizer_state_file, optimizer)
 
+    log_info(f"Use BF16: {use_bf16}")
+
     # TensorBoard
 
     writer = None
     if tensorboard_dir is not None:
         log_info("Opening TensorBoard writer.")
         writer = SummaryWriter(tensorboard_dir)
-
-        if project_info.train_info.token_count == 0:
-            log_info("Writing model graph to TensorBoard.")
-            writer_add_graph(writer, model, device=device)
 
     # helper functions
 
@@ -835,7 +870,9 @@ def action_model_init(path: StrOrPath, *, yes: bool = False):
     save_project(path, project_info)
 
 
-def action_graph(path: StrOrPath, tensorboard_dir: str, *, device: str = "cpu"):
+def action_graph(
+    path: StrOrPath, tensorboard_dir: str, seq_len: int, *, device: str = "cpu"
+):
     project_info = load_project(path)
     model_state_file = resolve_parent(path) / project_info.model_state_file
 
@@ -845,7 +882,7 @@ def action_graph(path: StrOrPath, tensorboard_dir: str, *, device: str = "cpu"):
 
     log_info("Opening TensorBoard writer.")
     writer = SummaryWriter(tensorboard_dir)
-    writer_add_graph(writer, model, device=device)
+    writer_add_graph(writer, model, seq_len=seq_len, device=device)
     writer.close()
     log_success(f"Model graph written to {tensorboard_dir}.")
 
@@ -951,6 +988,20 @@ def create_parser() -> ArgumentParser:
         help="stop token id (-1: never stop)",
     )
     gen_parser.add_argument("--eot", action="store_true", help="add EOT")
+    gen_parser.add_argument(
+        "-df",
+        "--dump-file",
+        type=str,
+        default=None,
+        help="dump generation details (prompt, temperature, token logits) to the specified file",
+    )
+    gen_parser.add_argument(
+        "-rs",
+        "--random-seed",
+        type=int,
+        default=None,
+        help="random seed for reproducibility (randomly generated if not specified)",
+    )
 
     # train
     train_parser = subparsers.add_parser("train", help="train model")
@@ -1035,6 +1086,11 @@ def create_parser() -> ArgumentParser:
     )
     graph_parser.add_argument("path", help="project file")
     graph_parser.add_argument("tensorboard_dir", help="TensorBoard write directory")
+    graph_parser.add_argument(
+        "seq_len",
+        type=int,
+        help="sequence length for dummy input (use training seq_len)",
+    )
 
     # param
     dump_param_parser = subparsers.add_parser("dump_param", help="dump parameters")
@@ -1082,6 +1138,8 @@ def main():
                 all=args.all,
                 stop_token=args.stop_token,
                 add_eot=args.eot,
+                dump_file=args.dump_file,
+                random_seed=args.random_seed,
             )
         case "train":
             action_train(
@@ -1108,7 +1166,7 @@ def main():
         case "embed":
             action_embed(args.path, args.tensorboard_dir, device=device)
         case "graph":
-            action_graph(args.path, args.tensorboard_dir, device=device)
+            action_graph(args.path, args.tensorboard_dir, args.seq_len, device=device)
         case "dump_param":
             action_dump_param(args.path)
         case _:
