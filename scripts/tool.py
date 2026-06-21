@@ -151,7 +151,7 @@ def iter_batches(
     the beginning.
 
     If *tracker* is a dict, it is updated before each sample with keys
-    ``sample_idx`` (current dataset row) and ``offset`` (window position
+    ``index`` (current dataset row) and ``offset`` (window position
     within that row).
 
     If *eot_index* is not ``None``, each row is treated as if it ends with
@@ -231,7 +231,7 @@ def iter_batches(
                 batch_targets[sample_in_batch, L:] = pad_index
 
                 if tracker is not None:
-                    tracker["sample_idx"] = row_index
+                    tracker["index"] = row_index
                     tracker["offset"] = pos
 
                 sample_in_batch += 1
@@ -517,6 +517,7 @@ def action_train(
     add_eot: bool = False,
     gradient_accumulation_steps: Optional[int] = None,
     loop_dataset: bool = False,
+    use_bf16: bool = True,
 ):
     assert log_period > 0
 
@@ -592,7 +593,7 @@ def action_train(
 
     eot_index = EOT if add_eot else None
 
-    train_tracker: dict = {"sample_idx": start_index, "offset": start_offset}
+    train_tracker: dict = {"index": start_index, "offset": start_offset}
 
     def make_iterator():
         return iter_batches(
@@ -646,7 +647,7 @@ def action_train(
             writer.add_text("train/log", msg, project_info.train_info.token_count)
 
     def save():
-        project_info.train_info.index = train_tracker["sample_idx"]
+        project_info.train_info.index = train_tracker["index"]
         project_info.train_info.offset = train_tracker["offset"]
         log_info(f"Saving. (train_info: {project_info.train_info})")
         save_project(path, project_info)
@@ -763,13 +764,14 @@ def action_train(
                 device=device,
                 step_callback=step_callback,
                 micro_batches=micro_batches,
+                use_bf16=use_bf16,
             )
             steps_remaining -= actual_steps
             if steps_remaining > 0:
                 log_info("Dataset exhausted - restarting from beginning.")
                 start_index = 0
                 start_offset = 0
-                train_tracker["sample_idx"] = 0
+                train_tracker["index"] = 0
                 train_tracker["offset"] = 0
     else:
         batch_iterator = make_iterator()
@@ -783,6 +785,7 @@ def action_train(
             device=device,
             step_callback=step_callback,
             micro_batches=micro_batches,
+            use_bf16=use_bf16,
         )
 
         if actual_steps < steps:
@@ -790,7 +793,7 @@ def action_train(
             project_info.train_info.index = 0
             project_info.train_info.offset = 0
             project_info.train_info.dataset_id = ""
-            train_tracker["sample_idx"] = 0
+            train_tracker["index"] = 0
             train_tracker["offset"] = 0
 
     save()
@@ -799,7 +802,7 @@ def action_train(
 
     log_important(f"Training completed. (time: {t_end - t_start:.6f})")
     log_info(
-        f"Reached sample {train_tracker['sample_idx']}, offset {train_tracker['offset']} in the dataset."
+        f"Reached sample {train_tracker['index']}, offset {train_tracker['offset']} in the dataset."
     )
 
     if writer is not None:
@@ -1005,6 +1008,12 @@ def create_parser() -> ArgumentParser:
         action="store_true",
         help="restart from the beginning when the dataset is exhausted instead of stopping early",
     )
+    train_parser.add_argument(
+        "-n16",
+        "--no-bf16",
+        action="store_true",
+        help="disable bfloat16 autocast (useful for CPU or consumer GPUs that don't support bf16)",
+    )
 
     # model_init
     model_init_parser = subparsers.add_parser(
@@ -1092,6 +1101,7 @@ def main():
                 add_eot=args.eot,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 loop_dataset=args.loop_dataset,
+                use_bf16=not args.no_bf16,
             )
         case "model_init":
             action_model_init(args.path, yes=args.yes)

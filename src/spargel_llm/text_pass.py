@@ -33,20 +33,24 @@ class TextPassInstance:
         raise NotImplementedError
 
 
-class TextPassModel(BaseModel):
-    """Pure configuration for a text pass."""
-
-    description: str | None = None
+class TextPass:
+    """Text pass factory."""
 
     def build(self, config_path: StrOrPath) -> TextPassInstance:
         raise NotImplementedError
 
 
-# Helper
+class TextPassModel(TextPass, BaseModel):
+    """Text pass for Pydantic validation."""
+
+    description: str | None = None
+
+
+# Passes
 
 
 @dataclass
-class _Chain(TextPassInstance):
+class ChainPassInstance(TextPassInstance):
     """Chain multiple instances sequentially."""
 
     instances: Sequence[TextPassInstance]
@@ -59,7 +63,75 @@ class _Chain(TextPassInstance):
         yield from current
 
 
-# Passes
+@dataclass
+class CombinePassInstance(TextPassInstance):
+    instances: Sequence[TextPassInstance]
+
+    @override
+    def process(self, texts):
+        if not self.instances:
+            return
+        copies = itertools.tee(texts, len(self.instances))
+        iterators = [inst.process(c) for inst, c in zip(self.instances, copies)]
+        # Round-robin interleave — order among passes is not significant.
+        while iterators:
+            remaining = []
+            for it in iterators:
+                try:
+                    yield next(it)
+                    remaining.append(it)
+                except StopIteration:
+                    pass
+            iterators = remaining
+
+
+@dataclass
+class CombinePass(TextPass):
+    """Apply passes independently and concatenate results."""
+
+    passes: Sequence[TextPass]
+
+    @override
+    def build(self, config_path):
+        instances = [p.build(config_path) for p in self.passes]
+        return CombinePassInstance(instances)
+
+
+class CombinePassModel(TextPassModel):
+    """Apply passes independently and concatenate results (Model)."""
+
+    name: Literal["combine"]
+    passes: Sequence[DiscriminatedTextPass]
+
+    @override
+    def build(self, config_path):
+        instances = [p.build(config_path) for p in self.passes]
+        return CombinePassInstance(instances)
+
+
+class FilterPass(TextPassModel):
+    """Filter texts by regex pattern."""
+
+    name: Literal["filter"]
+    pattern: str
+    invert: bool = False
+
+    @override
+    def build(self, config_path):
+        pat = regex.compile(self.pattern)
+        return self._Instance(pat, self.invert)
+
+    @dataclass
+    class _Instance(TextPassInstance):
+        pattern: Pattern
+        invert: bool
+
+        @override
+        def process(self, texts):
+            for text in texts:
+                matched = bool(self.pattern.search(text))
+                if matched != self.invert:
+                    yield text
 
 
 class FindPass(TextPassModel):
@@ -104,28 +176,41 @@ class FindPass(TextPassModel):
                     yield Path(cur_dir) / file
 
 
-class ForEachPass(TextPassModel):
+@dataclass
+class ForEachPassInstance(TextPassInstance):
+    instances: Sequence[TextPassInstance]
+
+    @override
+    def process(self, texts):
+        for text in texts:
+            current = (text,)
+            for inst in self.instances:
+                current = inst.process(current)
+            yield from current
+
+
+@dataclass
+class ForEachPass(TextPass):
     """Apply passes to each text."""
 
-    name: Literal["for_each"]
-    passes: Sequence["DiscriminatedTextPass"]
+    passes: Sequence[TextPass]
 
     @override
     def build(self, config_path):
         instances = [p.build(config_path) for p in self.passes]
-        return self._Instance(instances)
+        return ForEachPassInstance(instances)
 
-    @dataclass
-    class _Instance(TextPassInstance):
-        instances: Sequence[TextPassInstance]
 
-        @override
-        def process(self, texts):
-            for text in texts:
-                current = (text,)
-                for inst in self.instances:
-                    current = inst.process(current)
-                yield from current
+class ForEachPassModel(TextPassModel):
+    """Apply passes to each text (Model)."""
+
+    name: Literal["for_each"]
+    passes: Sequence[DiscriminatedTextPass]
+
+    @override
+    def build(self, config_path):
+        instances = [p.build(config_path) for p in self.passes]
+        return ForEachPassInstance(instances)
 
 
 class JoinPass(TextPassModel):
@@ -219,7 +304,7 @@ class ReferencePass(TextPassModel):
             ref_passes = TextPassList.model_validate(obj).passes
             for p in ref_passes:
                 instances.append(p.build(ref_path))
-        return _Chain(instances)
+        return ChainPassInstance(instances)
 
 
 class ReplacePass(TextPassModel):
@@ -296,7 +381,7 @@ class SplitPass(TextPassModel):
     name: Literal["split"]
     separator: str
     regex: bool = False
-    maxsplit: int = 0
+    max_split: int = 0
     behavior: Literal[
         "removed", "isolated", "merged_with_previous", "merged_with_next"
     ] = "removed"
@@ -317,7 +402,7 @@ class SplitPass(TextPassModel):
             cap_pat = None
 
         return self._Instance(
-            self.regex, pat, cap_pat, self.separator, self.maxsplit, self.behavior
+            self.regex, pat, cap_pat, self.separator, self.max_split, self.behavior
         )
 
     @dataclass
@@ -326,7 +411,7 @@ class SplitPass(TextPassModel):
         pattern: Pattern | None
         cap_pattern: Pattern | None
         separator: str
-        maxsplit: int
+        max_split: int
         behavior: str
 
         @override
@@ -335,13 +420,13 @@ class SplitPass(TextPassModel):
                 if self.behavior == "removed":
                     if self.regex and self.pattern:
                         yield from regex.split(
-                            self.pattern, text, maxsplit=self.maxsplit
+                            self.pattern, text, maxsplit=self.max_split
                         )
                     else:
-                        ms = self.maxsplit if self.maxsplit > 0 else -1
+                        ms = self.max_split if self.max_split > 0 else -1
                         yield from text.split(self.separator, ms)
                 elif self.cap_pattern:
-                    parts = regex.split(self.cap_pattern, text, maxsplit=self.maxsplit)
+                    parts = regex.split(self.cap_pattern, text, maxsplit=self.max_split)
                     if self.behavior == "isolated":
                         yield from parts
                     elif self.behavior == "merged_with_previous":
@@ -382,37 +467,13 @@ class StripPass(TextPassModel):
                     yield text.strip(self.chars)
 
 
-class FilterPass(TextPassModel):
-    """Filter texts by regex pattern."""
-
-    name: Literal["filter"]
-    pattern: str
-    invert: bool = False
-
-    @override
-    def build(self, config_path):
-        pat = regex.compile(self.pattern)
-        return self._Instance(pat, self.invert)
-
-    @dataclass
-    class _Instance(TextPassInstance):
-        pattern: Pattern
-        invert: bool
-
-        @override
-        def process(self, texts):
-            for text in texts:
-                matched = bool(self.pattern.search(text))
-                if matched != self.invert:
-                    yield text
-
-
 # Types
 
-type TextPass = (
-    FilterPass
+type TextPassModelUnion = (
+    CombinePassModel
+    | FilterPass
     | FindPass
-    | ForEachPass
+    | ForEachPassModel
     | JoinPass
     | PlainTextPass
     | ReadFilePass
@@ -422,7 +483,7 @@ type TextPass = (
     | SplitPass
     | StripPass
 )
-type DiscriminatedTextPass = Annotated[TextPass, Discriminator("name")]
+type DiscriminatedTextPass = Annotated[TextPassModelUnion, Discriminator("name")]
 
 
 class TextPassList(BaseModel):
@@ -436,7 +497,7 @@ def process_texts(
     texts: Iterable[str], passes: Sequence[TextPass], path: StrOrPath = "."
 ) -> Iterator[str]:
     instances = [p.build(path) for p in passes]
-    yield from _Chain(instances).process(texts)
+    yield from ChainPassInstance(instances).process(texts)
 
 
 def load_texts(path: StrOrPath) -> Iterator[str]:

@@ -11,6 +11,8 @@ Every pass has two layers:
 - **Model** (Pydantic model): pure configuration — parameters, serializable to JSON
 - **Instance** (runtime): created by `model.build(config_path)`, holding compiled regexes, resolved paths, etc.
 
+Passes are available in two forms: **code-constructed** (import classes directly) and **JSON-configured** (via discriminated union with `name` field). Code-constructed passes use base `TextPass` subclasses (`ForEachPass`, `CombinePass`), while JSON-configured passes use `TextPassModel` subclasses (`ForEachPassModel`, `CombinePassModel`) which add Pydantic validation and a `name` discriminator.
+
 ### Processing flow
 
 ```text
@@ -33,6 +35,7 @@ Each pass is a generator: `Iterable[str]` → `Iterator[str]`. Some passes chang
 | `find`        | N → N+M        | Appends M found file paths       |
 | `read_file`   | 1 → 1 or 0     | Skips on decode error (0 output) |
 | `for_each`    | 1 → N          | Sub-pipeline cardinality varies  |
+| `combine`     | N → M          | M = sum of each pass's outputs   |
 | `ref`         | depends        | Depends on referenced passes     |
 
 ### Path resolution
@@ -57,7 +60,7 @@ Every pass accepts an optional `description` field for documentation:
 ## Quick Start
 
 ```python
-from lm.text_pass import TextPassList, process_texts
+from spargel_llm.text_pass import TextPassList, process_texts
 
 passes = TextPassList.model_validate({
     "passes": [
@@ -73,7 +76,7 @@ result = list(process_texts(["  keep me  ", "  drop  "], passes))
 Load and run from a JSON file directly:
 
 ```python
-from lm.text_pass import load_texts
+from spargel_llm.text_pass import load_texts
 
 for text in load_texts("pipeline.json"):
     print(text)
@@ -136,13 +139,13 @@ Split each text by a literal separator or regex pattern. One text in, zero or mo
 | --------- | -------- | ----------- | -------------------------------------------------------------------------------------------------------- |
 | separator | `str`    | required    | Separator string or regex pattern to split on                                                            |
 | regex     | `bool`   | `false`     | Treat `separator` as a regex pattern                                                                     |
-| maxsplit  | `int`    | `0`         | Maximum number of splits; `0` means unlimited                                                            |
+| max_split | `int`    | `0`         | Maximum number of splits; `0` means unlimited                                                            |
 | behavior  | `string` | `"removed"` | What to do with the separator: `"removed"`, `"isolated"`, `"merged_with_previous"`, `"merged_with_next"` |
 
 ```json
 { "name": "split", "separator": "," }
 { "name": "split", "regex": true, "separator": "\\s+" }
-{ "name": "split", "separator": "\\t", "maxsplit": 1 }
+{ "name": "split", "separator": "\\t", "max_split": 1 }
 { "name": "split", "regex": true, "separator": "\\n = (?!=).*? = \\n", "behavior": "merged_with_next" }
 ```
 
@@ -207,6 +210,38 @@ Keep or discard texts matching a regex pattern. Each input yields zero or one ou
 ```json
 { "name": "filter", "pattern": "error|warn" }
 { "name": "filter", "pattern": "^#", "invert": true }
+```
+
+### `combine` — Independent parallel passes
+
+Apply multiple passes **independently** to the same input stream and concatenate their outputs. Unlike chaining (where each pass feeds into the next), each pass in `combine` sees the full upstream stream. Results are interleaved round-robin.
+
+| Param  | Type                          | Description          |
+| ------ | ----------------------------- | -------------------- |
+| passes | `list[DiscriminatedTextPass]` | Passes to run independently |
+
+```json
+{
+  "name": "combine",
+  "passes": [
+    { "name": "strip" },
+    { "name": "split_lines" }
+  ]
+}
+```
+
+Input `["  a\nb  ", "  c  "]` → output (round-robin): `"a\nb"`, `"  a"`, `"c"`, `"b  "`, `"  c  "`.
+
+The strip pass yields `["a\nb", "c"]` while split_lines yields `["  a", "b  ", "  c  "]`. Order among the passes is not significant — use downstream passes to reorder if needed.
+
+**Empty passes**: `"combine"` with an empty `passes` list yields nothing (it returns immediately without consuming the input).
+
+In code, use `CombinePass` directly:
+
+```python
+from spargel_llm.text_pass import CombinePass, StripPass, SplitLinesPass
+
+passes = [CombinePass(passes=[StripPass(name="strip"), SplitLinesPass(name="split_lines")])]
 ```
 
 ### `find` — Find files
@@ -405,18 +440,23 @@ Main config `pipeline.json`:
 
 ### Type system
 
-All pass types form a discriminated union via `DiscriminatedTextPass`, using Pydantic's `Discriminator("name")` to dispatch to the correct Model by the `name` field.
+All JSON-configurable pass types form a discriminated union via `DiscriminatedTextPass`, using Pydantic's `Discriminator("name")` to dispatch to the correct Model by the `name` field. The type alias is `TextPassModelUnion`.
+
+Each pass that supports JSON configuration uses a **Model** suffix: `ForEachPassModel`, `CombinePassModel`. The base versions (`ForEachPass`, `CombinePass`) are plain code classes accepting `list[TextPass]` — they work without Pydantic validation and are used when constructing pipelines directly in Python.
 
 ### Internal components
 
-| Component          | Role                                                                                                         |
-| ------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `TextPassModel`    | Base for all pass configs; defines `build(config_path) → TextPassInstance`                                   |
-| `TextPassInstance` | Base for all pass runtimes; defines `process(texts) → Iterator[str]`                                         |
-| `_Chain`           | Chains multiple instances, executing them in sequence                                                        |
-| `TextPassList`     | Top-level model wrapping `passes: list[DiscriminatedTextPass]`                                               |
-| `process_texts()`  | Public API: build instances from passes, chain, and run. Signature: `process_texts(texts, passes, path=".")` |
-| `load_texts()`     | Convenience: load config from a JSON file and run with empty initial stream                                  |
+| Component              | Role                                                                                                         |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `TextPass`             | Base factory interface; defines `build(config_path) → TextPassInstance` (code-constructed passes)           |
+| `TextPassModel`        | Base for JSON-configurable passes; extends `TextPass` + `BaseModel`; defines `description` field              |
+| `TextPassInstance`     | Base for all pass runtimes; defines `process(texts) → Iterator[str]`                                         |
+| `ChainPassInstance`    | Chains multiple instances, executing them in sequence                                                        |
+| `ForEachPassInstance`  | Applies a sub-pipeline to each input text in isolation                                                       |
+| `CombinePassInstance`  | Runs multiple instances independently on the same input, round-robin interleave                              |
+| `TextPassList`         | Top-level model wrapping `passes: list[DiscriminatedTextPass]`                                               |
+| `process_texts()`      | Public API: build instances from passes, chain, and run. Signature: `process_texts(texts, passes, path=".")` |
+| `load_texts()`         | Convenience: load config from a JSON file and run with empty initial stream                                  |
 
 ### Generate JSON Schema
 
