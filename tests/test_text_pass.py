@@ -19,7 +19,6 @@ from spargel_llm.text_pass import (
     ReadFilePass,
     ReferencePass,
     ReplacePass,
-    SplitLinesPass,
     SplitPass,
     StripPass,
     TextPassList,
@@ -71,12 +70,12 @@ class TestCombinePass:
         inst = self._build(
             [
                 StripPass(name="strip"),
-                SplitLinesPass(name="split_lines"),
+                SplitPass(name="split", separator="\n"),
             ]
         )
         result = list(inst.process(["  a\nb  ", "  c  "]))
         # strip: "a\nb", "c"
-        # split_lines: "  a", "b  ", "  c  "
+        # split: "  a", "b  ", "  c  "
         assert "a\nb" in result
         assert "c" in result
         assert "  a" in result
@@ -138,7 +137,7 @@ class TestCombinePassModel:
         inst = self._build(
             [
                 {"name": "strip"},
-                {"name": "split_lines"},
+                {"name": "split", "separator": "\n"},
             ]
         )
         result = list(inst.process(["  a\nb  ", "  c  "]))
@@ -363,14 +362,14 @@ class TestForEachPass:
         result = list(inst.process(["  a  ", "  b  ", "  c  "]))
         assert result == ["a", "b", "c"]
 
-    def test_applies_split_lines_to_each_text(self):
-        inst = self._build([SplitLinesPass(name="split_lines")])
+    def test_applies_split_to_each_text(self):
+        inst = self._build([SplitPass(name="split", separator="\n")])
         result = list(inst.process(["a\nb", "c\nd"]))
         assert result == ["a", "b", "c", "d"]
 
     def test_chains_multiple_passes_per_text(self):
         inst = self._build(
-            [StripPass(name="strip"), SplitLinesPass(name="split_lines")]
+            [StripPass(name="strip"), SplitPass(name="split", separator="\n")]
         )
         result = list(inst.process([" a\nb ", " c "]))
         assert result == ["a", "b", "c"]
@@ -387,7 +386,7 @@ class TestForEachPass:
     def test_split_strip_join_preserves_text_count(self):
         inst = self._build(
             [
-                SplitLinesPass(name="split_lines"),
+                SplitPass(name="split", separator="\n"),
                 StripPass(name="strip"),
                 JoinPass(name="join", separator="\n"),
             ]
@@ -398,7 +397,7 @@ class TestForEachPass:
     def test_split_strip_join_single_text(self):
         inst = self._build(
             [
-                SplitLinesPass(name="split_lines"),
+                SplitPass(name="split", separator="\n"),
                 StripPass(name="strip"),
                 JoinPass(name="join", separator="\n"),
             ]
@@ -409,7 +408,7 @@ class TestForEachPass:
     def test_split_strip_join_empty_lines_become_empty_string(self):
         inst = self._build(
             [
-                SplitLinesPass(name="split_lines"),
+                SplitPass(name="split", separator="\n"),
                 StripPass(name="strip"),
                 JoinPass(name="join", separator="\n"),
             ]
@@ -436,7 +435,7 @@ class TestForEachPass:
             [
                 ForEachPass(
                     passes=[
-                        SplitLinesPass(name="split_lines"),
+                        SplitPass(name="split", separator="\n"),
                         StripPass(name="strip"),
                         JoinPass(name="join", separator="\n"),
                     ]
@@ -452,7 +451,7 @@ class TestForEachPass:
             [
                 ForEachPass(
                     passes=[
-                        SplitLinesPass(name="split_lines"),
+                        SplitPass(name="split", separator="\n"),
                         FilterPass(name="filter", pattern=r"keep"),
                     ]
                 ),
@@ -470,7 +469,7 @@ class TestForEachPass:
         passes = [
             ForEachPass(
                 passes=[
-                    SplitLinesPass(name="split_lines"),
+                    SplitPass(name="split", separator="\n"),
                     StripPass(name="strip"),
                     JoinPass(name="join", separator="\n"),
                 ]
@@ -482,7 +481,7 @@ class TestForEachPass:
     def test_via_process_texts_mixed_flat_and_for_each(self):
         passes = [
             StripPass(name="strip"),
-            ForEachPass(passes=[SplitLinesPass(name="split_lines")]),
+            ForEachPass(passes=[SplitPass(name="split", separator="\n")]),
             StripPass(name="strip"),
         ]
         result = list(process_texts(["  a\nb  "], passes))
@@ -509,7 +508,7 @@ class TestForEachPassModel:
         assert result == ["a", "b", "c"]
 
     def test_chains_multiple_passes(self):
-        inst = self._build([{"name": "strip"}, {"name": "split_lines"}])
+        inst = self._build([{"name": "strip"}, {"name": "split", "separator": "\n"}])
         result = list(inst.process([" a\nb ", " c "]))
         assert result == ["a", "b", "c"]
 
@@ -525,7 +524,7 @@ class TestForEachPassModel:
     def test_split_strip_join_per_text(self):
         inst = self._build(
             [
-                {"name": "split_lines"},
+                {"name": "split", "separator": "\n"},
                 {"name": "strip"},
                 {"name": "join", "separator": "\n"},
             ]
@@ -536,7 +535,7 @@ class TestForEachPassModel:
     def test_split_strip_join_single_text(self):
         inst = self._build(
             [
-                {"name": "split_lines"},
+                {"name": "split", "separator": "\n"},
                 {"name": "strip"},
                 {"name": "join", "separator": "\n"},
             ]
@@ -547,7 +546,7 @@ class TestForEachPassModel:
     def test_split_strip_join_empty_lines_become_empty_string(self):
         inst = self._build(
             [
-                {"name": "split_lines"},
+                {"name": "split", "separator": "\n"},
                 {"name": "strip"},
                 {"name": "join", "separator": "\n"},
             ]
@@ -743,11 +742,33 @@ class TestReadFilePass:
                 "base": "./data",
                 "encoding": "utf-16",
                 "compression": "gzip",
+                "lines": True,
             }
         )
         assert p.base == "./data"
         assert p.encoding == "utf-16"
         assert p.compression == "gzip"
+        assert p.lines is True
+
+    def test_lines_reads_line_by_line(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        (d / "file.txt").write_text("a\nb\nc\n", encoding="utf-8")
+
+        inst = self._build(base=str(d), lines=True)
+        result = list(inst.process(["file.txt"]))
+        assert result == ["a\n", "b\n", "c\n"]
+
+    def test_lines_with_gzip(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        path = d / "file.txt.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            f.write("x\ny\n")
+
+        inst = self._build(base=str(d), compression="gzip", lines=True)
+        result = list(inst.process(["file.txt.gz"]))
+        assert result == ["x\n", "y\n"]
 
 
 class TestReferencePass:
@@ -774,7 +795,7 @@ class TestReferencePass:
                 {
                     "passes": [
                         {"name": "strip"},
-                        {"name": "split_lines"},
+                        {"name": "split", "separator": "\n"},
                     ]
                 }
             )
@@ -931,41 +952,6 @@ class TestReplacePass:
         assert p.new == "NUM"
         assert p.repeat is True
         assert p.max_repeat == 5
-
-
-class TestSplitLinesPass:
-    @staticmethod
-    def _build(**kwargs):
-        return SplitLinesPass(name="split_lines", **kwargs).build(".")
-
-    def test_splits_single_text(self):
-        inst = self._build()
-        result = list(inst.process(["a\nb\nc"]))
-        assert result == ["a", "b", "c"]
-
-    def test_splits_multiple_texts(self):
-        inst = self._build()
-        result = list(inst.process(["a\nb", "c\nd"]))
-        assert result == ["a", "b", "c", "d"]
-
-    def test_keep_ends(self):
-        inst = self._build(keep_ends=True)
-        result = list(inst.process(["a\nb\nc"]))
-        assert result == ["a\n", "b\n", "c"]
-
-    def test_empty_text(self):
-        inst = self._build()
-        result = list(inst.process([""]))
-        assert result == []
-
-    def test_empty_input(self):
-        inst = self._build()
-        assert list(inst.process([])) == []
-
-    def test_model_validate(self):
-        p = SplitLinesPass.model_validate({"name": "split_lines", "keep_ends": True})
-        assert p.name == "split_lines"
-        assert p.keep_ends is True
 
 
 class TestSplitPass:
@@ -1280,7 +1266,7 @@ class TestStripPass:
 class TestChainPassInstance:
     def test_chains_two_instances(self):
         a = StripPass(name="strip").build(".")
-        b = SplitLinesPass(name="split_lines").build(".")
+        b = SplitPass(name="split", separator="\n").build(".")
         chain = ChainPassInstance([a, b])
         result = list(chain.process([" a\nb ", " c "]))
         assert result == ["a", "b", "c"]
@@ -1299,7 +1285,7 @@ class TestChainPassInstance:
     def test_three_pass_chain(self):
         a = PlainTextPass(name="text", texts=["extra"]).build(".")
         b = StripPass(name="strip").build(".")
-        c = SplitLinesPass(name="split_lines").build(".")
+        c = SplitPass(name="split", separator="\n").build(".")
         chain = ChainPassInstance([a, b, c])
         result = list(chain.process(["  hello\n  "]))
         assert result == ["hello", "extra"]
@@ -1314,7 +1300,7 @@ class TestChainPassInstance:
     def test_chain_mixed_sources(self):
         a = StripPass(name="strip").build(".")
         b = (
-            TextPassList.model_validate({"passes": [{"name": "split_lines"}]})
+            TextPassList.model_validate({"passes": [{"name": "split", "separator": "\n"}]})
             .passes[0]
             .build(".")
         )
@@ -1323,7 +1309,7 @@ class TestChainPassInstance:
         assert result == ["a", "b", "c"]
 
     def test_chain_for_each_followed_by_filter(self):
-        fe = ForEachPass(passes=[SplitLinesPass(name="split_lines")]).build(".")
+        fe = ForEachPass(passes=[SplitPass(name="split", separator="\n")]).build(".")
         f = FilterPass(name="filter", pattern=r"keep").build(".")
         chain = ChainPassInstance([fe, f])
         result = list(chain.process(["keep\nskip", "also keep"]))
@@ -1372,7 +1358,7 @@ class TestTextPassList:
                     {"name": "read_file", "base": "."},
                     {"name": "ref", "paths": ["x.json"]},
                     {"name": "replace", "old": "", "new": ""},
-                    {"name": "split_lines"},
+                    {"name": "split", "separator": "\n"},
                     {"name": "split", "separator": ""},
                     {"name": "strip"},
                 ]
@@ -1400,7 +1386,7 @@ class TestProcessTexts:
         passes = [
             ForEachPass(
                 passes=[
-                    SplitLinesPass(name="split_lines"),
+                    SplitPass(name="split", separator="\n"),
                     StripPass(name="strip"),
                 ]
             )
@@ -1412,7 +1398,7 @@ class TestProcessTexts:
         model_passes = TextPassList.model_validate(
             {"passes": [{"name": "strip"}]}
         ).passes
-        code_for_each = ForEachPass(passes=[SplitLinesPass(name="split_lines")])
+        code_for_each = ForEachPass(passes=[SplitPass(name="split", separator="\n")])
         combined = [code_for_each, *model_passes]
         result = list(process_texts([" a\nb "], combined))
         assert result == ["a", "b"]
@@ -1557,7 +1543,7 @@ class TestIntegration:
             ReadFilePass(name="read_file", base=str(d)),
             ForEachPass(
                 passes=[
-                    SplitLinesPass(name="split_lines"),
+                    SplitPass(name="split", separator="\n"),
                     StripPass(name="strip"),
                     JoinPass(name="join", separator="\n"),
                 ]
@@ -1602,7 +1588,7 @@ class TestIntegration:
         passes = [
             ForEachPass(
                 passes=[
-                    SplitLinesPass(name="split_lines"),
+                    SplitPass(name="split", separator="\n"),
                     StripPass(name="strip"),
                     JoinPass(name="join", separator="\n"),
                 ]

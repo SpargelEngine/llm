@@ -19,7 +19,7 @@ Passes are available in two forms: **code-constructed** (import classes directly
 input text stream → [Pass 1] → [Pass 2] → ... → [Pass N] → output text stream
 ```
 
-Each pass is a generator: `Iterable[str]` → `Iterator[str]`. Some passes change the cardinality (`split_lines` 1→many, `join` many→1, `filter` may drop texts).
+Each pass is a generator: `Iterable[str]` → `Iterator[str]`. Some passes change the cardinality (`split` 1→many, `join` many→1, `filter` may drop texts).
 
 ### Stream cardinality
 
@@ -27,13 +27,12 @@ Each pass is a generator: `Iterable[str]` → `Iterator[str]`. Some passes chang
 | ------------- | -------------- | -------------------------------- |
 | `text`        | N → N+M        | Appends M literal strings        |
 | `strip`       | 1 → 1          | One output per input             |
-| `split_lines` | 1 → N          | One output per line              |
 | `split`       | 1 → N          | One output per segment           |
 | `join`        | N → 1          | All inputs merged to one         |
 | `replace`     | 1 → 1          | One output per input             |
 | `filter`      | 1 → 0 or 1     | Drops non-matching texts         |
 | `find`        | N → N+M        | Appends M found file paths       |
-| `read_file`   | 1 → 1 or 0     | Skips on decode error (0 output) |
+| `read_file`   | 1 → 1 or 0 or N | `lines=false` → 1; `lines=true` → N per file; skips on decode error (0 output) |
 | `for_each`    | 1 → N          | Sub-pipeline cardinality varies  |
 | `combine`     | N → M          | M = sum of each pass's outputs   |
 | `ref`         | depends        | Depends on referenced passes     |
@@ -116,21 +115,6 @@ Remove leading and trailing characters from each text. One output per input.
 { "name": "strip", "chars": ".,!", "right": true }
 ```
 
-### `split_lines` — Split into lines
-
-Split each text by newlines. One text in, zero or more lines out.
-
-| Param     | Type   | Default | Description                  |
-| --------- | ------ | ------- | ---------------------------- |
-| keep_ends | `bool` | `false` | Whether to keep `\n` endings |
-
-```json
-{ "name": "split_lines" }
-{ "name": "split_lines", "keep_ends": true }
-```
-
-An empty string produces no output (Python's `str.splitlines()` returns `[]` for `""`).
-
 ### `split` — Split by separator
 
 Split each text by a literal separator or regex pattern. One text in, zero or more segments out.
@@ -149,7 +133,7 @@ Split each text by a literal separator or regex pattern. One text in, zero or mo
 { "name": "split", "regex": true, "separator": "\\n = (?!=).*? = \\n", "behavior": "merged_with_next" }
 ```
 
-When `regex` is false, uses Python's `str.split` for fast literal splitting (for `"removed"` behavior) or `regex.split` with an escaped literal (for other behaviors). When `regex` is true, uses `regex.split`. An empty string input produces a single empty string output (`"".split(",")` → `[""]`), unlike `split_lines`.
+When `regex` is false, splitting is lazy and allocation-free (position-based). When `regex` is true, uses ``regex.finditer()`` for lazy splitting. An empty string input produces a single empty string output (`"".split(",")` → `[""]`).
 
 #### Behavior modes
 
@@ -225,23 +209,23 @@ Apply multiple passes **independently** to the same input stream and concatenate
   "name": "combine",
   "passes": [
     { "name": "strip" },
-    { "name": "split_lines" }
+    { "name": "split", "separator": "\n" }
   ]
 }
 ```
 
 Input `["  a\nb  ", "  c  "]` → output (round-robin): `"a\nb"`, `"  a"`, `"c"`, `"b  "`, `"  c  "`.
 
-The strip pass yields `["a\nb", "c"]` while split_lines yields `["  a", "b  ", "  c  "]`. Order among the passes is not significant — use downstream passes to reorder if needed.
+The strip pass yields `["a\nb", "c"]` while the split pass yields `["  a", "b  ", "  c  "]`. Order among the passes is not significant — use downstream passes to reorder if needed.
 
 **Empty passes**: `"combine"` with an empty `passes` list yields nothing (it returns immediately without consuming the input).
 
 In code, use `CombinePass` directly:
 
 ```python
-from spargel_llm.text_pass import CombinePass, StripPass, SplitLinesPass
+from spargel_llm.text_pass import CombinePass, SplitPass, StripPass
 
-passes = [CombinePass(passes=[StripPass(name="strip"), SplitLinesPass(name="split_lines")])]
+passes = [CombinePass(passes=[StripPass(name="strip"), SplitPass(name="split", separator="\n")])]
 ```
 
 ### `find` — Find files
@@ -269,17 +253,19 @@ Walk directories recursively and yield matching file paths. Found paths are **ap
 
 ### `read_file` — Read file contents
 
-Read the file at each input path and yield its content as a single text.
+Read the file at each input path and yield its content. With `lines=false` (default), yields the entire file as one text. With `lines=true`, yields individual lines via a ``readline()`` loop — memory-efficient for large files.
 
 | Param       | Type             | Default | Description                            |
 | ----------- | ---------------- | ------- | -------------------------------------- |
 | base        | `str`            | `"."`   | Base directory for relative paths      |
 | encoding    | `str \| null`    | `null`  | File encoding; `null` = system default |
 | compression | `"gzip" \| null` | `null`  | Decompression; supports `gzip`         |
+| lines       | `bool`           | `false` | Yield lines via ``readline()`` loop    |
 
 ```json
 { "name": "read_file", "base": "./data", "encoding": "utf-8" }
 { "name": "read_file", "compression": "gzip" }
+{ "name": "read_file", "lines": true }
 ```
 
 Each input path is resolved as `base / path`. If the input path is absolute, `base` is ignored (standard `Path` division semantics).
@@ -300,7 +286,7 @@ Typical pattern: strip each line of each text while preserving text boundaries.
 {
   "name": "for_each",
   "passes": [
-    { "name": "split_lines" },
+    { "name": "split", "separator": "\n" },
     { "name": "strip" },
     { "name": "join", "separator": "\n" }
   ]
@@ -339,7 +325,7 @@ Strip whitespace, discard empty lines, join with newlines:
 ```json
 {
   "passes": [
-    { "name": "split_lines" },
+    { "name": "split", "separator": "\n" },
     { "name": "strip" },
     { "name": "filter", "pattern": "^$", "invert": true },
     { "name": "join", "separator": "\n" }
@@ -363,17 +349,11 @@ Input `"  hello  \n\n  world  "` → output `"hello\nworld"`.
     {
       "name": "read_file",
       "base": "./corpus",
-      "encoding": "utf-8"
+      "encoding": "utf-8",
+      "lines": true
     },
-    {
-      "name": "for_each",
-      "passes": [
-        { "name": "split_lines" },
-        { "name": "strip" },
-        { "name": "filter", "pattern": "^$", "invert": true },
-        { "name": "join", "separator": "\n" }
-      ]
-    }
+    { "name": "strip" },
+    { "name": "filter", "pattern": "^$", "invert": true }
   ]
 }
 ```
@@ -381,12 +361,9 @@ Input `"  hello  \n\n  world  "` → output `"hello\nworld"`.
 What this does:
 
 1. `find` — discover all `.txt` files under `./corpus`
-2. `read_file` — read each file's content
-3. `for_each` — for each file:
-   - split into lines
-   - strip whitespace from each line
-   - drop empty lines
-   - rejoin with newlines
+2. `read_file` with `lines: true` — read each file line by line (memory-efficient)
+3. `strip` — clean whitespace from each line
+4. `filter` — drop empty lines
 
 ### Modular pipeline with `ref`
 
@@ -412,7 +389,7 @@ Main config `pipeline.json`:
       "paths": ["."],
       "file_pattern": ".*\\.txt"
     },
-    { "name": "read_file", "base": "./corpus", "encoding": "utf-8" }
+    { "name": "read_file", "base": "./corpus", "encoding": "utf-8", "lines": true }
   ]
 }
 ```
@@ -422,14 +399,8 @@ Main config `pipeline.json`:
 ```json
 {
   "passes": [
-    {
-      "name": "for_each",
-      "passes": [
-        { "name": "split_lines" },
-        { "name": "strip" },
-        { "name": "join", "separator": "\n" }
-      ]
-    }
+    { "name": "strip" },
+    { "name": "join", "separator": "\n" }
   ]
 }
 ```

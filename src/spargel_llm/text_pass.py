@@ -187,6 +187,7 @@ class ForEachPassInstance(TextPassInstance):
             for inst in self.instances:
                 current = inst.process(current)
             yield from current
+            del current, text  # release before fetching next text
 
 
 @dataclass
@@ -252,23 +253,28 @@ class PlainTextPass(TextPassModel):
 
 
 class ReadFilePass(TextPassModel):
-    """Read file content."""
+    """Read file content.
+
+    When ``lines`` is true, yields individual lines (via ``readline()`` loop).
+    """
 
     name: Literal["read_file"]
     base: str = "."
     encoding: str | None = None
     compression: Literal["gzip"] | None = None
+    lines: bool = False
 
     @override
     def build(self, config_path):
         base = _resolve_parent(config_path) / self.base
-        return self._Instance(base, self.encoding, self.compression)
+        return self._Instance(base, self.encoding, self.compression, self.lines)
 
     @dataclass
     class _Instance(TextPassInstance):
         base: Path
         encoding: str | None
         compression: Literal["gzip"] | None
+        lines: bool
 
         @override
         def process(self, texts):
@@ -278,12 +284,19 @@ class ReadFilePass(TextPassModel):
                     match self.compression:
                         case "gzip":
                             with gzip.open(path, "rt", encoding=self.encoding) as f:
-                                yield f.read()
+                                yield from self._read(f)
                         case _:
                             with open(path, "r", encoding=self.encoding) as f:
-                                yield f.read()
+                                yield from self._read(f)
                 except UnicodeDecodeError:
                     logger.warning(f'UnicodeDecodeError in file: "{path}"')
+
+        def _read(self, f):
+            if self.lines:
+                while line := f.readline():
+                    yield line
+            else:
+                yield f.read()
 
 
 class ReferencePass(TextPassModel):
@@ -355,24 +368,52 @@ class ReplacePass(TextPassModel):
                     return text.replace(self.old, self.new)
 
 
-class SplitLinesPass(TextPassModel):
-    """Split text into lines."""
 
-    name: Literal["split_lines"]
-    keep_ends: bool = False
+def _literal_positions(
+    text: str, sep: str
+) -> Iterator[tuple[int, int, None]]:
+    """Yield (start, end, None) of each occurrence of *sep* in *text*."""
+    if not sep:
+        return
+    start = 0
+    sep_len = len(sep)
+    while (end := text.find(sep, start)) != -1:
+        yield (end, end + sep_len, None)
+        start = end + sep_len
 
-    @override
-    def build(self, config_path):
-        return self._Instance(self.keep_ends)
 
-    @dataclass
-    class _Instance(TextPassInstance):
-        keep_ends: bool
+def _split_iter(
+    positions: Iterator[tuple[int, int, tuple[str, ...] | None]],
+    text: str,
+    max_split: int,
+    behavior: str,
+) -> Iterator[str]:
+    """Yield slices of *text* split at *positions*, lazy, per *behavior*."""
+    start = 0
+    limit = max_split if max_split > 0 else None
+    prev_start = None
 
-        @override
-        def process(self, texts):
-            for text in texts:
-                yield from text.splitlines(keepends=self.keep_ends)
+    for count, (p_start, p_end, groups) in enumerate(positions):
+        if limit is not None and count >= limit:
+            break
+        if behavior == "removed":
+            yield text[start:p_start]
+            if groups:
+                yield from groups
+        elif behavior == "isolated":
+            yield text[start:p_start]
+            yield text[p_start:p_end]
+        elif behavior == "merged_with_previous":
+            yield text[start:p_end]
+        else:  # merged_with_next
+            yield text[prev_start if prev_start is not None else start : p_start]
+            prev_start = p_start
+        start = p_end
+
+    if behavior == "merged_with_next":
+        yield text[prev_start if prev_start is not None else start :]
+    else:
+        yield text[start:]
 
 
 class SplitPass(TextPassModel):
@@ -419,27 +460,22 @@ class SplitPass(TextPassModel):
             for text in texts:
                 if self.behavior == "removed":
                     if self.regex and self.pattern:
-                        yield from regex.split(
-                            self.pattern, text, maxsplit=self.max_split
+                        positions = (
+                            (m.start(), m.end(), m.groups())
+                            for m in self.pattern.finditer(text)
                         )
                     else:
-                        ms = self.max_split if self.max_split > 0 else -1
-                        yield from text.split(self.separator, ms)
+                        positions = _literal_positions(text, self.separator)
                 elif self.cap_pattern:
-                    parts = regex.split(self.cap_pattern, text, maxsplit=self.max_split)
-                    if self.behavior == "isolated":
-                        yield from parts
-                    elif self.behavior == "merged_with_previous":
-                        for i in range(0, len(parts) - 1, 2):
-                            yield parts[i] + parts[i + 1]
-                        if len(parts) % 2 == 1:
-                            yield parts[-1]
-                    elif self.behavior == "merged_with_next":
-                        yield parts[0]
-                        for i in range(1, len(parts) - 1, 2):
-                            yield parts[i] + parts[i + 1]
+                    positions = (
+                        (m.start(), m.end(), None)
+                        for m in self.cap_pattern.finditer(text)
+                    )
                 else:
                     raise RuntimeError("no self.cap_pattern")
+                yield from _split_iter(
+                    positions, text, self.max_split, self.behavior
+                )
 
 
 class StripPass(TextPassModel):
@@ -479,7 +515,6 @@ type TextPassModelUnion = (
     | ReadFilePass
     | ReferencePass
     | ReplacePass
-    | SplitLinesPass
     | SplitPass
     | StripPass
 )

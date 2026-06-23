@@ -137,7 +137,7 @@ def iter_batches(
     """Iterate through a pre-tokenized Parquet dataset and yield tensor batches.
 
     For each row, a window of ``seq_len + 1`` tokens slides with the given
-    *stride* (default: ``seq_len + 1``).  Each window produces one sample:
+    *stride* (default: ``seq_len``).  Each window produces one sample:
     ``(input_ids, mask, target_ids)``.  Short tails are padded with
     *pad_index*.
 
@@ -161,7 +161,7 @@ def iter_batches(
     ``row_len + 1`` and the final window's target includes the EOT token.
     """
     if stride is None:
-        stride = seq_len + 1
+        stride = seq_len
 
     first = True
     row_index = 0
@@ -698,7 +698,6 @@ def action_train(
     state = {
         "sum_loss": 0.0,
         "sum_time_load_batch": 0.0,
-        "sum_time_transfer_batch": 0.0,
         "sum_time_forward": 0.0,
         "sum_time_backward": 0.0,
     }
@@ -711,7 +710,6 @@ def action_train(
 
         state["sum_loss"] += info.loss
         state["sum_time_load_batch"] += info.time_load_batch
-        state["sum_time_transfer_batch"] += info.time_transfer_batch
         state["sum_time_forward"] += info.time_forward
         state["sum_time_backward"] += info.time_backward
 
@@ -720,19 +718,12 @@ def action_train(
         if step % log_period == 0:
             avg_loss = state["sum_loss"] / log_period
             avg_time_load_batch = state["sum_time_load_batch"] / log_period
-            avg_time_transfer_batch = state["sum_time_transfer_batch"] / log_period
             avg_time_forward = state["sum_time_forward"] / log_period
             avg_time_backward = state["sum_time_backward"] / log_period
-            avg_time = (
-                avg_time_load_batch
-                + avg_time_transfer_batch
-                + avg_time_forward
-                + avg_time_backward
-            )
+            avg_time = avg_time_load_batch + avg_time_forward + avg_time_backward
 
             state["sum_loss"] = 0.0
             state["sum_time_load_batch"] = 0.0
-            state["sum_time_transfer_batch"] = 0.0
             state["sum_time_forward"] = 0.0
             state["sum_time_backward"] = 0.0
 
@@ -749,7 +740,7 @@ def action_train(
                     eot_index=eot_index,
                 )
 
-            time_log_msg = f"avg_time={avg_time:.6f} (({avg_time_load_batch:.6f} + {avg_time_transfer_batch:.6f}) + ({avg_time_forward:.6f} + {avg_time_backward:.6f}))"
+            time_log_msg = f"avg_time={avg_time:.6f} ({avg_time_load_batch:.6f} + {avg_time_forward:.6f} + {avg_time_backward:.6f})"
             if val_loss is not None:
                 print(
                     f"  {step}: avg_loss={avg_loss:.6f}, val_loss={val_loss:.6f}, {time_log_msg}"
