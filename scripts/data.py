@@ -12,57 +12,42 @@ from spargel_llm.utils import PromptAbortError
 #### actions ####
 
 
-def action_info(path: str, row_group: int = 0):
-    """Show metadata about a tokens.parquet file."""
+def _open_and_print_parquet_metadata(path: str):
+    """Open a Parquet file, print its metadata, and return it."""
     pf = pq.ParquetFile(path)
-
     print(f"File:             {path}")
     print(f"Rows:             {pf.metadata.num_rows:,}")
     print(f"Row groups:       {pf.metadata.num_row_groups}")
     print(f"Schema:           {pf.schema_arrow}")
 
-    metadata = pf.schema_arrow.metadata
-    if metadata:
-        dataset_id = metadata.get(b"dataset_id", b"").decode()
+    schema_md = pf.schema_arrow.metadata
+    if schema_md:
+        dataset_id = schema_md.get(b"dataset_id", b"").decode()
         if dataset_id:
             print(f"Dataset ID:       {dataset_id}")
 
-    # Sample one row group for length statistics
-    table = pf.read_row_group(row_group, columns=["tokens"])
-    col = table.column("tokens").combine_chunks()
-    offsets = col.offsets.to_numpy()
-    lengths = offsets[1:] - offsets[:-1]
+    return pf
 
+
+def _lengths_from_column(table, col_name: str) -> np.ndarray:
+    """Extract per-row lengths from a column in a row group table."""
+    col = table.column(col_name).combine_chunks()
+    if col_name == "text":
+        offsets = np.frombuffer(col.buffers()[1], dtype=np.int32)
+    else:
+        offsets = col.offsets.to_numpy()
+    return offsets[1:] - offsets[:-1]
+
+
+def action_info(path: str, col: str, row_group: int = 0):
+    """Show metadata and length statistics for a data Parquet file."""
+    pf = _open_and_print_parquet_metadata(path)
+    table = pf.read_row_group(row_group, columns=[col])
+    lengths = _lengths_from_column(table, col)
+
+    label = "characters" if col == "text" else "tokens"
     print(f"Length statistics from row group {row_group}:")
-    print(f"  Total tokens:     {lengths.sum():,}")
-    print(f"  Average length:   {lengths.mean():.1f}")
-    print(f"  Min length:       {lengths.min()}")
-    print(f"  Max length:       {lengths.max()}")
-
-
-def action_text_info(path: str, row_group: int = 0):
-    """Show metadata about a texts.parquet file."""
-    pf = pq.ParquetFile(path)
-
-    print(f"File:             {path}")
-    print(f"Rows:             {pf.metadata.num_rows:,}")
-    print(f"Row groups:       {pf.metadata.num_row_groups}")
-    print(f"Schema:           {pf.schema_arrow}")
-
-    metadata = pf.schema_arrow.metadata
-    if metadata:
-        dataset_id = metadata.get(b"dataset_id", b"").decode()
-        if dataset_id:
-            print(f"Dataset ID:       {dataset_id}")
-
-    # Sample one row group for length statistics
-    table = pf.read_row_group(row_group, columns=["text"])
-    col = table.column("text").combine_chunks()
-    offsets = np.frombuffer(col.buffers()[1], dtype=np.int32)
-    lengths = offsets[1:] - offsets[:-1]
-
-    print(f"Length statistics from row group {row_group}:")
-    print(f"  Total characters: {lengths.sum():,}")
+    print(f"  Total {label}:     {lengths.sum():,}")
     print(f"  Average length:   {lengths.mean():.1f}")
     print(f"  Min length:       {lengths.min()}")
     print(f"  Max length:       {lengths.max()}")
@@ -115,22 +100,17 @@ def create_parser() -> ArgumentParser:
     subparsers = parser.add_subparsers(dest="action", help="actions", required=True)
 
     # info
-    info_parser = subparsers.add_parser("info", help="show tokens.parquet metadata")
-    info_parser.add_argument("path", help="path to tokens.parquet file")
+    info_parser = subparsers.add_parser(
+        "info", help="show metadata and length statistics for a data Parquet file"
+    )
+    info_parser.add_argument("path", help="path to a tokens.parquet or texts.parquet file")
     info_parser.add_argument(
-        "-rg",
-        "--row-group",
-        type=int,
-        default=0,
-        help="row group index to sample for length statistics (default: 0)",
+        "-c",
+        "--col",
+        default="tokens",
+        help="column to sample for length statistics (default: tokens)",
     )
-
-    # text_info
-    text_info_parser = subparsers.add_parser(
-        "text_info", help="show texts.parquet metadata"
-    )
-    text_info_parser.add_argument("path", help="path to texts.parquet file")
-    text_info_parser.add_argument(
+    info_parser.add_argument(
         "-rg",
         "--row-group",
         type=int,
@@ -161,9 +141,7 @@ def main():
 
     match args.action:
         case "info":
-            action_info(args.path, row_group=args.row_group)
-        case "text_info":
-            action_text_info(args.path, row_group=args.row_group)
+            action_info(args.path, col=args.col, row_group=args.row_group)
         case "text_show":
             action_text_show(args.path, args.row)
         case _:

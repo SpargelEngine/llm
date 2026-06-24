@@ -15,6 +15,7 @@ from spargel_llm.text_pass import (
     ForEachPass,
     ForEachPassModel,
     JoinPass,
+    JSONPass,
     PlainTextPass,
     ReadFilePass,
     ReferencePass,
@@ -590,6 +591,77 @@ class TestForEachPassModel:
             {"passes": [{"name": "for_each", "passes": []}]}
         ).passes[0]
         assert isinstance(p, ForEachPassModel) and p.passes == []
+
+
+class TestJSONPass:
+    @staticmethod
+    def _build(**kwargs):
+        return JSONPass(name="json", **kwargs).build(".")
+
+    def test_extracts_string_field(self):
+        inst = self._build(key="content")
+        result = list(inst.process(['{"content": "hello", "id": 1}']))
+        assert result == ["hello"]
+
+    def test_extracts_from_multiple_texts(self):
+        inst = self._build(key="msg")
+        result = list(inst.process(['{"msg": "a", "id": 1}', '{"msg": "b", "id": 2}']))
+        assert result == ["a", "b"]
+
+    def test_key_not_found_raises_key_error(self):
+        inst = self._build(key="missing")
+        with pytest.raises(KeyError):
+            list(inst.process(['{"content": "hello"}']))
+
+    def test_value_not_string_raises_type_error(self):
+        inst = self._build(key="content")
+        with pytest.raises(TypeError):
+            list(inst.process(['{"content": 123}']))
+
+    def test_value_is_null_raises_type_error(self):
+        inst = self._build(key="content")
+        with pytest.raises(TypeError):
+            list(inst.process(['{"content": null}']))
+
+    def test_invalid_json_raises_error(self):
+        inst = self._build(key="content")
+        with pytest.raises(json.decoder.JSONDecodeError):
+            list(inst.process(["not json"]))
+
+    def test_empty_input(self):
+        inst = self._build(key="content")
+        assert list(inst.process([])) == []
+
+    def test_model_validate(self):
+        p = JSONPass.model_validate({"name": "json", "key": "title"})
+        assert p.name == "json"
+        assert p.key == "title"
+
+    def test_end_to_end_json(self):
+        passes = TextPassList.model_validate(
+            {"passes": [{"name": "json", "key": "text"}]}
+        ).passes
+        result = list(process_texts(['{"text": "hello world"}'], passes))
+        assert result == ["hello world"]
+
+    def test_end_to_end_jsonl_pipeline(self, tmp_path):
+        """Read a JSONL file, extract field from each line."""
+        d = tmp_path / "data"
+        d.mkdir()
+        jsonl_path = d / "items.jsonl"
+        jsonl_path.write_text(
+            '{"text": "hello"}\n{"text": "world"}\n{"text": "foo"}\n',
+            encoding="utf-8",
+        )
+
+        read_inst = ReadFilePass(name="read_file", base=str(d), lines=True).build(".")
+        strip_inst = StripPass(name="strip").build(".")
+        filter_inst = FilterPass(name="filter", pattern=r"^$", invert=True).build(".")
+        json_inst = JSONPass(name="json", key="text").build(".")
+
+        chain = ChainPassInstance([read_inst, strip_inst, filter_inst, json_inst])
+        result = list(chain.process([jsonl_path.name]))
+        assert result == ["hello", "world", "foo"]
 
 
 class TestJoinPass:
@@ -1354,6 +1426,7 @@ class TestTextPassList:
                     {"name": "find", "base": "."},
                     {"name": "for_each", "passes": []},
                     {"name": "join"},
+                    {"name": "json", "key": "content"},
                     {"name": "text", "texts": []},
                     {"name": "read_file", "base": "."},
                     {"name": "ref", "paths": ["x.json"]},
@@ -1364,7 +1437,7 @@ class TestTextPassList:
                 ]
             }
         )
-        assert len(m.passes) == 11
+        assert len(m.passes) == 12
 
 
 class TestProcessTexts:

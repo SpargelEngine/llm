@@ -41,6 +41,8 @@ class StepInfo:
     time_load_batch: float
     time_forward: float
     time_backward: float
+    step_token_count: int
+    step_total_tokens: int
 
 
 def train(
@@ -78,6 +80,7 @@ def train(
         step_time_forward = 0.0
         step_time_backward = 0.0
         step_token_count = 0
+        step_total_tokens = 0
 
         actual_mb = 0
         for mb in range(micro_batches):
@@ -123,6 +126,7 @@ def train(
             step_time_forward += t2 - t1
             step_time_backward += t3 - t2
             step_token_count += int(torch.sum(~masks).item())
+            step_total_tokens += masks.numel()
 
         step_loss = step_loss / actual_mb
 
@@ -143,6 +147,8 @@ def train(
                     time_load_batch=step_time_load_batch,
                     time_forward=step_time_forward,
                     time_backward=step_time_backward,
+                    step_token_count=step_token_count,
+                    step_total_tokens=step_total_tokens,
                 )
             )
 

@@ -28,6 +28,7 @@ Each pass is a generator: `Iterable[str]` → `Iterator[str]`. Some passes chang
 | `text`        | N → N+M        | Appends M literal strings        |
 | `strip`       | 1 → 1          | One output per input             |
 | `split`       | 1 → N          | One output per segment           |
+| `json`        | 1 → 1          | Extracts string field from JSON   |
 | `join`        | N → 1          | All inputs merged to one         |
 | `replace`     | 1 → 1          | One output per input             |
 | `filter`      | 1 → 0 or 1     | Drops non-matching texts         |
@@ -161,6 +162,24 @@ Concatenate all input texts into a single output string with a separator. Many i
 ```
 
 Input `["a", "b", "c"]` → output `["a\nb\nc"]`.
+
+### `json` — Extract field from JSON
+
+Parse each text as JSON and extract the value of a specified key. The extracted value **must** be a string — raises ``KeyError`` if the key is absent, ``TypeError`` if its value is not a string.
+
+| Param | Type  | Default  | Description     |
+| ----- | ----- | -------- | --------------- |
+| key   | `str` | required | JSON key to extract |
+
+```json
+{ "name": "json", "key": "content" }
+{ "name": "json", "key": "title" }
+```
+
+Input `["{\"content\": \"hello\", \"id\": 1}"]` → output `["hello"]`.
+
+Input `["{\"content\": 123}"]` raises ``TypeError`` (value is not a string).
+Input `["{\"id\": 1}"]` raises ``KeyError`` (key ``"content"`` is missing).
 
 ### `replace` — Replace text
 
@@ -364,6 +383,38 @@ What this does:
 2. `read_file` with `lines: true` — read each file line by line (memory-efficient)
 3. `strip` — clean whitespace from each line
 4. `filter` — drop empty lines
+
+### Read and extract fields from JSONL
+
+Parse a [JSONL](https://jsonlines.org/) file (one JSON object per line) and extract a specific string field from each line:
+
+```json
+{
+  "passes": [
+    { "name": "read_file", "base": "./data", "lines": true },
+    { "name": "strip" },
+    { "name": "filter", "pattern": "^$", "invert": true },
+    { "name": "json", "key": "content" }
+  ]
+}
+```
+
+Input file `data/items.jsonl`:
+
+```
+{"content": "hello world", "id": 1}
+{"content": "foo bar", "id": 2}
+{"content": "baz", "id": 3}
+```
+
+Output: `"hello world"`, `"foo bar"`, `"baz"`.
+
+What this does:
+
+1. `read_file` with `lines: true` — read each line of the JSONL file (memory-efficient for large files)
+2. `strip` — remove trailing newlines from each line
+3. `filter` — drop blank lines (e.g. trailing empty line at end of file)
+4. `json` — parse each line as JSON and extract the `"content"` field; raises ``KeyError`` if absent, ``TypeError`` if not a string
 
 ### Modular pipeline with `ref`
 

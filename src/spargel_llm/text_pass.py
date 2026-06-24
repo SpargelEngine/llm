@@ -214,6 +214,32 @@ class ForEachPassModel(TextPassModel):
         return ForEachPassInstance(instances)
 
 
+class JSONPass(TextPassModel):
+    """Parse each text as JSON and extract a key field."""
+
+    name: Literal["json"]
+    key: str
+
+    @override
+    def build(self, config_path):
+        return self._Instance(self.key)
+
+    @dataclass
+    class _Instance(TextPassInstance):
+        key: str
+
+        @override
+        def process(self, texts):
+            for text in texts:
+                obj = json.loads(text)
+                value = obj[self.key]
+                if not isinstance(value, str):
+                    raise TypeError(
+                        f'JSON key "{self.key}" is not a string: {type(value).__name__}'
+                    )
+                yield value
+
+
 class JoinPass(TextPassModel):
     """Join texts."""
 
@@ -511,6 +537,7 @@ type TextPassModelUnion = (
     | FindPass
     | ForEachPassModel
     | JoinPass
+    | JSONPass
     | PlainTextPass
     | ReadFilePass
     | ReferencePass

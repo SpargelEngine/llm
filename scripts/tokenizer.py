@@ -61,6 +61,7 @@ def action_encode(path: str, texts_path: str, output: str, batch_size: int = 1):
             writer.write_table(
                 pa.table({"tokens": [x.ids for x in encoded]}, schema=schema)
             )
+            del texts, encoded  # free memory
 
     print(f'Saved encoded Parquet to "{output}".')
 

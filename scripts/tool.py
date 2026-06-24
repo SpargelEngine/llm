@@ -87,6 +87,14 @@ def save_optimizer_state(path: StrOrPath, optimizer: Optimizer):
     torch.save(optimizer.state_dict(), path)
 
 
+def create_optimizer(
+    model: Model, learning_rate: float, weight_decay: float
+) -> AdamW:
+    return AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+
+
 #### other helpers ####
 
 
@@ -658,12 +666,14 @@ def action_train(
 
     # optimizer
 
-    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = create_optimizer(model, learning_rate, weight_decay)
     if should_reset_optimizer:
         log_info("Batch size changed, optimizer reset.")
-    else:
-        log_info("Loading optimzier state.")
+    elif optimizer_state_file.exists():
+        log_info("Loading optimizer state.")
         load_optimizer_state(optimizer_state_file, optimizer)
+    else:
+        log_info("Optimizer state file not found, using fresh optimizer.")
 
     log_info(f"Use BF16: {use_bf16}")
 
@@ -700,6 +710,8 @@ def action_train(
         "sum_time_load_batch": 0.0,
         "sum_time_forward": 0.0,
         "sum_time_backward": 0.0,
+        "sum_non_pad_tokens": 0,
+        "sum_total_tokens": 0,
     }
 
     def step_callback(info: StepInfo):
@@ -712,6 +724,8 @@ def action_train(
         state["sum_time_load_batch"] += info.time_load_batch
         state["sum_time_forward"] += info.time_forward
         state["sum_time_backward"] += info.time_backward
+        state["sum_non_pad_tokens"] += info.step_token_count
+        state["sum_total_tokens"] += info.step_total_tokens
 
         step = info.step + 1
 
@@ -751,6 +765,16 @@ def action_train(
                 print(f"  {step}: avg_loss={avg_loss:.6f}, {time_log_msg}")
 
             if step % (log_period * 10) == 0:
+                non_pad = state["sum_non_pad_tokens"]
+                total = state["sum_total_tokens"]
+                if total > 0:
+                    ratio = non_pad / total
+                    print(
+                        f"non_pad_ratio={ratio:.6f} (non_pad={non_pad}, total={total})"
+                    )
+                state["sum_non_pad_tokens"] = 0
+                state["sum_total_tokens"] = 0
+
                 save()
 
                 if step % (log_period * 100) == 0:
@@ -848,10 +872,8 @@ def action_model_init(path: StrOrPath, *, yes: bool = False):
     save_model_state(model_state_file, model)
     log_success(f"Initialized model state at {model_state_file}.")
 
-    optimizer = AdamW(
-        model.parameters(),
-        lr=train_config.learning_rate,
-        weight_decay=train_config.weight_decay,
+    optimizer = create_optimizer(
+        model, train_config.learning_rate, train_config.weight_decay
     )
     save_optimizer_state(optimizer_state_file, optimizer)
     log_success(f"Initialized optimizer state at {optimizer_state_file}.")
