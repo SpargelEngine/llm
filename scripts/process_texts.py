@@ -1,11 +1,11 @@
 from argparse import ArgumentParser
 from pathlib import Path
-from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
+from spargel_llm.parquet_utils import make_text_schema
 from spargel_llm.text_pass import load_texts
 
 
@@ -23,20 +23,23 @@ def main():
         "output",
         help="output Parquet file path",
     )
+    parser.add_argument(
+        "--batch-size",
+        "-bs",
+        type=int,
+        default=1000,
+        help="row group size for Parquet writing (default: 1000)",
+    )
     args = parser.parse_args()
 
     output_path = Path(args.output)
-    schema = pa.schema([pa.field("text", pa.string())])
-    dataset_id = uuid4().hex
-    schema = schema.with_metadata({"dataset_id": dataset_id})
-
-    WRITE_BATCH = 1000
+    schema = make_text_schema()
 
     with pq.ParquetWriter(output_path, schema, compression="zstd") as writer:
         batch: list[str] = []
         for text in tqdm(load_texts(args.config)):
             batch.append(text)
-            if len(batch) >= WRITE_BATCH:
+            if len(batch) >= args.batch_size:
                 writer.write_table(pa.table({"text": batch}, schema=schema))
                 batch = []
         if batch:

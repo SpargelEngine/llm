@@ -1,11 +1,13 @@
+import math
 from argparse import ArgumentParser
-from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from tokenizers.trainers import BpeTrainer
 from tqdm import tqdm
+
+from spargel_llm.parquet_utils import make_tokens_schema, read_row, resolve_row
 
 
 def action_info(path: str):
@@ -29,11 +31,12 @@ def action_init(path: str):
 
 def action_train(path: str, texts_path: str, vocab_size: int):
     tokenizer = Tokenizer.from_file(path)
-    trainer = BpeTrainer(
-        vocab_size=vocab_size,
-        special_tokens=["<unk>", "<pad>", "<eot>"]
-        + [f"<placeholder{i}>" for i in range(3, 16)],
-    )
+
+    special_tokens = ["<unk>", "<pad>", "<sot>", "<eot>"]
+    special_tokens += [f"<placeholder{i}>" for i in range(len(special_tokens), 16)]
+    assert len(special_tokens) == 16
+
+    trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=special_tokens)
     pf = pq.ParquetFile(texts_path)
 
     def text_iter():
@@ -41,21 +44,22 @@ def action_train(path: str, texts_path: str, vocab_size: int):
             for text in batch.column("text").to_pylist():
                 yield text
 
-    tokenizer.train_from_iterator(text_iter(), trainer)
+    tokenizer.train_from_iterator(text_iter(), trainer, length=pf.metadata.num_rows)
     tokenizer.save(path, pretty=True)
     print(f'Saved tokenizer at "{path}".')
 
 
-def action_encode(path: str, texts_path: str, output: str, batch_size: int = 1):
+def action_encode(path: str, texts_path: str, output: str, batch_size: int = 1000):
     tokenizer = Tokenizer.from_file(path)
     pf = pq.ParquetFile(texts_path)
 
-    schema = pa.schema([pa.field("tokens", pa.list_(pa.uint32()))])
-    dataset_id = uuid4().hex
-    schema = schema.with_metadata({"dataset_id": dataset_id})
+    schema = make_tokens_schema()
 
     with pq.ParquetWriter(output, schema, compression="zstd") as writer:
-        for batch in tqdm(pf.iter_batches(batch_size=batch_size), desc="batches"):
+        total = math.ceil(pf.metadata.num_rows / batch_size)
+        for batch in tqdm(
+            pf.iter_batches(batch_size=batch_size), desc="batches", total=total
+        ):
             texts = batch.column("text").to_pylist()
             encoded = tokenizer.encode_batch_fast(texts)
             writer.write_table(
@@ -73,6 +77,22 @@ def action_demo(path: str, text: str, *, show_id: bool = False):
         print(output.ids)
     else:
         print(output.tokens)
+
+
+def action_show(tokenizer_path: str, tokens_path: str, row: int | None = None):
+    """Decode and print the tokens at a specific row from a tokens.parquet file.
+
+    Only reads the row group containing the target row, skipping all others.
+    If row is not specified, a random row is selected.
+    """
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    pf = pq.ParquetFile(tokens_path)
+    row = resolve_row(pf, row)
+    local_idx, table = read_row(pf, row, ["tokens"])
+    token_ids = table.column("tokens")[local_idx].as_py()
+    text = tokenizer.decode(token_ids)
+    print(f"[{row}/{pf.metadata.num_rows}] length={len(token_ids)}")
+    print(text)
 
 
 def create_parser() -> ArgumentParser:
@@ -106,7 +126,7 @@ def create_parser() -> ArgumentParser:
         "-bs",
         type=int,
         default=1,
-        help="batch size for encoding (default: 1)",
+        help="batch size for encoding (default: 1000)",
     )
 
     # demo
@@ -114,6 +134,21 @@ def create_parser() -> ArgumentParser:
     demo_parser.add_argument("path", help="tokenizer JSON file")
     demo_parser.add_argument("text", help="text to encode")
     demo_parser.add_argument("--id", action="store_true", help="show token ids")
+
+    # show
+    show_parser = subparsers.add_parser(
+        "show", help="decode and print a row from a tokens.parquet file"
+    )
+    show_parser.add_argument("tokenizer_path", help="tokenizer JSON file")
+    show_parser.add_argument("tokens_path", help="path to tokens.parquet file")
+    show_parser.add_argument(
+        "row",
+        nargs="?",
+        type=int,
+        default=None,
+        help="zero-based row index to print (negative indices count from the end; "
+        "random if omitted)",
+    )
 
     return parser
 
@@ -135,6 +170,8 @@ def main():
             )
         case "demo":
             action_demo(args.path, args.text, show_id=args.id)
+        case "show":
+            action_show(args.tokenizer_path, args.tokens_path, args.row)
 
 
 if __name__ == "__main__":

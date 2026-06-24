@@ -102,8 +102,8 @@ class Attention(nn.Module):
                 1.0 / (10000.0 ** (torch.arange(0, self.dim_k, 2) / self.dim_k)),
                 persistent=False,
             )
-            self.cos_values = nn.Buffer(None, persistent=False)
-            self.sin_values = nn.Buffer(None, persistent=False)
+            self.cos_values = nn.Buffer(torch.empty(0), persistent=False)
+            self.sin_values = nn.Buffer(torch.empty(0), persistent=False)
             self.seq_len = None
 
         def _xavier_init(w: Tensor, d1: int, d2: int):

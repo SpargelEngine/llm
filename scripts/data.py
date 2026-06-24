@@ -1,13 +1,11 @@
 """Inspect and display contents of data Parquet files (texts and tokens)."""
 
-import sys
 from argparse import ArgumentParser
 
 import numpy as np
 import pyarrow.parquet as pq
 
-from spargel_llm.logging import log_info
-from spargel_llm.utils import PromptAbortError
+from spargel_llm.parquet_utils import get_dataset_id, read_row, resolve_row
 
 #### actions ####
 
@@ -20,11 +18,9 @@ def _open_and_print_parquet_metadata(path: str):
     print(f"Row groups:       {pf.metadata.num_row_groups}")
     print(f"Schema:           {pf.schema_arrow}")
 
-    schema_md = pf.schema_arrow.metadata
-    if schema_md:
-        dataset_id = schema_md.get(b"dataset_id", b"").decode()
-        if dataset_id:
-            print(f"Dataset ID:       {dataset_id}")
+    dataset_id = get_dataset_id(pf)
+    if dataset_id:
+        print(f"Dataset ID:       {dataset_id}")
 
     return pf
 
@@ -59,34 +55,12 @@ def action_text_show(path: str, row: int | None = None):
     Only reads the row group containing the target row, skipping all others.
     If row is not specified, a random row is selected.
     """
-    import random
-
     pf = pq.ParquetFile(path)
-
-    if row is None:
-        row = random.randrange(pf.metadata.num_rows)
-
-    if row < 0:
-        row += pf.metadata.num_rows
-
-    if row < 0 or row >= pf.metadata.num_rows:
-        raise IndexError(
-            f"row index out of range (file has {pf.metadata.num_rows} rows)"
-        )
-
-    # Find which row group contains the target row
-    offset = 0
-    for rg_idx in range(pf.metadata.num_row_groups):
-        rg = pf.metadata.row_group(rg_idx)
-        if offset + rg.num_rows > row:
-            # Read only this row group and extract the target row
-            table = pf.read_row_group(rg_idx, columns=["text"])
-            local_idx = row - offset
-            text = table.column("text")[local_idx].as_py()
-            print(f"[{row}/{pf.metadata.num_rows}] length={len(text)}")
-            print(text)
-            return
-        offset += rg.num_rows
+    row = resolve_row(pf, row)
+    local_idx, table = read_row(pf, row, ["text"])
+    text = table.column("text")[local_idx].as_py()
+    print(f"[{row}/{pf.metadata.num_rows}] length={len(text)}")
+    print(text)
 
 
 #### main ####
@@ -103,7 +77,9 @@ def create_parser() -> ArgumentParser:
     info_parser = subparsers.add_parser(
         "info", help="show metadata and length statistics for a data Parquet file"
     )
-    info_parser.add_argument("path", help="path to a tokens.parquet or texts.parquet file")
+    info_parser.add_argument(
+        "path", help="path to a tokens.parquet or texts.parquet file"
+    )
     info_parser.add_argument(
         "-c",
         "--col",
@@ -149,8 +125,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except PromptAbortError:
-        log_info("Aborting.")
-        sys.exit(1)
+    main()

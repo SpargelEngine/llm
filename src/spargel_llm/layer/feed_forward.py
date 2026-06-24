@@ -1,39 +1,36 @@
 from typing import Literal, override
 
 import torch.nn as nn
-from torch import Tensor
 import torch.nn.functional as F
-from pydantic import BaseModel
+from torch import Tensor
 
-class FeedForwardConfig(BaseModel):
-    dim: int
-    hidden: int
-    activation: Literal["relu", "relu2"]
 
 class FeedForward(nn.Module):
     """
     Feed Forward
     """
 
-    def __init__(self, config: FeedForwardConfig):
-        super().__init__()
-        self.config = config
+    type Activation = Literal["relu", "relu2"]
 
-        self.up = nn.Linear(self.config.dim, self.config.hidden)
-        self.down = nn.Linear(self.config.hidden, self.config.dim)
+    def __init__(self, dim: int, dim_hidden: int, activation: Activation):
+        super().__init__()
+        self.activation = activation
+
+        self.up = nn.Linear(dim, dim_hidden)
+        self.down = nn.Linear(dim_hidden, dim)
 
     @override
     def forward(self, x: Tensor) -> Tensor:
         x = self.up(x)
-        if self.config.activation == "relu":
+        if self.activation == "relu":
             x = F.relu(x)
-        elif self.config.activation == "relu2":
+        elif self.activation == "relu2":
             x = F.relu(x).square()
         else:
-            raise ValueError("unknown activation: " + self.config.activation)
+            raise ValueError("unknown activation: " + self.activation)
         x = self.down(x)
         return x
 
     @override
     def extra_repr(self) -> str:
-        return f"dim={self.config.dim}, hidden={self.config.hidden}, activation={self.config.activation!r}"
+        return f"dim={self.dim}, hidden={self.hidden}, activation={self.activation!r}"

@@ -16,7 +16,7 @@ class PositionalEncoding(nn.Module):
         self.max_seq_len = max_seq_len
         self.dim = dim
 
-        self.pe = nn.Buffer(torch.empty(max_seq_len, dim))
+        self.pe = nn.Buffer(torch.empty(max_seq_len, dim), persistent=False)
 
         positions = torch.arange(0, max_seq_len).reshape(max_seq_len, 1)
         frequencies = torch.arange(1, dim // 2 + 1) * torch.pi / max_seq_len

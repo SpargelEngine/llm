@@ -2,8 +2,11 @@
 
 from argparse import ArgumentParser
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
+
+from spargel_llm.parquet_utils import iter_row_groups, resolve_index
 
 
 def action_info(input_path: str):
@@ -36,35 +39,17 @@ def action_info(input_path: str):
     )
 
 
-def _resolve_index(idx: int, total: int) -> int:
-    """Resolve a possibly-negative index into a non-negative one."""
-    if idx < 0:
-        idx += total
-    return idx
-
-
-def _iter_row_groups(pf: pq.ParquetFile):
-    """Yield ``(rg_idx, offset, rg_rows)`` for each row group in *pf*."""
-    offset = 0
-    for rg_idx in range(pf.metadata.num_row_groups):
-        rg_rows = pf.metadata.row_group(rg_idx).num_rows
-        yield rg_idx, offset, rg_rows
-        offset += rg_rows
-
-
 def _parse_slice(slice_spec: str, total: int) -> tuple[int, int]:
     """Parse a ``[start]:[end]`` string into absolute row indices."""
     parts = slice_spec.split(":")
     if len(parts) != 2:
-        raise ValueError(
-            f"slice must be in the form [start]:[end], got {slice_spec!r}"
-        )
+        raise ValueError(f"slice must be in the form [start]:[end], got {slice_spec!r}")
     start_str, end_str = parts
     start = int(start_str) if start_str else 0
     end = int(end_str) if end_str else total
 
-    start = max(0, min(_resolve_index(start, total), total))
-    end = max(0, min(_resolve_index(end, total), total))
+    start = max(0, min(resolve_index(start, total), total))
+    end = max(0, min(resolve_index(end, total), total))
 
     if start >= end:
         raise ValueError(
@@ -73,13 +58,61 @@ def _parse_slice(slice_spec: str, total: int) -> tuple[int, int]:
     return start, end
 
 
+def action_copy(
+    input_path: str,
+    output: str,
+    row_group_size: int | None = None,
+):
+    """Copy a Parquet file, optionally controlling row group size.
+
+    Reads row groups from *input_path* and writes them to *output* with the
+    same schema.  When *row_group_size* is given, every row group in the output
+    except possibly the last will contain exactly that many rows.
+    """
+    pf = pq.ParquetFile(input_path)
+    schema = pf.schema_arrow
+
+    writer = pq.ParquetWriter(
+        output, schema, compression="zstd", row_group_size=row_group_size
+    )
+
+    pending: list[pa.Table] = []
+    pending_rows = 0
+
+    for rg_idx in tqdm(range(pf.metadata.num_row_groups), desc="copy"):
+        table = pf.read_row_group(rg_idx)
+
+        if not row_group_size:
+            writer.write_table(table)
+            continue
+
+        pending.append(table)
+        pending_rows += table.num_rows
+
+        while pending_rows >= row_group_size:
+            combined = pa.concat_tables(pending)
+            writer.write_table(combined.slice(0, row_group_size))
+            remainder = combined.slice(row_group_size)
+            pending = [remainder] if remainder.num_rows > 0 else []
+            pending_rows = remainder.num_rows
+
+    if pending:
+        writer.write_table(pa.concat_tables(pending))
+
+    writer.close()
+
+    out_rows = pq.ParquetFile(output).metadata.num_rows
+    out_rgs = pq.ParquetFile(output).metadata.num_row_groups
+    print(f"{input_path} -> {output} ({out_rows:,} rows, {out_rgs} row groups)")
+
+
 def action_split(input_path: str, pos: int, output1: str, output2: str):
     """Split a Parquet file into two at the given row position.
 
     Rows ``0..pos-1`` go to *output1*, rows ``pos..end`` go to *output2*.
     """
     pf = pq.ParquetFile(input_path)
-    pos = _resolve_index(pos, pf.metadata.num_rows)
+    pos = resolve_index(pos, pf.metadata.num_rows)
 
     if pos < 0 or pos > pf.metadata.num_rows:
         raise ValueError(
@@ -91,7 +124,7 @@ def action_split(input_path: str, pos: int, output1: str, output2: str):
     w2 = pq.ParquetWriter(output2, schema, compression="zstd")
 
     for rg_idx, offset, rg_rows in tqdm(
-        list(_iter_row_groups(pf)), desc="row group"
+        iter_row_groups(pf), desc="row group", total=pf.metadata.num_row_groups
     ):
         rg_end = offset + rg_rows
 
@@ -126,7 +159,7 @@ def action_slice(input_path: str, slice_spec: str, output: str):
     schema = pf.schema_arrow
     writer = pq.ParquetWriter(output, schema, compression="zstd")
 
-    for rg_idx, offset, rg_rows in _iter_row_groups(pf):
+    for rg_idx, offset, rg_rows in iter_row_groups(pf):
         rg_end = offset + rg_rows
 
         if rg_end <= start:
@@ -167,6 +200,19 @@ def create_parser() -> ArgumentParser:
     split_parser.add_argument("output1", help="first output file")
     split_parser.add_argument("output2", help="second output file")
 
+    copy_parser = subparsers.add_parser(
+        "copy", help="copy a Parquet file, optionally re-chunking row groups"
+    )
+    copy_parser.add_argument("input", help="input Parquet file")
+    copy_parser.add_argument("output", help="output Parquet file")
+    copy_parser.add_argument(
+        "-g",
+        "--row-group-size",
+        type=int,
+        default=None,
+        help="target rows per output row group",
+    )
+
     slice_parser = subparsers.add_parser(
         "slice", help="extract a slice of rows from a Parquet file"
     )
@@ -187,6 +233,8 @@ def main():
     match args.action:
         case "info":
             action_info(args.input)
+        case "copy":
+            action_copy(args.input, args.output, args.row_group_size)
         case "split":
             action_split(args.input, args.pos, args.output1, args.output2)
         case "slice":

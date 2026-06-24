@@ -2,14 +2,13 @@ import json
 import os
 import random
 import shutil
-import sys
 import time
 from argparse import ArgumentParser
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Optional
 
-import numpy as np
 import pyarrow.parquet as pq
 import torch
 from pydantic import BaseModel, NonNegativeInt
@@ -20,17 +19,22 @@ from torch import Tensor
 from torch.optim import AdamW, Optimizer
 from torch.utils.tensorboard import SummaryWriter
 
-from spargel_llm.layer.feed_forward import FeedForwardConfig
-from spargel_llm.logging import log_info, log_success
+from spargel_llm.logging import log_info, log_success, log_warning
 from spargel_llm.model import Config, Model
-from spargel_llm.train import StepInfo, TrainInfo, generate_step, train
-from spargel_llm.typing import StrOrPath
-from spargel_llm.utils import (
-    PromptAbortError,
-    prompt_overwrite,
+from spargel_llm.parquet_utils import get_dataset_id
+from spargel_llm.train import (
+    StepInfo,
+    TrainInfo,
+    compute_validation_metrics,
+    generate_step,
+    iter_batches,
+    train,
 )
+from spargel_llm.typing import StrOrPath
 
-PAD, EOT = 1, 2
+PAD = 1
+SOT = 2
+EOT = 3
 
 
 class TrainConfig(BaseModel):
@@ -57,6 +61,16 @@ class ProjectInfo(BaseModel):
 
     # training config
     train_config: TrainConfig
+
+
+@dataclass
+class LogState:
+    """Mutable state accumulated across training steps for periodic logging."""
+
+    sum_loss: float = 0.0
+    sum_time: float = 0.0
+    sum_non_pad_tokens: int = 0
+    sum_total_tokens: int = 0
 
 
 #### load/store helper functions ####
@@ -120,146 +134,6 @@ def load_dataset(path: StrOrPath) -> pq.ParquetFile:
     return parquet_file
 
 
-def get_dataset_id(parquet_file: pq.ParquetFile) -> str:
-    """Extract the ``dataset_id`` from a Parquet file's schema metadata."""
-    metadata = parquet_file.schema_arrow.metadata
-    if metadata is None:
-        return ""
-    return metadata.get(b"dataset_id", b"").decode()
-
-
-def iter_batches(
-    dataset: pq.ParquetFile,
-    seq_len: int,
-    batch_size: int,
-    pad_index: int,
-    stride: int | None = None,
-    start_index: int = 0,
-    start_offset: int = 0,
-    tracker: dict | None = None,
-    eot_index: int | None = None,
-) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
-    """Iterate through a pre-tokenized Parquet dataset and yield tensor batches.
-
-    For each row, a window of ``seq_len + 1`` tokens slides with the given
-    *stride* (default: ``seq_len``).  Each window produces one sample:
-    ``(input_ids, mask, target_ids)``.  Short tails are padded with
-    *pad_index*.
-
-    Works directly on Arrow's underlying NumPy buffers to avoid the
-    Python-object overhead of ``to_pylist()``.  Samples are accumulated
-    into pre-allocated tensor batches.  Partial batches at the end are
-    silently discarded.
-
-    *start_index* skips the first N items of *dataset*.
-
-    *start_offset* is used as the initial window position only for the
-    first item (the one at *start_index*); all subsequent items start from
-    the beginning.
-
-    If *tracker* is a dict, it is updated before each sample with keys
-    ``index`` (current dataset row) and ``offset`` (window position
-    within that row).
-
-    If *eot_index* is not ``None``, each row is treated as if it ends with
-    an additional token of that value, so the effective row length becomes
-    ``row_len + 1`` and the final window's target includes the EOT token.
-    """
-    if stride is None:
-        stride = seq_len
-
-    first = True
-    row_index = 0
-
-    # Pre-allocate batch buffers as numpy arrays (reused across batches).
-    batch_inputs = np.full((batch_size, seq_len), pad_index, dtype=np.int32)
-    batch_masks = np.ones((batch_size, seq_len), dtype=bool)
-    batch_targets = np.full((batch_size, seq_len), pad_index, dtype=np.int32)
-    sample_in_batch = 0
-
-    # Skip row groups that are entirely before start_index.
-    start_rg = 0
-    rg_start = 0
-    while start_rg < dataset.metadata.num_row_groups:
-        rg_rows = dataset.metadata.row_group(start_rg).num_rows
-        if rg_start + rg_rows <= start_index:
-            rg_start += rg_rows
-            row_index += rg_rows
-            start_rg += 1
-            continue
-        break
-
-    for rg_idx in range(start_rg, dataset.metadata.num_row_groups):
-        table = dataset.read_row_group(rg_idx)
-        col = table.column("tokens").combine_chunks()
-        offsets = col.offsets.to_numpy()
-        values = col.values.to_numpy().astype(np.int32)
-
-        n_rows = len(col)
-
-        for i in range(n_rows):
-            if row_index < start_index:
-                row_index += 1
-                continue
-
-            row_start = int(offsets[i])
-            row_end = int(offsets[i + 1])
-            row_len = row_end - row_start
-
-            row_len_with_eot = row_len + 1 if eot_index is not None else row_len
-
-            if row_len_with_eot <= 1:
-                row_index += 1
-                continue
-
-            pos = start_offset if first else 0
-            first = False
-
-            while pos + 1 < row_len_with_eot:
-                end = min(pos + seq_len + 1, row_len_with_eot)
-                L = end - pos - 1
-
-                # Write sample directly into the pre-allocated batch row.
-                batch_inputs[sample_in_batch, :L] = values[
-                    row_start + pos : row_start + pos + L
-                ]
-                batch_inputs[sample_in_batch, L:] = pad_index
-                batch_masks[sample_in_batch, :L] = False
-                batch_masks[sample_in_batch, L:] = True
-
-                # Target: may include EOT at the final position.
-                orig_target_len = min(L, row_len - (pos + 1))
-                if orig_target_len > 0:
-                    batch_targets[sample_in_batch, :orig_target_len] = values[
-                        row_start + pos + 1 : row_start + pos + 1 + orig_target_len
-                    ]
-                if end > row_len and eot_index is not None:
-                    batch_targets[sample_in_batch, orig_target_len] = eot_index
-                batch_targets[sample_in_batch, L:] = pad_index
-
-                if tracker is not None:
-                    tracker["index"] = row_index
-                    tracker["offset"] = pos
-
-                sample_in_batch += 1
-
-                if sample_in_batch == batch_size:
-                    yield (
-                        torch.tensor(batch_inputs),
-                        torch.tensor(batch_masks),
-                        torch.tensor(batch_targets),
-                    )
-                    # Reset for reuse.
-                    batch_inputs.fill(pad_index)
-                    batch_masks.fill(True)
-                    batch_targets.fill(pad_index)
-                    sample_in_batch = 0
-
-                pos += stride
-
-            row_index += 1
-
-
 def get_backup_path(path: StrOrPath):
     return (
         resolve_parent(path)
@@ -293,7 +167,19 @@ def writer_add_embedding(
     model.eval()
     with torch.no_grad():
         vocab_size = tokenizer.get_vocab_size()
-        labels = [tokenizer.id_to_token(i) for i in range(vocab_size)]
+
+        def _make_label(i: int) -> str:
+            decoded = tokenizer.decode([i], skip_special_tokens=False)
+            if not decoded or not decoded.strip():
+                return tokenizer.id_to_token(i) or f"<id:{i}>"
+            return (
+                decoded.replace("\t", "\\t")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\x0c", "\\f")
+            )
+
+        labels = [_make_label(i) for i in range(vocab_size)]
 
         def add_token_vectors(tag: str, vectors: Tensor):
             writer.add_embedding(vectors.detach().float().cpu(), labels, tag=tag)
@@ -308,108 +194,100 @@ def writer_add_embedding(
             add_token_vectors("lm_head", model.out.weight)
 
 
-@torch.compile
-def validation_metrics_step(
-    model: Model,
-    inputs: Tensor,
-    masks: Tensor,
-    targets: Tensor,
-    pad_index: int,
-):
-    logits: Tensor = model(inputs, masks)
-    flattened_logits = logits.flatten(0, -2)
-    flattened_targets = targets.flatten(0, -1).to(torch.long)
-
-    loss = torch.nn.functional.cross_entropy(
-        flattened_logits,
-        flattened_targets,
-        ignore_index=pad_index,
-    )
-
-    valid_targets = flattened_targets != pad_index
-    log_probs = torch.log_softmax(flattened_logits.float(), dim=-1)
-    entropy_by_token = -(log_probs.exp() * log_probs).sum(dim=-1)
-    valid_weights = valid_targets.to(entropy_by_token.dtype)
-    entropy_sum = (entropy_by_token * valid_weights).sum()
-    valid_token_count = valid_targets.sum()
-
-    return loss, entropy_sum, valid_token_count
-
-
-def compute_validation_metrics(
-    model: Model,
-    dataset: pq.ParquetFile,
-    seq_len: int,
-    batch_size: int,
-    pad_index: int,
-    device: str,
-    num_batches: int = 10,
-    eot_index: int | None = None,
-) -> tuple[float, float]:
-    assert num_batches > 0
-
-    total_loss = 0.0
-    total_entropy = 0.0
-    total_entropy_tokens = 0
-
-    def make_iterator():
-        return iter_batches(
-            dataset, seq_len, batch_size, pad_index, eot_index=eot_index
-        )
-
-    iterator = make_iterator()
-
-    model.eval()
-
-    with torch.no_grad():
-        for _ in range(num_batches):
-            try:
-                inputs, masks, targets = next(iterator)
-            except StopIteration:
-                iterator = make_iterator()
-                inputs, masks, targets = next(iterator)
-
-            loss, entropy_sum, entropy_token_count = validation_metrics_step(
-                model,
-                inputs.to(device),
-                masks.to(device),
-                targets.to(device),
-                pad_index=pad_index,
-            )
-
-            total_loss += loss.detach().item()
-            total_entropy += entropy_sum.detach().item()
-            total_entropy_tokens += int(entropy_token_count.detach().item())
-
-    return total_loss / num_batches, total_entropy / max(total_entropy_tokens, 1)
-
-
-def compute_validation_loss(
-    model: Model,
-    dataset: pq.ParquetFile,
-    seq_len: int,
-    batch_size: int,
-    pad_index: int,
-    device: str,
-    num_batches: int = 10,
-    eot_index: int | None = None,
-) -> float:
-    loss, _ = compute_validation_metrics(
-        model=model,
-        dataset=dataset,
-        seq_len=seq_len,
-        batch_size=batch_size,
-        pad_index=pad_index,
-        device=device,
-        num_batches=num_batches,
-        eot_index=eot_index,
-    )
-    return loss
-
-
 def always_true():
     while True:
         yield True
+
+
+def log_step_callback(
+    info: StepInfo,
+    state: LogState,
+    *,
+    log_period: int,
+    model: Model,
+    val_dataset: pq.ParquetFile | None,
+    val_batches: int,
+    seq_len: int,
+    batch_size: int,
+    pad_index: int,
+    device: str,
+    eot_index: int | None,
+    sot_index: int | None,
+    writer: SummaryWriter | None,
+    get_token_count: Callable[[], int],
+    on_save: Callable[[], None],
+    on_backup: Callable[[], None],
+) -> None:
+    token_count = get_token_count()
+
+    if writer is not None:
+        writer.add_scalar("loss/train", info.loss, token_count)
+
+    state.sum_loss += info.loss * info.step_token_count
+    state.sum_time += info.time
+    state.sum_non_pad_tokens += info.step_token_count
+    state.sum_total_tokens += info.step_total_tokens
+
+    step = info.step + 1
+
+    if step % log_period == 0:
+        avg_loss = state.sum_loss / max(state.sum_non_pad_tokens, 1)
+        avg_time = state.sum_time / log_period
+
+        state.sum_loss = 0.0
+        state.sum_time = 0.0
+        state.sum_non_pad_tokens = 0
+        state.sum_total_tokens = 0
+
+        val_metrics = None
+        val_time = 0.0
+        if val_dataset is not None:
+            t_val_start = time.perf_counter()
+            val_metrics = compute_validation_metrics(
+                model=model,
+                dataset=val_dataset,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                pad_index=pad_index,
+                device=device,
+                num_batches=val_batches,
+                eot_index=eot_index,
+                sot_index=sot_index,
+            )
+            val_time = time.perf_counter() - t_val_start
+
+        # TensorBoard metrics
+        if writer is not None:
+            writer.add_scalar("metric/avg_time", avg_time, token_count)
+            if val_metrics is not None:
+                writer.add_scalar("metric/val_time", val_time, token_count)
+
+        # Console output
+        if val_metrics is not None:
+            val_loss, val_entropy = val_metrics
+            parts = [
+                f"  {step}: avg_loss={avg_loss:.6f}, val_loss={val_loss:.6f}, val_entropy={val_entropy:.6f}",
+                f"avg_time={avg_time:.6f}, val_time={val_time:.6f}",
+            ]
+            print(", ".join(parts))
+            if writer is not None:
+                writer.add_scalar("loss/val", val_loss, token_count)
+                writer.add_scalar("entropy/val", val_entropy, token_count)
+        else:
+            parts = [f"  {step}: avg_loss={avg_loss:.6f}", f"avg_time={avg_time:.6f}"]
+            print(", ".join(parts))
+
+        if step % (log_period * 10) == 0:
+            non_pad = state.sum_non_pad_tokens
+            total = state.sum_total_tokens
+            if total > 0:
+                ratio = non_pad / total
+                print(f"non_pad_ratio={ratio:.6f} (non_pad={non_pad}, total={total})")
+
+            on_save()
+
+            if step % (log_period * 100) == 0:
+                on_backup()
 
 
 #### actions ####
@@ -423,9 +301,7 @@ def action_info(path: StrOrPath):
     rich_print(project_info)
 
 
-def action_init(path: StrOrPath, *, yes: bool = False):
-    prompt_overwrite(path, yes=yes)
-
+def action_init(path: StrOrPath):
     config = Config(
         vocab_size=8192,
         max_seq_len=4096,
@@ -434,12 +310,9 @@ def action_init(path: StrOrPath, *, yes: bool = False):
         dim=256,
         dim_key=64,
         dim_value=64,
+        dim_ff_hidden=1024,
         use_rope=True,
-        feed_forward=FeedForwardConfig(
-            dim=256,
-            hidden=1024,
-            activation="relu",
-        ),
+        ff_activation="relu",
     )
 
     model_state_file = "model_state.pth"
@@ -467,21 +340,21 @@ def action_gen(
     path: StrOrPath,
     seq_len: int,
     prompt: str,
-    count: int = 0,
+    count: int = -1,
     temperature: float = 0.5,
     *,
     device: str = "cpu",
     stream: bool = False,
-    all: bool = False,
+    show_all: bool = False,
     stop_token: int = EOT,
-    add_eot: bool = False,
+    add_sot: bool = False,
     dump_file: Optional[str] = None,
     random_seed: Optional[int] = None,
 ):
     assert seq_len > 0
     assert temperature > 0
 
-    if not add_eot:
+    if not add_sot:
         assert len(prompt) > 0
 
     project_info = load_project(path)
@@ -495,6 +368,9 @@ def action_gen(
     tokenizer = load_tokenizer(resolve_parent(path) / project_info.tokenizer)
 
     prompt_tokens = tokenizer.encode(prompt).ids
+
+    if add_sot:
+        prompt_tokens = [SOT] + prompt_tokens
 
     if random_seed is None:
         random_seed = random.randrange(2**63)
@@ -516,7 +392,7 @@ def action_gen(
 
     tokens = list(prompt_tokens)
 
-    print("Prompt:", repr(tokenizer.decode(tokens)))
+    print("Prompt:", repr(tokenizer.decode(tokens, skip_special_tokens=False)))
     print("Prompt token count:", len(tokens))
     print("Sequence length:", seq_len)
     print("Temperature:", temperature)
@@ -535,8 +411,8 @@ def action_gen(
 
     decode_stream = DecodeStream() if stream else None
 
-    if stream and all:
-        print(tokenizer.decode(tokens), end="")
+    if stream and show_all:
+        print(tokenizer.decode(tokens, skip_special_tokens=False), end="")
 
     for _ in range(count) if count >= 0 else always_true():
         input = tokens[-seq_len:]
@@ -581,10 +457,10 @@ def action_gen(
     if stream:
         print()
     else:
-        if all:
-            print(tokenizer.decode(tokens))
+        if show_all:
+            print(tokenizer.decode(tokens, skip_special_tokens=False))
         else:
-            print(tokenizer.decode(tokens[start_pos:]))
+            print(tokenizer.decode(tokens[start_pos:], skip_special_tokens=False))
 
     log_info("********")
     print("Generated token count:", len(tokens) - start_pos)
@@ -603,12 +479,14 @@ def action_train(
     learning_rate: Optional[float] = None,
     weight_decay: Optional[float] = None,
     val_path: Optional[str] = None,
+    val_batches: Optional[int] = None,
     log_period: int = 10,
     tensorboard_dir: Optional[str] = None,
     device: str = "cpu",
     start_index: Optional[int] = None,
     start_offset: Optional[int] = None,
     add_eot: bool = False,
+    add_sot: bool = False,
     gradient_accumulation_steps: Optional[int] = None,
     loop_dataset: bool = False,
     use_bf16: bool = True,
@@ -626,33 +504,20 @@ def action_train(
     prev_bs = train_config.batch_size
     should_reset_optimizer = new_bs != prev_bs
 
-    if seq_len is None:
-        seq_len = train_config.seq_len
-    else:
-        train_config.seq_len = seq_len
+    def _apply[T](attr: str, value: T | None) -> T:
+        if value is not None:
+            setattr(train_config, attr, value)
+            return value
+        v = getattr(train_config, attr)
+        return v
+
+    seq_len = _apply("seq_len", seq_len)
     assert seq_len > 0
-
-    if batch_size is None:
-        batch_size = train_config.batch_size
-    else:
-        train_config.batch_size = batch_size
+    batch_size = _apply("batch_size", batch_size)
     assert batch_size > 0
-
-    if learning_rate is None:
-        learning_rate = train_config.learning_rate
-    else:
-        train_config.learning_rate = learning_rate
-
-    if weight_decay is None:
-        weight_decay = train_config.weight_decay
-    else:
-        train_config.weight_decay = weight_decay
-
-    if gradient_accumulation_steps is None:
-        micro_batches = train_config.micro_batches or 1
-    else:
-        micro_batches = gradient_accumulation_steps
-        train_config.micro_batches = micro_batches
+    learning_rate = _apply("learning_rate", learning_rate)
+    weight_decay = _apply("weight_decay", weight_decay)
+    micro_batches = _apply("micro_batches", gradient_accumulation_steps) or 1
     assert micro_batches >= 1
     assert batch_size % micro_batches == 0, (
         f"batch_size ({batch_size}) must be divisible by "
@@ -686,6 +551,7 @@ def action_train(
     log_info(f"Start position: index={start_index}, offset={start_offset}")
 
     eot_index = EOT if add_eot else None
+    sot_index = SOT if add_sot else None
 
     train_tracker: dict = {"index": start_index, "offset": start_offset}
 
@@ -699,9 +565,11 @@ def action_train(
             start_offset=start_offset or 0,
             tracker=train_tracker,
             eot_index=eot_index,
+            sot_index=sot_index,
         )
 
-    val_batches = max(log_period // 10, 1)
+    if val_batches is None:
+        val_batches = max(log_period // 10, 1)
     val_dataset = None
     if val_path is not None:
         log_info("Loading validation dataset.")
@@ -725,6 +593,13 @@ def action_train(
         log_info("Optimizer state file not found, using fresh optimizer.")
 
     log_info(f"Use BF16: {use_bf16}")
+
+    if use_bf16 and device == "cpu":
+        log_warning(
+            "BF16 is enabled but the device is CPU. "
+            "BF16 is typically not supported on CPU and may cause errors or poor performance. "
+            "Use -n16 / --no-bf16 to disable BF16."
+        )
 
     # TensorBoard
 
@@ -754,82 +629,27 @@ def action_train(
         shutil.copyfile(model_state_file, get_backup_path(model_state_file))
         shutil.copyfile(optimizer_state_file, get_backup_path(optimizer_state_file))
 
-    state = {
-        "sum_loss": 0.0,
-        "sum_time_load_batch": 0.0,
-        "sum_time_forward": 0.0,
-        "sum_time_backward": 0.0,
-        "sum_non_pad_tokens": 0,
-        "sum_total_tokens": 0,
-    }
+    state = LogState()
 
     def step_callback(info: StepInfo):
-        token_count = project_info.train_info.token_count
-
-        if writer is not None:
-            writer.add_scalar("loss/train", info.loss, token_count)
-
-        state["sum_loss"] += info.loss
-        state["sum_time_load_batch"] += info.time_load_batch
-        state["sum_time_forward"] += info.time_forward
-        state["sum_time_backward"] += info.time_backward
-        state["sum_non_pad_tokens"] += info.step_token_count
-        state["sum_total_tokens"] += info.step_total_tokens
-
-        step = info.step + 1
-
-        if step % log_period == 0:
-            avg_loss = state["sum_loss"] / log_period
-            avg_time_load_batch = state["sum_time_load_batch"] / log_period
-            avg_time_forward = state["sum_time_forward"] / log_period
-            avg_time_backward = state["sum_time_backward"] / log_period
-            avg_time = avg_time_load_batch + avg_time_forward + avg_time_backward
-
-            state["sum_loss"] = 0.0
-            state["sum_time_load_batch"] = 0.0
-            state["sum_time_forward"] = 0.0
-            state["sum_time_backward"] = 0.0
-
-            val_metrics = None
-            if val_dataset is not None:
-                val_metrics = compute_validation_metrics(
-                    model=model,
-                    dataset=val_dataset,
-                    seq_len=seq_len,
-                    batch_size=micro_batch_size,
-                    pad_index=PAD,
-                    device=device,
-                    num_batches=val_batches,
-                    eot_index=eot_index,
-                )
-
-            time_log_msg = f"avg_time={avg_time:.6f} ({avg_time_load_batch:.6f} + {avg_time_forward:.6f} + {avg_time_backward:.6f})"
-            if val_metrics is not None:
-                val_loss, val_entropy = val_metrics
-                print(
-                    f"  {step}: avg_loss={avg_loss:.6f}, val_loss={val_loss:.6f}, val_entropy={val_entropy:.6f}, {time_log_msg}"
-                )
-                if writer is not None:
-                    writer.add_scalar("loss/val", val_loss, token_count)
-                    writer.add_scalar("entropy/val", val_entropy, token_count)
-            else:
-                print(f"  {step}: avg_loss={avg_loss:.6f}, {time_log_msg}")
-
-            if step % (log_period * 10) == 0:
-                non_pad = state["sum_non_pad_tokens"]
-                total = state["sum_total_tokens"]
-                if total > 0:
-                    ratio = non_pad / total
-                    print(
-                        f"non_pad_ratio={ratio:.6f} (non_pad={non_pad}, total={total})"
-                    )
-                state["sum_non_pad_tokens"] = 0
-                state["sum_total_tokens"] = 0
-
-                save()
-
-                if step % (log_period * 100) == 0:
-                    backup()
+        log_step_callback(
+            info,
+            state,
+            log_period=log_period,
+            model=model,
+            val_dataset=val_dataset,
+            val_batches=val_batches,
+            seq_len=seq_len,
+            batch_size=micro_batch_size,
+            pad_index=PAD,
+            device=device,
+            eot_index=eot_index,
+            sot_index=sot_index,
+            writer=writer,
+            get_token_count=lambda: project_info.train_info.token_count,
+            on_save=save,
+            on_backup=backup,
+        )
 
     # train
 
@@ -851,30 +671,8 @@ def action_train(
 
     backup()
 
-    if loop_dataset:
-        steps_remaining = steps
-        while steps_remaining > 0:
-            batch_iterator = make_iterator()
-            actual_steps = train(
-                info=project_info.train_info,
-                model=model,
-                optimizer=optimizer,
-                batch_iterator=batch_iterator,
-                pad_index=PAD,
-                steps=steps_remaining,
-                device=device,
-                step_callback=step_callback,
-                micro_batches=micro_batches,
-                use_bf16=use_bf16,
-            )
-            steps_remaining -= actual_steps
-            if steps_remaining > 0:
-                log_info("Dataset exhausted - restarting from beginning.")
-                start_index = 0
-                start_offset = 0
-                train_tracker["index"] = 0
-                train_tracker["offset"] = 0
-    else:
+    steps_remaining = steps
+    while steps_remaining > 0:
         batch_iterator = make_iterator()
         actual_steps = train(
             info=project_info.train_info,
@@ -882,20 +680,27 @@ def action_train(
             optimizer=optimizer,
             batch_iterator=batch_iterator,
             pad_index=PAD,
-            steps=steps,
+            steps=steps_remaining,
             device=device,
             step_callback=step_callback,
             micro_batches=micro_batches,
             use_bf16=use_bf16,
         )
-
-        if actual_steps < steps:
-            log_info("Dataset exhausted - resetting train_info position to zero.")
-            project_info.train_info.index = 0
-            project_info.train_info.offset = 0
-            project_info.train_info.dataset_id = ""
+        steps_remaining -= actual_steps
+        if steps_remaining > 0:
+            if loop_dataset:
+                log_info("Dataset exhausted - restarting from beginning.")
+            else:
+                log_info("Dataset exhausted - resetting train_info position to zero.")
+                project_info.train_info.index = 0
+                project_info.train_info.offset = 0
+                project_info.train_info.dataset_id = ""
             train_tracker["index"] = 0
             train_tracker["offset"] = 0
+            start_index = 0
+            start_offset = 0
+            if not loop_dataset:
+                break
 
     save()
 
@@ -910,14 +715,11 @@ def action_train(
         writer.close()
 
 
-def action_model_init(path: StrOrPath, *, yes: bool = False):
+def action_model_init(path: StrOrPath):
     project_info = load_project(path)
     model_state_file = resolve_parent(path) / project_info.model_state_file
     train_config = project_info.train_config
     optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
-
-    prompt_overwrite(model_state_file, yes=yes)
-    prompt_overwrite(optimizer_state_file, yes=yes)
 
     model = Model(project_info.config)
     save_model_state(model_state_file, model)
@@ -998,12 +800,6 @@ def create_parser() -> ArgumentParser:
     )
 
     parser.add_argument(
-        "-y",
-        "--yes",
-        action="store_true",
-        help="always say YES and avoid interactive prompts",
-    )
-    parser.add_argument(
         "-t",
         "--thread",
         type=int,
@@ -1037,7 +833,7 @@ def create_parser() -> ArgumentParser:
         "-c",
         "--count",
         type=int,
-        default=200,
+        default=-1,
         help="maximum number of tokens to generate (negative for infinite)",
     )
     gen_parser.add_argument(
@@ -1048,6 +844,7 @@ def create_parser() -> ArgumentParser:
         "-a",
         "--all",
         action="store_true",
+        dest="show_all",
         help="show prompt and generated text together",
     )
     gen_parser.add_argument(
@@ -1057,7 +854,7 @@ def create_parser() -> ArgumentParser:
         default=EOT,
         help="stop token id (-1: never stop)",
     )
-    gen_parser.add_argument("--eot", action="store_true", help="add EOT")
+    gen_parser.add_argument("--sot", action="store_true", help="add SOT")
     gen_parser.add_argument(
         "-df",
         "--dump-file",
@@ -1110,10 +907,14 @@ def create_parser() -> ArgumentParser:
         help="initial window offset for the first sample (default: read from project)",
     )
     train_parser.add_argument(
-        "-et",
         "--eot",
         action="store_true",
         help="append EOT to each training/validation text (effective length +1)",
+    )
+    train_parser.add_argument(
+        "--sot",
+        action="store_true",
+        help="prepend SOT to each training/validation text (effective length +1)",
     )
     train_parser.add_argument(
         "-mb",
@@ -1128,6 +929,13 @@ def create_parser() -> ArgumentParser:
         "--loop-dataset",
         action="store_true",
         help="restart from the beginning when the dataset is exhausted instead of stopping early",
+    )
+    train_parser.add_argument(
+        "-vb",
+        "--validation-batches",
+        type=int,
+        default=None,
+        help="number of batches for validation (default: log_period // 10, at least 1)",
     )
     train_parser.add_argument(
         "-n16",
@@ -1163,9 +971,7 @@ def create_parser() -> ArgumentParser:
     graph_parser.add_argument("path", help="project file")
     graph_parser.add_argument("tensorboard_dir", help="TensorBoard write directory")
     graph_parser.add_argument(
-        "seq_len",
-        type=int,
-        help="sequence length for dummy input (use training seq_len)",
+        "seq_len", type=int, help="sequence length for dummy input"
     )
 
     # param
@@ -1187,7 +993,7 @@ def main():
     num_threads = 8
     if args.thread is not None:
         num_threads = args.thread
-    elif device == "cpu":
+    else:
         num_threads = os.cpu_count() or 8
 
     torch.set_num_threads(num_threads)
@@ -1201,7 +1007,7 @@ def main():
         case "info":
             action_info(args.path)
         case "init":
-            action_init(args.path, yes=args.yes)
+            action_init(args.path)
         case "gen":
             action_gen(
                 args.path,
@@ -1211,9 +1017,9 @@ def main():
                 temperature=args.temp,
                 device=device,
                 stream=args.stream,
-                all=args.all,
+                show_all=args.show_all,
                 stop_token=args.stop_token,
-                add_eot=args.eot,
+                add_sot=args.sot,
                 dump_file=args.dump_file,
                 random_seed=args.random_seed,
             )
@@ -1227,18 +1033,20 @@ def main():
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
                 val_path=args.val,
+                val_batches=args.validation_batches,
                 device=device,
                 tensorboard_dir=args.tensorboard_dir,
                 log_period=args.log_period,
                 start_index=args.start_index,
                 start_offset=args.start_offset,
                 add_eot=args.eot,
+                add_sot=args.sot,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 loop_dataset=args.loop_dataset,
                 use_bf16=not args.no_bf16,
             )
         case "model_init":
-            action_model_init(args.path, yes=args.yes)
+            action_model_init(args.path)
         case "embed":
             action_embed(
                 args.path, args.tensorboard_dir, layer=args.layer, device=device
@@ -1252,8 +1060,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except PromptAbortError:
-        log_info("Aborting.")
-        sys.exit(1)
+    main()

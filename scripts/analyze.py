@@ -1,13 +1,10 @@
 import json
-import sys
 from argparse import ArgumentParser
 
 import torch
 from tokenizers import Tokenizer
 
-from spargel_llm.logging import log_info
 from spargel_llm.typing import StrOrPath
-from spargel_llm.utils import PromptAbortError
 
 
 def load_tokenizer(path: StrOrPath) -> Tokenizer:
@@ -76,9 +73,7 @@ def create_parser() -> ArgumentParser:
     gen_parser.add_argument(
         "dump_file", help="dump file (JSONL) produced by tool.py gen --dump-file"
     )
-    gen_parser.add_argument(
-        "tokenizer", help="tokenizer file for decoding token ids"
-    )
+    gen_parser.add_argument("tokenizer", help="tokenizer file for decoding token ids")
     gen_parser.add_argument(
         "-n",
         type=int,
@@ -105,8 +100,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except PromptAbortError:
-        log_info("Aborting.")
-        sys.exit(1)
+    main()
