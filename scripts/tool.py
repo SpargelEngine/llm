@@ -31,6 +31,7 @@ from spargel_llm.train import (
     train,
 )
 from spargel_llm.typing import StrOrPath
+from spargel_llm.utils import escape_whitespace
 
 PAD = 1
 SOT = 2
@@ -69,8 +70,8 @@ class LogState:
 
     sum_loss: float = 0.0
     sum_time: float = 0.0
-    sum_non_pad_tokens: int = 0
-    sum_total_tokens: int = 0
+    tokens: int = 0
+    tokens_non_pad: int = 0
 
 
 #### load/store helper functions ####
@@ -172,12 +173,7 @@ def writer_add_embedding(
             decoded = tokenizer.decode([i], skip_special_tokens=False)
             if not decoded or not decoded.strip():
                 return tokenizer.id_to_token(i) or f"<id:{i}>"
-            return (
-                decoded.replace("\t", "\\t")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\x0c", "\\f")
-            )
+            return escape_whitespace(decoded)
 
         labels = [_make_label(i) for i in range(vocab_size)]
 
@@ -213,6 +209,7 @@ def log_step_callback(
     device: str,
     eot_index: int | None,
     sot_index: int | None,
+    use_bf16: bool = True,
     writer: SummaryWriter | None,
     get_token_count: Callable[[], int],
     on_save: Callable[[], None],
@@ -223,26 +220,22 @@ def log_step_callback(
     if writer is not None:
         writer.add_scalar("loss/train", info.loss, token_count)
 
-    state.sum_loss += info.loss * info.step_token_count
+    state.sum_loss += info.loss * info.tokens_non_pad
     state.sum_time += info.time
-    state.sum_non_pad_tokens += info.step_token_count
-    state.sum_total_tokens += info.step_total_tokens
+    state.tokens += info.tokens
+    state.tokens_non_pad += info.tokens_non_pad
 
     step = info.step + 1
 
     if step % log_period == 0:
-        avg_loss = state.sum_loss / max(state.sum_non_pad_tokens, 1)
+        avg_loss = state.sum_loss / max(state.tokens_non_pad, 1)
         avg_time = state.sum_time / log_period
-
-        state.sum_loss = 0.0
-        state.sum_time = 0.0
-        state.sum_non_pad_tokens = 0
-        state.sum_total_tokens = 0
 
         val_metrics = None
         val_time = 0.0
         if val_dataset is not None:
             t_val_start = time.perf_counter()
+
             val_metrics = compute_validation_metrics(
                 model=model,
                 dataset=val_dataset,
@@ -253,14 +246,18 @@ def log_step_callback(
                 num_batches=val_batches,
                 eot_index=eot_index,
                 sot_index=sot_index,
+                use_bf16=use_bf16,
             )
+
+            if device == "cuda":
+                torch.cuda.synchronize()
             val_time = time.perf_counter() - t_val_start
 
         # TensorBoard metrics
         if writer is not None:
-            writer.add_scalar("metric/avg_time", avg_time, token_count)
+            writer.add_scalar("metric/time/avg", avg_time, token_count)
             if val_metrics is not None:
-                writer.add_scalar("metric/val_time", val_time, token_count)
+                writer.add_scalar("metric/time/val", val_time, token_count)
 
         # Console output
         if val_metrics is not None:
@@ -278,8 +275,8 @@ def log_step_callback(
             print(", ".join(parts))
 
         if step % (log_period * 10) == 0:
-            non_pad = state.sum_non_pad_tokens
-            total = state.sum_total_tokens
+            non_pad = state.tokens_non_pad
+            total = state.tokens
             if total > 0:
                 ratio = non_pad / total
                 print(f"non_pad_ratio={ratio:.6f} (non_pad={non_pad}, total={total})")
@@ -288,6 +285,11 @@ def log_step_callback(
 
             if step % (log_period * 100) == 0:
                 on_backup()
+
+        state.sum_loss = 0.0
+        state.sum_time = 0.0
+        state.tokens = 0
+        state.tokens_non_pad = 0
 
 
 #### actions ####
@@ -721,6 +723,7 @@ def action_train(
             device=device,
             eot_index=eot_index,
             sot_index=sot_index,
+            use_bf16=use_bf16,
             writer=writer,
             get_token_count=lambda: project_info.train_info.token_count,
             on_save=save,

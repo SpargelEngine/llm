@@ -12,6 +12,7 @@ from spargel_llm.parquet_utils import (
     read_row,
     resolve_row,
 )
+from spargel_llm.utils import escape_whitespace
 
 
 def action_demo(path: str, text: str, *, show_id: bool = False):
@@ -21,6 +22,21 @@ def action_demo(path: str, text: str, *, show_id: bool = False):
         print(output.ids)
     else:
         print(output.tokens)
+
+
+def action_dump(path: str, min_len: int | None = None):
+    tokenizer = Tokenizer.from_file(path)
+    vocab_size = tokenizer.get_vocab_size()
+    for i in range(vocab_size):
+        raw = tokenizer.id_to_token(i) or ""
+        if min_len is not None and len(raw) < min_len:
+            continue
+        decoded = tokenizer.decode([i], skip_special_tokens=False)
+        if not decoded or not decoded.strip():
+            label = raw or f"<id:{i}>"
+        else:
+            label = escape_whitespace(decoded)
+        print(f"{i}: |{label}|")
 
 
 def action_encode(path: str, texts_path: str, output: str, batch_size: int = 1000):
@@ -109,6 +125,17 @@ def create_parser() -> ArgumentParser:
     demo_parser.add_argument("text", help="text to encode")
     demo_parser.add_argument("--id", action="store_true", help="show token ids")
 
+    # dump
+    dump_parser = subparsers.add_parser("dump", help="dump all token ids and contents")
+    dump_parser.add_argument("path", help="tokenizer JSON file")
+    dump_parser.add_argument(
+        "min_len",
+        nargs="?",
+        type=int,
+        default=None,
+        help="optional minimum raw token length to filter by",
+    )
+
     # encode
     encode_parser = subparsers.add_parser(
         "encode", help="encode dataset texts to tokens"
@@ -163,6 +190,8 @@ def main():
     match args.action:
         case "demo":
             action_demo(args.path, args.text, show_id=args.id)
+        case "dump":
+            action_dump(args.path, min_len=args.min_len)
         case "encode":
             action_encode(
                 args.path, args.texts_path, args.output, batch_size=args.batch_size

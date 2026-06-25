@@ -8,6 +8,7 @@ After changing the code, do not forget to update the corresponding tests/docs if
 
 Before committing, review the type of change in this round (patch/bug-fix, improvement, breaking, ...),
 and change the SemVer of the project accordingly.
+Do format checking and testing here.
 
 When git committing, only concisely describe the changes/fixes/improvements.
 DO NOT add additional information or signature such as "Co-Authored-By: XXX".

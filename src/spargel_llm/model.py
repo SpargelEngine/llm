@@ -1,6 +1,5 @@
 from typing import override
 
-import torch
 import torch.nn as nn
 from pydantic import BaseModel, PositiveInt
 from torch import Tensor
@@ -89,22 +88,3 @@ class Model(nn.Module):
     @override
     def extra_repr(self) -> str:
         return str(self.config)
-
-    def loss(
-        self, input_ids: Tensor, mask: Tensor, target_ids: Tensor, pad_index: int
-    ) -> Tensor:
-        """
-        Args:
-            input_ids (..., seq_len) dtype=int
-            mask (..., seq_len) dtype=bool
-            target_ids (..., seq_len) dtype=int
-        """
-
-        logits: Tensor = self(input_ids, mask)  # (..., seq_len, vocab_size)
-        loss = nn.functional.cross_entropy(
-            logits.flatten(0, -2),
-            target_ids.flatten(0, -1).to(torch.long),
-            ignore_index=pad_index,
-        )
-
-        return loss

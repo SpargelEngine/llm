@@ -1,15 +1,18 @@
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterator, Optional
+from typing import Callable, Iterator, Literal, Optional
 
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+import torch.nn as nn
 from pydantic import BaseModel, NonNegativeFloat, NonNegativeInt
 from torch import Tensor
 from torch.optim import Optimizer
 
 from .model import Model
+
+type Reduction = Literal["mean", "sum"]
 
 
 class TrainInfo(BaseModel):
@@ -23,12 +26,55 @@ class TrainInfo(BaseModel):
 @torch.compile
 def compute_loss_step(
     model: Model,
-    inputs: Tensor,
-    masks: Tensor,
-    targets: Tensor,
+    input_ids: Tensor,
+    mask: Tensor,
+    target_ids: Tensor,
+    *,
     pad_index: int,
+    reduction: Reduction = "mean",
 ):
-    return model.loss(inputs, masks, targets, pad_index=pad_index)
+    logits: Tensor = model(input_ids, mask)  # (..., seq_len, vocab_size)
+    flattened_logits = logits.flatten(0, -2)
+    flattened_targets = target_ids.flatten(0, -1).to(torch.long)
+
+    loss = nn.functional.cross_entropy(
+        flattened_logits,
+        flattened_targets,
+        ignore_index=pad_index,
+        reduction=reduction,
+    )
+
+    return loss
+
+
+@torch.compile
+def validation_metrics_step(
+    model: Model,
+    input_ids: Tensor,
+    mask: Tensor,
+    target_ids: Tensor,
+    *,
+    pad_index: int,
+    reduction: Reduction = "mean",
+):
+    logits: Tensor = model(input_ids, mask)  # (..., seq_len, vocab_size)
+    flattened_logits = logits.flatten(0, -2)
+    flattened_targets = target_ids.flatten(0, -1).to(torch.long)
+
+    loss = nn.functional.cross_entropy(
+        flattened_logits,
+        flattened_targets,
+        ignore_index=pad_index,
+        reduction=reduction,
+    )
+
+    valid_targets = flattened_targets != pad_index
+    log_probs = torch.log_softmax(flattened_logits.float(), dim=-1)
+    entropy_by_token = -(log_probs.exp() * log_probs).sum(dim=-1)
+    valid_weights = valid_targets.to(entropy_by_token.dtype)
+    entropy_sum = (entropy_by_token * valid_weights).sum()
+
+    return loss, entropy_sum
 
 
 @torch.compile
@@ -41,15 +87,15 @@ class StepInfo:
     step: int
     loss: float
     time: float
-    step_token_count: int
-    step_total_tokens: int
+    tokens: int
+    tokens_non_pad: int
 
 
 def train(
     info: TrainInfo,
     model: Model,
     optimizer: Optimizer,
-    batch_iterator: Iterator[tuple[Tensor, Tensor, Tensor, int]],
+    batch_iterator: Iterator[tuple[Tensor, Tensor, Tensor, int, int]],
     pad_index: int,
     steps: int,
     *,
@@ -62,7 +108,7 @@ def train(
 
     Each step consists of *micro_batches* forward/backward passes whose
     gradients are accumulated before a single ``optimizer.step()`` call.
-    The effective batch size is ``micro_batch_size × micro_batches``.
+    The effective batch size is ``micro_batch_size x micro_batches``.
 
     Returns the number of steps actually executed (may be less than *steps*
     if the data iterator is exhausted).
@@ -73,74 +119,145 @@ def train(
     device_type = torch_device.type
 
     for step in range(steps):
-        step_loss = 0.0
-        step_token_count = 0
-        step_total_tokens = 0
-
         t_start = time.perf_counter()
 
+        # fetch micro batches
+        cpu_batches: list[tuple[Tensor, Tensor, Tensor, int, int]] = []
+        step_tokens = 0
+        step_tokens_non_pad = 0
+        for _ in range(micro_batches):
+            try:
+                inputs, masks, targets, tokens, tokens_non_pad = next(batch_iterator)
+            except StopIteration:
+                if not cpu_batches:
+                    return step
+                break
+            step_tokens += tokens
+            step_tokens_non_pad += tokens_non_pad
+            cpu_batches.append((inputs, masks, targets, tokens, tokens_non_pad))
+
+        step_loss = torch.tensor(0.0, device=torch_device, dtype=torch.float32)
+
+        model.train()
+
+        # reset gradients
         optimizer.zero_grad()
 
-        actual_mb = 0
-        for mb in range(micro_batches):
-            try:
-                inputs, masks, targets, non_pad_count = next(batch_iterator)
-            except StopIteration:
-                if mb == 0:
-                    print("Stopping early because there are no more data.")
-                    return step
-                # partial step — still apply what we've accumulated
-                break
-
-            actual_mb += 1
-
-            inputs2 = inputs.to(torch_device)
-            masks2 = masks.to(torch_device)
-            targets2 = targets.to(torch_device)
-
-            model.train()
+        # forward / backward
+        for inputs, masks, targets, _, _ in cpu_batches:
+            inputs = inputs.to(torch_device)
+            masks = masks.to(torch_device)
+            targets = targets.to(torch_device)
 
             with torch.autocast(
                 device_type=device_type, dtype=torch.bfloat16, enabled=use_bf16
             ):
                 loss = compute_loss_step(
                     model=model,
-                    inputs=inputs2,
-                    masks=masks2,
-                    targets=targets2,
+                    input_ids=inputs,
+                    mask=masks,
+                    target_ids=targets,
                     pad_index=pad_index,
+                    reduction="sum",
                 )
-            loss = loss / micro_batches
-
+            loss = loss / step_tokens_non_pad
+            step_loss = step_loss + loss
             loss.backward()
 
-            step_loss += loss.detach().item() * micro_batches
-            step_token_count += non_pad_count
-            step_total_tokens += masks.numel()
-
-        step_loss = step_loss / actual_mb
-
+        # update weights
         optimizer.step()
 
+        if device == "cuda":
+            torch.cuda.synchronize()
         t_end = time.perf_counter()
 
         step_time = t_end - t_start
 
         info.time += step_time
-        info.token_count += step_token_count
+        info.token_count += step_tokens_non_pad
 
         if step_callback is not None:
             step_callback(
                 StepInfo(
                     step=step,
-                    loss=step_loss,
+                    loss=step_loss.item(),
                     time=step_time,
-                    step_token_count=step_token_count,
-                    step_total_tokens=step_total_tokens,
+                    tokens=step_tokens,
+                    tokens_non_pad=step_tokens_non_pad,
                 )
             )
 
     return steps
+
+
+def compute_validation_metrics(
+    model: Model,
+    dataset: pq.ParquetFile,
+    seq_len: int,
+    batch_size: int,
+    pad_index: int,
+    device: str,
+    num_batches: int = 1,
+    eot_index: int | None = None,
+    sot_index: int | None = None,
+    *,
+    use_bf16: bool = True,
+) -> tuple[float, float]:
+    assert num_batches > 0
+
+    torch_device = torch.device(device)
+    device_type = torch_device.type
+
+    def make_iterator():
+        return iter_batches(
+            dataset,
+            seq_len,
+            batch_size,
+            pad_index,
+            eot_index=eot_index,
+            sot_index=sot_index,
+        )
+
+    iterator = make_iterator()
+
+    total_loss = torch.tensor(0.0, device=torch_device, dtype=torch.float32)
+    total_entropy = torch.tensor(0.0, device=torch_device, dtype=torch.float32)
+    total_valid_tokens = 0
+
+    model.eval()
+
+    with torch.no_grad():
+        for _ in range(num_batches):
+            try:
+                inputs, masks, targets, _, n_non_pad = next(iterator)
+            except StopIteration:
+                iterator = make_iterator()
+                inputs, masks, targets, _, n_non_pad = next(iterator)
+
+            inputs = inputs.to(torch_device)
+            masks = masks.to(torch_device)
+            targets = targets.to(torch_device)
+
+            with torch.autocast(
+                device_type=device_type, dtype=torch.bfloat16, enabled=use_bf16
+            ):
+                loss, entropy_sum = validation_metrics_step(
+                    model=model,
+                    input_ids=inputs,
+                    mask=masks,
+                    target_ids=targets,
+                    pad_index=pad_index,
+                    reduction="sum",
+                )
+
+            total_loss = total_loss + loss
+            total_entropy = total_entropy + entropy_sum
+            total_valid_tokens += n_non_pad
+
+    return (
+        total_loss.item() / max(total_valid_tokens, 1),
+        total_entropy.item() / max(total_valid_tokens, 1),
+    )
 
 
 def _augment_row(
@@ -190,7 +307,7 @@ def iter_batches(
     tracker: dict | None = None,
     eot_index: int | None = None,
     sot_index: int | None = None,
-) -> Iterator[tuple[Tensor, Tensor, Tensor, int]]:
+) -> Iterator[tuple[Tensor, Tensor, Tensor, int, int]]:
     """Iterate through a pre-tokenized Parquet dataset and yield tensor batches.
 
     For each row, a window of ``seq_len + 1`` tokens slides with the given
@@ -198,9 +315,10 @@ def iter_batches(
     ``(input_ids, mask, target_ids)``.  Short tails are padded with
     *pad_index*.
 
-    Yields ``(inputs, masks, targets, non_pad_count)`` where
-    *non_pad_count* is the total number of valid (non-PAD) tokens in the
-    batch — computed during construction so the caller doesn't need a
+    Yields ``(inputs, masks, targets, tokens, tokens_non_pad)`` where
+    *tokens* is the total number of elements in the batch tensors and
+    *tokens_non_pad* is the number of valid (non-PAD) tokens — both
+    computed during construction so the caller doesn't need a
     GPU-synchronising ``.item()`` call.
 
     Works directly on Arrow's underlying NumPy buffers to avoid the
@@ -313,13 +431,17 @@ def iter_batches(
                         torch.from_numpy(batch_inputs),
                         torch.from_numpy(batch_masks),
                         torch.from_numpy(batch_targets),
+                        batch_size * seq_len,
                         batch_non_pad,
                     )
                     cur = 1 - cur
-                    # Only the mask needs resetting: stale input/target data
-                    # beyond the written L positions is harmless — the mask
-                    # is True (ignored) there and False only where we wrote.
+                    # Reset all buffers: stale target data beyond the
+                    # written L positions would be treated as valid by
+                    # cross_entropy (which ignores only pad_index, not the
+                    # attention mask), inflating the reported loss.
+                    bufs[cur][0].fill(pad_index)
                     bufs[cur][1].fill(True)
+                    bufs[cur][2].fill(pad_index)
                     batch_inputs, batch_masks, batch_targets = bufs[cur]
                     sample_in_batch = 0
                     batch_non_pad = 0
@@ -327,87 +449,3 @@ def iter_batches(
                 pos += stride
 
             row_index += 1
-
-
-@torch.compile
-def validation_metrics_step(
-    model: Model,
-    inputs: Tensor,
-    masks: Tensor,
-    targets: Tensor,
-    pad_index: int,
-):
-    logits: Tensor = model(inputs, masks)
-    flattened_logits = logits.flatten(0, -2)
-    flattened_targets = targets.flatten(0, -1).to(torch.long)
-
-    loss = torch.nn.functional.cross_entropy(
-        flattened_logits,
-        flattened_targets,
-        ignore_index=pad_index,
-    )
-
-    valid_targets = flattened_targets != pad_index
-    log_probs = torch.log_softmax(flattened_logits.float(), dim=-1)
-    entropy_by_token = -(log_probs.exp() * log_probs).sum(dim=-1)
-    valid_weights = valid_targets.to(entropy_by_token.dtype)
-    entropy_sum = (entropy_by_token * valid_weights).sum()
-    valid_token_count = valid_targets.sum()
-
-    return loss, entropy_sum, valid_token_count
-
-
-def compute_validation_metrics(
-    model: Model,
-    dataset: pq.ParquetFile,
-    seq_len: int,
-    batch_size: int,
-    pad_index: int,
-    device: str,
-    num_batches: int = 1,
-    eot_index: int | None = None,
-    sot_index: int | None = None,
-) -> tuple[float, float]:
-    assert num_batches > 0
-
-    total_loss = 0.0
-    total_entropy = 0.0
-    total_valid_tokens = 0
-
-    def make_iterator():
-        return iter_batches(
-            dataset,
-            seq_len,
-            batch_size,
-            pad_index,
-            eot_index=eot_index,
-            sot_index=sot_index,
-        )
-
-    iterator = make_iterator()
-
-    model.eval()
-
-    with torch.no_grad():
-        for _ in range(num_batches):
-            try:
-                inputs, masks, targets, n = next(iterator)
-            except StopIteration:
-                iterator = make_iterator()
-                inputs, masks, targets, n = next(iterator)
-
-            loss, entropy_sum, _ = validation_metrics_step(
-                model,
-                inputs.to(device),
-                masks.to(device),
-                targets.to(device),
-                pad_index=pad_index,
-            )
-
-            total_loss += loss.detach().item() * n
-            total_entropy += entropy_sum.detach().item()
-            total_valid_tokens += n
-
-    return total_loss / max(total_valid_tokens, 1), total_entropy / max(
-        total_valid_tokens, 1
-    )

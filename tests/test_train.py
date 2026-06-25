@@ -3,6 +3,7 @@
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from spargel_llm.train import _augment_row, iter_batches
 
@@ -21,7 +22,7 @@ def _make_parquet(rows: list[list[int]], dataset_id: str = "test") -> pq.Parquet
 
 def _first_batch(*args, **kwargs):
     """Convenience: return (inputs, masks, targets) of the first batch."""
-    inputs, masks, targets, _ = next(iter(iter_batches(*args, **kwargs)))
+    inputs, masks, targets, _, _ = next(iter(iter_batches(*args, **kwargs)))
     return inputs, masks, targets
 
 
@@ -72,7 +73,7 @@ class TestIterBatches:
         pf = _make_parquet([[1, 2, 3, 4], [5, 6, 7, 8]])
         batches = list(iter_batches(pf, seq_len=2, batch_size=3, pad_index=0))
         assert len(batches) == 1
-        inputs, _, _, _ = batches[0]
+        inputs, _, _, _, _ = batches[0]
         # Row 0: pos=0 L=2 [1,2], pos=2 L=1 [3,0]
         # Row 1: pos=0 L=2 [5,6], pos=2 L=1 [7,0] ← discarded
         np.testing.assert_array_equal(inputs, [[1, 2], [3, 0], [5, 6]])
@@ -158,3 +159,139 @@ class TestIterBatches:
         # Tracker ends at last yielded sample: row 1, offset 2
         assert tracker["index"] == 1
         assert tracker["offset"] == 2
+
+    def test_buffer_staleness_after_cycle(self):
+        """Buffer unwritten positions must be pad_index after a full cycle.
+
+        buffer 0 (batch 1) → buffer 1 (batch 2) → buffer 0 (batch 3).
+        If only the mask is reset, batch 3's unwritten positions carry
+        stale real token IDs from batch 1, which cross_entropy would
+        treat as valid targets (it ignores only ``pad_index``, not the
+        attention mask).
+
+        IMPORTANT: ``torch.from_numpy`` tensors share memory with the
+        numpy buffer.  Do **not** collect batches with ``list()`` (3+
+        batches cause the double-buffer to cycle and overwrite earlier
+        tensors).  Verify each batch immediately after yielding.
+        """
+        # batch_size=2, seq_len=4, stride=3, pad_index=0
+        #
+        # Row 0: 8 tokens → aug_len=8
+        #   pos=0: L=min(4,7)=4 → sample 0 (buffer 0)
+        #   pos=3: L=min(4,4)=4 → sample 1, batch 1 YIELD (buffer 0)
+        #   pos=6: L=min(4,1)=1 → sample 0 (buffer 1)
+        #
+        # Row 1: 8 tokens → aug_len=8
+        #   pos=0: L=min(4,7)=4 → sample 1, batch 2 YIELD (buffer 1)
+        #   pos=3: L=min(4,4)=4 → sample 0 (buffer 0 — REUSED)
+        #   pos=6: L=min(4,1)=1 → sample 1, batch 3 YIELD (buffer 0)
+        #
+        # Batch 3 sample 1 writes only 1 position (L=1).  Without the
+        # fix targets[1, 1:] = [6, 7, 8] (stale from batch 1 sample 1).
+        pf = _make_parquet(
+            [
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                [10, 20, 30, 40, 50, 60, 70, 80],
+            ]
+        )
+
+        it = iter_batches(pf, seq_len=4, batch_size=2, pad_index=0, stride=3)
+
+        # Batch 1 (buffer 0): Row 0 pos=0 L=4, pos=3 L=4
+        inputs_1, _, targets_1, _, n_non_pad_1 = next(it)
+        np.testing.assert_array_equal(inputs_1[0], [1, 2, 3, 4])
+        np.testing.assert_array_equal(targets_1[0], [2, 3, 4, 5])
+        np.testing.assert_array_equal(inputs_1[1], [4, 5, 6, 7])
+        np.testing.assert_array_equal(targets_1[1], [5, 6, 7, 8])
+        assert n_non_pad_1 == 8
+
+        # Batch 2 (buffer 1): Row 0 pos=6 L=1, Row 1 pos=0 L=4
+        inputs_2, _, targets_2, _, n_non_pad_2 = next(it)
+        np.testing.assert_array_equal(inputs_2[0], [7, 0, 0, 0])
+        np.testing.assert_array_equal(targets_2[0], [8, 0, 0, 0])
+        np.testing.assert_array_equal(inputs_2[1], [10, 20, 30, 40])
+        np.testing.assert_array_equal(targets_2[1], [20, 30, 40, 50])
+        assert n_non_pad_2 == 5
+
+        # Batch 3 (buffer 0 reused): Row 1 pos=3 L=4, pos=6 L=1
+        inputs_3, masks_3, targets_3, _, n_non_pad_3 = next(it)
+        np.testing.assert_array_equal(inputs_3[0], [40, 50, 60, 70])
+        np.testing.assert_array_equal(targets_3[0], [50, 60, 70, 80])
+        np.testing.assert_array_equal(inputs_3[1], [70, 0, 0, 0])
+        np.testing.assert_array_equal(targets_3[1], [80, 0, 0, 0])
+        assert n_non_pad_3 == 5
+
+        # non-pad count must match the actual count in targets
+        non_pad_in_targets = (targets_3 != 0).sum().item()
+        assert n_non_pad_3 == non_pad_in_targets, (
+            f"n_non_pad ({n_non_pad_3}) != actual non-pad in targets "
+            f"({non_pad_in_targets}) — stale buffer data leaked"
+        )
+
+        # Masks must be False exactly where data was written
+        np.testing.assert_array_equal(masks_3[0], [False, False, False, False])
+        np.testing.assert_array_equal(masks_3[1], [False, True, True, True])
+
+        # No more batches expected
+        with pytest.raises(StopIteration):
+            next(it)
+
+    def test_all_batches_have_consistent_token_counts(self):
+        """Every yielded batch must have n_non_pad == count(targets != pad)."""
+        pf = _make_parquet(
+            [
+                [1, 2, 3, 4, 5],
+                [6, 7],
+                [8, 9, 10, 11, 12, 13, 14],
+            ]
+        )
+        for inputs, masks, targets, tokens, n_non_pad in iter_batches(
+            pf, seq_len=3, batch_size=3, pad_index=0, stride=2
+        ):
+            assert tokens == inputs.numel(), "tokens must equal total elements"
+            actual_non_pad = (targets != 0).sum().item()
+            assert n_non_pad == actual_non_pad, (
+                f"n_non_pad={n_non_pad} != actual={actual_non_pad}; "
+                f"targets=\n{targets}"
+            )
+
+    def test_all_batches_have_consistent_masks(self):
+        """Mask must be False exactly where targets != pad_index."""
+        pf = _make_parquet(
+            [
+                [1, 2, 3, 4, 5],
+                [6, 7],
+                [8, 9, 10, 11, 12, 13, 14],
+            ]
+        )
+        for _, masks, targets, _, _ in iter_batches(
+            pf, seq_len=3, batch_size=3, pad_index=0, stride=2
+        ):
+            np.testing.assert_array_equal(
+                masks.numpy(),
+                targets.numpy() == 0,
+                err_msg="mask must be True (ignored) where target is pad_index",
+            )
+
+    def test_many_buffer_cycles(self):
+        """Exercise many buffer cycles to flush out any corner cases.
+
+        Verifies that every yielded batch has consistent n_non_pad and
+        mask-vs-targets values.  Processes batches as yielded — do not
+        ``list()``-collect since tensors share memory with the buffer.
+        """
+        rows = [[i % 100 + 1] * 20 for i in range(100)]
+        pf = _make_parquet(rows)
+        count = 0
+        for inputs, masks, targets, tokens, n_non_pad in iter_batches(
+            pf, seq_len=4, batch_size=4, pad_index=0, stride=3
+        ):
+            assert tokens == inputs.numel()
+            actual = (targets != 0).sum().item()
+            assert n_non_pad == actual, f"n_non_pad={n_non_pad} != actual={actual}"
+            np.testing.assert_array_equal(
+                masks.numpy(),
+                targets.numpy() == 0,
+            )
+            count += 1
+        assert count > 10, f"expected >10 batches, got {count}"

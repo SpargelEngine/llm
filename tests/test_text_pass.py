@@ -1372,7 +1372,9 @@ class TestChainPassInstance:
     def test_chain_mixed_sources(self):
         a = StripPass(name="strip").build(".")
         b = (
-            TextPassList.model_validate({"passes": [{"name": "split", "separator": "\n"}]})
+            TextPassList.model_validate(
+                {"passes": [{"name": "split", "separator": "\n"}]}
+            )
             .passes[0]
             .build(".")
         )
