@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from tqdm import tqdm
 
 
 def resolve_index(idx: int, total: int) -> int:
@@ -59,6 +60,13 @@ def get_dataset_id(pf: pq.ParquetFile) -> str:
     return metadata.get(b"dataset_id", b"").decode()
 
 
+def with_new_dataset_id(schema: pa.Schema) -> pa.Schema:
+    """Return a copy of *schema* with a fresh ``dataset_id`` in its metadata."""
+    meta = dict(schema.metadata or {})
+    meta[b"dataset_id"] = uuid4().hex.encode()
+    return schema.with_metadata(meta)
+
+
 def make_text_schema() -> pa.Schema:
     """Create the standard schema for a texts Parquet file."""
     schema = pa.schema([pa.field("text", pa.string())])
@@ -69,3 +77,28 @@ def make_tokens_schema() -> pa.Schema:
     """Create the standard schema for a tokens Parquet file."""
     schema = pa.schema([pa.field("tokens", pa.list_(pa.uint32()))])
     return schema.with_metadata({"dataset_id": uuid4().hex})
+
+
+def concat_parquet_files(
+    input_paths: list[str], output_path: str, show_progress: bool = True
+) -> int:
+    """Concatenate multiple Parquet files into one.
+
+    A fresh dataset ID is written to *output_path*.
+
+    Returns the total number of rows written.
+    """
+    first = pq.ParquetFile(input_paths[0])
+    schema = with_new_dataset_id(first.schema_arrow)
+    with pq.ParquetWriter(output_path, schema, compression="zstd") as writer:
+        total = 0
+        iterator = input_paths
+        if show_progress:
+            iterator = tqdm(iterator, desc="concat")
+        for path in iterator:
+            pf = pq.ParquetFile(path)
+            for rg_idx in range(pf.metadata.num_row_groups):
+                table = pf.read_row_group(rg_idx)
+                writer.write_table(table)
+                total += table.num_rows
+    return total

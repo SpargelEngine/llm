@@ -293,47 +293,42 @@ def log_step_callback(
 #### actions ####
 
 
-def action_info(path: StrOrPath):
+def action_dump_param(path: StrOrPath):
     project_info = load_project(path)
+    model_state_file = resolve_parent(path) / project_info.model_state_file
 
-    log_info("==== Project Info ====")
-    print("Project file:", path)
-    rich_print(project_info)
+    device = "cpu"
+    model = Model(project_info.config).to(device)
+    log_info("Loading model state.")
+    load_model_state(model_state_file, model, device=device)
+
+    for name, param in model.named_parameters():
+        print(f"==== {name} ====")
+        print(param)
 
 
-def action_init(path: StrOrPath):
-    config = Config(
-        vocab_size=8192,
-        max_seq_len=4096,
-        num_layer=4,
-        num_head=4,
-        dim=256,
-        dim_key=64,
-        dim_value=64,
-        dim_ff_hidden=1024,
-        use_rope=True,
-        ff_activation="relu",
-    )
+def action_embed(
+    path: StrOrPath,
+    tensorboard_dir: str,
+    *,
+    layer: str = "embedding",
+    device: str = "cpu",
+):
+    project_info = load_project(path)
+    model_state_file = resolve_parent(path) / project_info.model_state_file
+    tokenizer_file = resolve_parent(path) / project_info.tokenizer
 
-    model_state_file = "model_state.pth"
-    tokenizer = "tokenizer.json"
+    model = Model(project_info.config).to(device)
+    log_info("Loading model state.")
+    load_model_state(model_state_file, model, device=device)
 
-    project_info = ProjectInfo(
-        config=config,
-        model_state_file=model_state_file,
-        tokenizer=tokenizer,
-        train_info=TrainInfo(),
-        train_config=TrainConfig(
-            seq_len=0,
-            batch_size=0,
-            learning_rate=1e-3,
-            weight_decay=0.1,
-            optimizer_state_file="optimizer_state.pth",
-        ),
-    )
+    tokenizer = load_tokenizer(tokenizer_file)
 
-    save_project(path, project_info)
-    log_success(f"Initialized project at {path}.")
+    log_info("Opening TensorBoard writer.")
+    writer = SummaryWriter(tensorboard_dir)
+    writer_add_embedding(writer, model, tokenizer, layer=layer, device=device)
+    writer.close()
+    log_success(f"Embedding projection written to {tensorboard_dir}.")
 
 
 def action_gen(
@@ -467,6 +462,87 @@ def action_gen(
 
     if dump_f is not None:
         dump_f.close()
+
+
+def action_graph(
+    path: StrOrPath, tensorboard_dir: str, seq_len: int, *, device: str = "cpu"
+):
+    project_info = load_project(path)
+    model_state_file = resolve_parent(path) / project_info.model_state_file
+
+    model = Model(project_info.config).to(device)
+    log_info("Loading model state.")
+    load_model_state(model_state_file, model, device=device)
+
+    log_info("Opening TensorBoard writer.")
+    writer = SummaryWriter(tensorboard_dir)
+    writer_add_graph(writer, model, seq_len=seq_len, device=device)
+    writer.close()
+    log_success(f"Model graph written to {tensorboard_dir}.")
+
+
+def action_info(path: StrOrPath):
+    project_info = load_project(path)
+
+    log_info("==== Project Info ====")
+    print("Project file:", path)
+    rich_print(project_info)
+
+
+def action_init(path: StrOrPath):
+    config = Config(
+        vocab_size=8192,
+        max_seq_len=4096,
+        num_layer=4,
+        num_head=4,
+        dim=256,
+        dim_key=64,
+        dim_value=64,
+        dim_ff_hidden=1024,
+        use_rope=True,
+        ff_activation="relu",
+    )
+
+    model_state_file = "model_state.pth"
+    tokenizer = "tokenizer.json"
+
+    project_info = ProjectInfo(
+        config=config,
+        model_state_file=model_state_file,
+        tokenizer=tokenizer,
+        train_info=TrainInfo(),
+        train_config=TrainConfig(
+            seq_len=0,
+            batch_size=0,
+            learning_rate=1e-3,
+            weight_decay=0.1,
+            optimizer_state_file="optimizer_state.pth",
+        ),
+    )
+
+    save_project(path, project_info)
+    log_success(f"Initialized project at {path}.")
+
+
+def action_model_init(path: StrOrPath):
+    project_info = load_project(path)
+    model_state_file = resolve_parent(path) / project_info.model_state_file
+    train_config = project_info.train_config
+    optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
+
+    model = Model(project_info.config)
+    save_model_state(model_state_file, model)
+    log_success(f"Initialized model state at {model_state_file}.")
+
+    optimizer = create_optimizer(
+        model, train_config.learning_rate, train_config.weight_decay
+    )
+    save_optimizer_state(optimizer_state_file, optimizer)
+    log_success(f"Initialized optimizer state at {optimizer_state_file}.")
+
+    project_info.train_info = TrainInfo()
+
+    save_project(path, project_info)
 
 
 def action_train(
@@ -715,82 +791,6 @@ def action_train(
         writer.close()
 
 
-def action_model_init(path: StrOrPath):
-    project_info = load_project(path)
-    model_state_file = resolve_parent(path) / project_info.model_state_file
-    train_config = project_info.train_config
-    optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
-
-    model = Model(project_info.config)
-    save_model_state(model_state_file, model)
-    log_success(f"Initialized model state at {model_state_file}.")
-
-    optimizer = create_optimizer(
-        model, train_config.learning_rate, train_config.weight_decay
-    )
-    save_optimizer_state(optimizer_state_file, optimizer)
-    log_success(f"Initialized optimizer state at {optimizer_state_file}.")
-
-    project_info.train_info = TrainInfo()
-
-    save_project(path, project_info)
-
-
-def action_graph(
-    path: StrOrPath, tensorboard_dir: str, seq_len: int, *, device: str = "cpu"
-):
-    project_info = load_project(path)
-    model_state_file = resolve_parent(path) / project_info.model_state_file
-
-    model = Model(project_info.config).to(device)
-    log_info("Loading model state.")
-    load_model_state(model_state_file, model, device=device)
-
-    log_info("Opening TensorBoard writer.")
-    writer = SummaryWriter(tensorboard_dir)
-    writer_add_graph(writer, model, seq_len=seq_len, device=device)
-    writer.close()
-    log_success(f"Model graph written to {tensorboard_dir}.")
-
-
-def action_dump_param(path: StrOrPath):
-    project_info = load_project(path)
-    model_state_file = resolve_parent(path) / project_info.model_state_file
-
-    device = "cpu"
-    model = Model(project_info.config).to(device)
-    log_info("Loading model state.")
-    load_model_state(model_state_file, model, device=device)
-
-    for name, param in model.named_parameters():
-        print(f"==== {name} ====")
-        print(param)
-
-
-def action_embed(
-    path: StrOrPath,
-    tensorboard_dir: str,
-    *,
-    layer: str = "embedding",
-    device: str = "cpu",
-):
-    project_info = load_project(path)
-    model_state_file = resolve_parent(path) / project_info.model_state_file
-    tokenizer_file = resolve_parent(path) / project_info.tokenizer
-
-    model = Model(project_info.config).to(device)
-    log_info("Loading model state.")
-    load_model_state(model_state_file, model, device=device)
-
-    tokenizer = load_tokenizer(tokenizer_file)
-
-    log_info("Opening TensorBoard writer.")
-    writer = SummaryWriter(tensorboard_dir)
-    writer_add_embedding(writer, model, tokenizer, layer=layer, device=device)
-    writer.close()
-    log_success(f"Embedding projection written to {tensorboard_dir}.")
-
-
 #### main ####
 
 
@@ -816,13 +816,22 @@ def create_parser() -> ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="action", help="actions", required=True)
 
-    # info
-    info_parser = subparsers.add_parser("info", help="show info")
-    info_parser.add_argument("path", help="project file")
+    # dump_param
+    dump_param_parser = subparsers.add_parser("dump_param", help="dump parameters")
+    dump_param_parser.add_argument("path", help="project file")
 
-    # init
-    init_parser = subparsers.add_parser("init", help="initialize a new project")
-    init_parser.add_argument("path", help="project file")
+    # embed
+    embed_parser = subparsers.add_parser(
+        "embed", help="write embedding projection to TensorBoard"
+    )
+    embed_parser.add_argument("path", help="project file")
+    embed_parser.add_argument("tensorboard_dir", help="TensorBoard write directory")
+    embed_parser.add_argument(
+        "--layer",
+        choices=("embedding", "head", "both"),
+        default="embedding",
+        help="token vectors to visualize (default: embedding)",
+    )
 
     # gen
     gen_parser = subparsers.add_parser("gen", help="generate text")
@@ -869,6 +878,31 @@ def create_parser() -> ArgumentParser:
         default=None,
         help="random seed for reproducibility (randomly generated if not specified)",
     )
+
+    # graph
+    graph_parser = subparsers.add_parser(
+        "graph", help="write model graph to TensorBoard"
+    )
+    graph_parser.add_argument("path", help="project file")
+    graph_parser.add_argument("tensorboard_dir", help="TensorBoard write directory")
+    graph_parser.add_argument(
+        "seq_len", type=int, help="sequence length for dummy input"
+    )
+
+    # info
+    info_parser = subparsers.add_parser("info", help="show info")
+    info_parser.add_argument("path", help="project file")
+
+    # init
+    init_parser = subparsers.add_parser("init", help="initialize a new project")
+    init_parser.add_argument("path", help="project file")
+
+    # model_init
+    model_init_parser = subparsers.add_parser(
+        "model_init",
+        help="initialize model accroding to configuration and fill with random weights",
+    )
+    model_init_parser.add_argument("path", help="project file")
 
     # train
     train_parser = subparsers.add_parser("train", help="train model")
@@ -944,40 +978,6 @@ def create_parser() -> ArgumentParser:
         help="disable bfloat16 autocast (useful for CPU or consumer GPUs that don't support bf16)",
     )
 
-    # model_init
-    model_init_parser = subparsers.add_parser(
-        "model_init",
-        help="initialize model accroding to configuration and fill with random weights",
-    )
-    model_init_parser.add_argument("path", help="project file")
-
-    # embed
-    embed_parser = subparsers.add_parser(
-        "embed", help="write embedding projection to TensorBoard"
-    )
-    embed_parser.add_argument("path", help="project file")
-    embed_parser.add_argument("tensorboard_dir", help="TensorBoard write directory")
-    embed_parser.add_argument(
-        "--layer",
-        choices=("embedding", "head", "both"),
-        default="embedding",
-        help="token vectors to visualize (default: embedding)",
-    )
-
-    # graph
-    graph_parser = subparsers.add_parser(
-        "graph", help="write model graph to TensorBoard"
-    )
-    graph_parser.add_argument("path", help="project file")
-    graph_parser.add_argument("tensorboard_dir", help="TensorBoard write directory")
-    graph_parser.add_argument(
-        "seq_len", type=int, help="sequence length for dummy input"
-    )
-
-    # param
-    dump_param_parser = subparsers.add_parser("dump_param", help="dump parameters")
-    dump_param_parser.add_argument("path", help="project file")
-
     return parser
 
 
@@ -1004,10 +1004,12 @@ def main():
         torch.set_float32_matmul_precision(args.float32_precision)
 
     match args.action:
-        case "info":
-            action_info(args.path)
-        case "init":
-            action_init(args.path)
+        case "dump_param":
+            action_dump_param(args.path)
+        case "embed":
+            action_embed(
+                args.path, args.tensorboard_dir, layer=args.layer, device=device
+            )
         case "gen":
             action_gen(
                 args.path,
@@ -1023,6 +1025,14 @@ def main():
                 dump_file=args.dump_file,
                 random_seed=args.random_seed,
             )
+        case "graph":
+            action_graph(args.path, args.tensorboard_dir, args.seq_len, device=device)
+        case "info":
+            action_info(args.path)
+        case "init":
+            action_init(args.path)
+        case "model_init":
+            action_model_init(args.path)
         case "train":
             action_train(
                 args.path,
@@ -1045,16 +1055,6 @@ def main():
                 loop_dataset=args.loop_dataset,
                 use_bf16=not args.no_bf16,
             )
-        case "model_init":
-            action_model_init(args.path)
-        case "embed":
-            action_embed(
-                args.path, args.tensorboard_dir, layer=args.layer, device=device
-            )
-        case "graph":
-            action_graph(args.path, args.tensorboard_dir, args.seq_len, device=device)
-        case "dump_param":
-            action_dump_param(args.path)
         case _:
             raise ValueError(f"unrecognized action: {args.action}")
 
