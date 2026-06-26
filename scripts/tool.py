@@ -20,7 +20,7 @@ from torch.optim import AdamW, Optimizer
 from torch.utils.tensorboard import SummaryWriter
 
 from spargel_llm.logging import log_info, log_success, log_warning
-from spargel_llm.model import Config, Model
+from spargel_llm.model import Config, Model, compute_param_counts
 from spargel_llm.parquet_utils import get_dataset_id
 from spargel_llm.train import (
     StepInfo,
@@ -489,6 +489,13 @@ def action_info(path: StrOrPath):
     log_info("==== Project Info ====")
     print("Project file:", path)
     rich_print(project_info)
+
+    embedding_params, body_params = compute_param_counts(project_info.config)
+    total = embedding_params + body_params
+    log_info("==== Parameter Counts ====")
+    print(f"Embedding (in+out): {embedding_params:,}")
+    print(f"Body (transformer):  {body_params:,}")
+    print(f"Total:               {total:,}")
 
 
 def action_init(path: StrOrPath):
