@@ -10,7 +10,7 @@ from pydantic import BaseModel, NonNegativeFloat, NonNegativeInt
 from torch import Tensor
 from torch.optim import Optimizer
 
-from .model import Model
+from .model import Config, Model, compute_param_counts
 
 type Reduction = Literal["mean", "sum"]
 
@@ -449,3 +449,87 @@ def iter_batches(
                 pos += stride
 
             row_index += 1
+
+
+def estimate_memory(
+    config: Config,
+    *,
+    seq_len: int,
+    micro_batch_size: int,
+    use_bf16: bool = True,
+) -> dict:
+    """Estimate peak GPU memory required for training.
+
+    Covers model weights (fp32), gradients (fp32), AdamW optimizer state
+    (fp32 momentum + variance), and per-micro-batch activations.
+    Returns a breakdown in bytes.
+    """
+    embedding_params, body_params = compute_param_counts(config)
+    total_params = embedding_params + body_params
+
+    # fp32 master weights
+    model_mem = total_params * 4
+
+    # fp32 gradients
+    grad_mem = total_params * 4
+
+    # AdamW: fp32 momentum + fp32 variance
+    optim_mem = total_params * 8
+
+    B = micro_batch_size
+    S = seq_len
+    H = config.num_head
+    D = config.dim
+    d_k = config.dim_key
+    d_v = config.dim_value
+    d_ff = config.dim_ff_hidden
+    n_layer = config.num_layer
+
+    # Most activations stay in BF16 (2 bytes) under autocast;
+    # attention softmax outputs are typically fp32 (4 bytes).
+    act_bytes = 2 if use_bf16 else 4
+
+    # Embedding lookup output
+    embed_act = B * S * D * act_bytes
+
+    # Per transformer block activations saved for backward:
+    #   norm1 input (residual)         B*S*D
+    #   Q, K, V                        3 * B*H*S*d_k
+    #   attention softmax output       B*H*S*S  (fp32)
+    #   pre-W_o (attention output)     B*H*S*d_v
+    #   post-W_o (residual)            B*S*D
+    #   norm2 input (residual)         B*S*D
+    #   FF hidden (post-activation)    B*S*d_ff
+    attn_score_bytes = 4  # softmax upcasts to fp32
+    per_block = (
+        B * S * D * act_bytes
+        + 3 * B * H * S * d_k * act_bytes
+        + B * H * S * S * attn_score_bytes
+        + B * H * S * d_v * act_bytes
+        + B * S * D * act_bytes
+        + B * S * D * act_bytes
+        + B * S * d_ff * act_bytes
+    )
+
+    all_blocks = n_layer * per_block
+
+    # LM head logits (fp32 for cross-entropy)
+    logit_act = B * S * config.vocab_size * 4
+
+    peak_act = embed_act + all_blocks + logit_act
+
+    # ~10 % for framework, CUDA context, allocator fragmentation
+    overhead = 1.1
+
+    total = int((model_mem + grad_mem + optim_mem + peak_act) * overhead)
+
+    return {
+        "total_params": total_params,
+        "embedding_params": embedding_params,
+        "body_params": body_params,
+        "model_mem": model_mem,
+        "grad_mem": grad_mem,
+        "optim_mem": optim_mem,
+        "activation_mem": int(peak_act),
+        "total": total,
+    }

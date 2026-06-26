@@ -26,6 +26,7 @@ from spargel_llm.train import (
     StepInfo,
     TrainInfo,
     compute_validation_metrics,
+    estimate_memory,
     generate_step,
     iter_batches,
     train,
@@ -193,6 +194,53 @@ def writer_add_embedding(
 def always_true():
     while True:
         yield True
+
+
+def _report_memory_estimate(
+    result: dict,
+    seq_len: int,
+    batch_size: int,
+    micro_batches: int,
+    use_bf16: bool,
+) -> None:
+    """Print a human-readable GPU memory estimate."""
+    dtype_label = "BF16" if use_bf16 else "FP32"
+    log_info("==== Memory Estimate ====")
+    print(
+        f"Parameters:  {result['total_params']:,} "
+        f"(embedding: {result['embedding_params']:,}, "
+        f"body: {result['body_params']:,})"
+    )
+    print(f"Precision:   {dtype_label} activations, FP32 master weights")
+    print(
+        f"Batch size:  {batch_size} (micro_batch_size={batch_size // micro_batches}"
+        f"{' x ' + str(micro_batches) + ' micro-batches' if micro_batches > 1 else ''})"
+    )
+    print(f"Seq length:  {seq_len}")
+    print()
+
+    def fmt_mib(b: int) -> str:
+        return f"{b / (1024 * 1024):,.1f} MiB"
+
+    def fmt_gib(b: int) -> str:
+        return f"{b / (1024 * 1024 * 1024):,.2f} GiB"
+
+    print(
+        f"  Model weights:     {fmt_mib(result['model_mem']):>10s}  ({fmt_gib(result['model_mem'])})"
+    )
+    print(
+        f"  Gradients:         {fmt_mib(result['grad_mem']):>10s}  ({fmt_gib(result['grad_mem'])})"
+    )
+    print(
+        f"  Optimizer (AdamW): {fmt_mib(result['optim_mem']):>10s}  ({fmt_gib(result['optim_mem'])})"
+    )
+    print(
+        f"  Activations:       {fmt_mib(result['activation_mem']):>10s}  ({fmt_gib(result['activation_mem'])})"
+    )
+    print("  ─────────────────────────────")
+    print(
+        f"  Estimated total:   {fmt_mib(result['total']):>10s}  ({fmt_gib(result['total'])})"
+    )
 
 
 def log_step_callback(
@@ -572,9 +620,10 @@ def action_train(
     start_offset: Optional[int] = None,
     add_eot: bool = False,
     add_sot: bool = False,
-    gradient_accumulation_steps: Optional[int] = None,
+    micro_batches: Optional[int] = None,
     loop_dataset: bool = False,
     use_bf16: bool = True,
+    estimate: bool = False,
 ):
     assert log_period > 0
 
@@ -602,7 +651,7 @@ def action_train(
     assert batch_size > 0
     learning_rate = _apply("learning_rate", learning_rate)
     weight_decay = _apply("weight_decay", weight_decay)
-    micro_batches = _apply("micro_batches", gradient_accumulation_steps) or 1
+    micro_batches = _apply("micro_batches", micro_batches) or 1
     assert micro_batches >= 1
     assert batch_size % micro_batches == 0, (
         f"batch_size ({batch_size}) must be divisible by "
@@ -610,6 +659,16 @@ def action_train(
     )
 
     micro_batch_size = batch_size // micro_batches
+
+    if estimate:
+        result = estimate_memory(
+            project_info.config,
+            seq_len=seq_len,
+            micro_batch_size=micro_batch_size,
+            use_bf16=use_bf16,
+        )
+        _report_memory_estimate(result, seq_len, batch_size, micro_batches, use_bf16)
+        return
 
     # data
 
@@ -951,21 +1010,21 @@ def create_parser() -> ArgumentParser:
         help="initial window offset for the first sample (default: read from project)",
     )
     train_parser.add_argument(
-        "--eot",
-        action="store_true",
-        help="append EOT to each training/validation text (effective length +1)",
-    )
-    train_parser.add_argument(
         "--sot",
         action="store_true",
         help="prepend SOT to each training/validation text (effective length +1)",
+    )
+    train_parser.add_argument(
+        "--eot",
+        action="store_true",
+        help="append EOT to each training/validation text (effective length +1)",
     )
     train_parser.add_argument(
         "-mb",
         "--micro-batches",
         type=int,
         default=None,
-        dest="gradient_accumulation_steps",
+        dest="micro_batches",
         help="split each step into N micro-batches with accumulated gradients (default: 1)",
     )
     train_parser.add_argument(
@@ -986,6 +1045,11 @@ def create_parser() -> ArgumentParser:
         "--no-bf16",
         action="store_true",
         help="disable bfloat16 autocast (useful for CPU or consumer GPUs that don't support bf16)",
+    )
+    train_parser.add_argument(
+        "--estimate",
+        action="store_true",
+        help="estimate and report GPU memory required for training, then exit without training",
     )
 
     return parser
@@ -1061,9 +1125,10 @@ def main():
                 start_offset=args.start_offset,
                 add_eot=args.eot,
                 add_sot=args.sot,
-                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                micro_batches=args.micro_batches,
                 loop_dataset=args.loop_dataset,
                 use_bf16=not args.no_bf16,
+                estimate=args.estimate,
             )
         case _:
             raise ValueError(f"unrecognized action: {args.action}")
