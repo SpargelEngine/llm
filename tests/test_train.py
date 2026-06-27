@@ -5,7 +5,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from spargel_llm.train import _augment_row, iter_batches
+from spargel_llm.train import TrainTracker, _augment_row, iter_batches
 
 
 def _make_parquet(rows: list[list[int]], dataset_id: str = "test") -> pq.ParquetFile:
@@ -157,7 +157,7 @@ class TestIterBatches:
 
     def test_tracker(self):
         pf = _make_parquet([[1, 2, 3, 4], [5, 6, 7, 8]])
-        tracker = {}
+        tracker = TrainTracker(index=0, offset=0)
         list(
             iter_batches(
                 pf,
@@ -171,8 +171,8 @@ class TestIterBatches:
         # Row 0, pos=0; Row 0, pos=2 → batch 0 (yielded)
         # Row 1, pos=0; Row 1, pos=2 → batch 1 (yielded)
         # Tracker ends at last yielded sample: row 1, offset 2
-        assert tracker["index"] == 1
-        assert tracker["offset"] == 2
+        assert tracker.index == 1
+        assert tracker.offset == 2
 
     def test_buffer_staleness_after_cycle(self):
         """Buffer unwritten positions must be pad_index after a full cycle.

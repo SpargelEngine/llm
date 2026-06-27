@@ -27,6 +27,7 @@ from spargel_llm.parquet_utils import get_dataset_id
 from spargel_llm.train import (
     StepInfo,
     TrainInfo,
+    TrainTracker,
     compute_validation_metrics,
     generate_step,
     iter_batches,
@@ -74,6 +75,7 @@ class LogState:
     sum_time: float = 0.0
     tokens: int = 0
     tokens_non_pad: int = 0
+    val_exhausted_warned: bool = False
 
 
 #### load/store helper functions ####
@@ -203,7 +205,6 @@ def estimate_memory(
     seq_len: int,
     micro_batch_size: int,
     use_bf16: bool = True,
-    overhead: float = 1.2,
 ) -> dict:
     """Estimate peak GPU memory required for training.
 
@@ -265,7 +266,7 @@ def estimate_memory(
 
     peak_act = embed_act + all_blocks + logit_act
 
-    total = int((model_mem + grad_mem + optim_mem + peak_act) * overhead)
+    total = int(model_mem + grad_mem + optim_mem + peak_act)
 
     return {
         "total_params": total_params,
@@ -285,7 +286,6 @@ def _report_memory_estimate(
     batch_size: int,
     micro_batches: int,
     use_bf16: bool,
-    overhead: float,
 ) -> None:
     """Print a human-readable GPU memory estimate."""
     dtype_label = "BF16" if use_bf16 else "FP32"
@@ -301,7 +301,6 @@ def _report_memory_estimate(
         f"{' x ' + str(micro_batches) + ' micro-batches' if micro_batches > 1 else ''})"
     )
     print(f"Seq length:  {seq_len}")
-    print(f"Overhead:    {overhead}")
     print()
 
     def fmt_mib(b: int) -> str:
@@ -369,7 +368,7 @@ def log_step_callback(
         if val_dataset is not None:
             t_val_start = time.perf_counter()
 
-            val_metrics = compute_validation_metrics(
+            val_loss, val_entropy, val_actual = compute_validation_metrics(
                 model=model,
                 dataset=val_dataset,
                 seq_len=seq_len,
@@ -381,6 +380,15 @@ def log_step_callback(
                 sot_index=sot_index,
                 use_bf16=use_bf16,
             )
+
+            if val_actual < val_batches and not state.val_exhausted_warned:
+                log_warning(
+                    f"Validation dataset exhausted early "
+                    f"({val_actual}/{val_batches} batches)."
+                )
+                state.val_exhausted_warned = True
+
+            val_metrics = (val_loss, val_entropy)
 
             if device == "cuda":
                 torch.cuda.synchronize()
@@ -709,20 +717,17 @@ def action_train(
     loop_dataset: bool = False,
     use_bf16: bool = True,
     estimate: bool = False,
-    overhead: float = 1.2,
 ):
     assert log_period > 0
+
+    # === Load project & resolve paths ===
 
     project_info = load_project(path)
     model_state_file = resolve_parent(path) / project_info.model_state_file
     train_config = project_info.train_config
     optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
 
-    # Optimizer state (momentum, etc.) depends on the effective batch size —
-    # reset whenever it changes.
-    new_bs = batch_size if batch_size is not None else train_config.batch_size
-    prev_bs = train_config.batch_size
-    should_reset_optimizer = new_bs != prev_bs
+    # === Parse & validate configuration ===
 
     def _apply[T](attr: str, value: T | None) -> T:
         if value is not None:
@@ -733,8 +738,12 @@ def action_train(
 
     seq_len = _apply("seq_len", seq_len)
     assert seq_len > 0
+
+    prev_batch_size = train_config.batch_size
     batch_size = _apply("batch_size", batch_size)
     assert batch_size > 0
+    should_reset_optimizer = batch_size != prev_batch_size
+
     learning_rate = _apply("learning_rate", learning_rate)
     weight_decay = _apply("weight_decay", weight_decay)
     micro_batches = _apply("micro_batches", micro_batches) or 1
@@ -752,11 +761,8 @@ def action_train(
             seq_len=seq_len,
             micro_batch_size=micro_batch_size,
             use_bf16=use_bf16,
-            overhead=overhead,
         )
-        _report_memory_estimate(
-            result, seq_len, batch_size, micro_batches, use_bf16, overhead
-        )
+        _report_memory_estimate(result, seq_len, batch_size, micro_batches, use_bf16)
         tokens_per_step = seq_len * batch_size
         total_tokens = tokens_per_step * steps
         log_info("==== Token Throughput ====")
@@ -764,12 +770,11 @@ def action_train(
         print(f"Total tokens ({steps} steps): {total_tokens:,}")
         return
 
-    # data
+    # === Load training data ===
 
     log_info("Loading training dataset.")
     dataset = load_dataset(data_path)
 
-    # detect dataset replacement
     new_id = get_dataset_id(dataset)
     old_id = project_info.train_info.dataset_id
     if new_id and new_id != old_id:
@@ -780,7 +785,6 @@ def action_train(
             project_info.train_info.offset = 0
         project_info.train_info.dataset_id = new_id
 
-    # start position: CLI args override TrainInfo
     if start_index is None:
         start_index = project_info.train_info.index
     if start_offset is None:
@@ -791,7 +795,9 @@ def action_train(
     eot_index = EOT if add_eot else None
     sot_index = SOT if add_sot else None
 
-    train_tracker: dict = {"index": start_index, "offset": start_offset}
+    # Mutable state shared between iter_batches (writes progress),
+    # save() (reads progress), and the exhaustion-reset path below.
+    train_tracker = TrainTracker(index=start_index, offset=start_offset)
 
     def make_iterator():
         return iter_batches(
@@ -806,6 +812,8 @@ def action_train(
             sot_index=sot_index,
         )
 
+    # === Load validation data ===
+
     if val_batches is None:
         val_batches = max(log_period // 10, 1)
     val_dataset = None
@@ -813,13 +821,13 @@ def action_train(
         log_info("Loading validation dataset.")
         val_dataset = load_dataset(val_path)
 
-    # model
+    # === Build model ===
 
     model = Model(project_info.config).to(device)
     log_info("Loading model state.")
     load_model_state(model_state_file, model, device=device)
 
-    # optimizer
+    # === Build optimizer ===
 
     optimizer = create_optimizer(model, learning_rate, weight_decay)
     if should_reset_optimizer:
@@ -830,8 +838,6 @@ def action_train(
     else:
         log_info("Optimizer state file not found, using fresh optimizer.")
 
-    log_info(f"Use BF16: {use_bf16}")
-
     if use_bf16 and device == "cpu":
         log_warning(
             "BF16 is enabled but the device is CPU. "
@@ -839,23 +845,17 @@ def action_train(
             "Use -n16 / --no-bf16 to disable BF16."
         )
 
-    # TensorBoard
+    # === TensorBoard writer ===
 
     writer = None
     if tensorboard_dir is not None:
-        log_info("Opening TensorBoard writer.")
         writer = SummaryWriter(tensorboard_dir)
 
-    # helper functions
-
-    def log_important(msg: str):
-        log_info(msg)
-        if writer is not None:
-            writer.add_text("train/log", msg, project_info.train_info.token_count)
+    # === Helper functions ===
 
     def save():
-        project_info.train_info.index = train_tracker["index"]
-        project_info.train_info.offset = train_tracker["offset"]
+        project_info.train_info.index = train_tracker.index
+        project_info.train_info.offset = train_tracker.offset
         log_info(f"Saving. (train_info: {project_info.train_info})")
         save_project(path, project_info)
         save_model_state(model_state_file, model)
@@ -890,32 +890,91 @@ def action_train(
             on_backup=backup,
         )
 
-    # train
-
-    t_start = time.perf_counter()
+    # === Log training configuration ===
 
     dataset_id = project_info.train_info.dataset_id
-    pos_msg = f"dataset={data_path!r}"
-    if dataset_id:
-        pos_msg += f", dataset_id={dataset_id!r}"
-    pos_msg += f", start_index={start_index}, start_offset={start_offset}"
 
+    # console (include file paths for troubleshooting)
+    val_info = f"{val_batches} batches"
+    if val_path is not None:
+        val_info += f", dataset={val_path!r}"
+
+    data_msg = f"{data_path!r}"
+    if dataset_id:
+        data_msg += f", dataset_id={dataset_id!r}"
+    data_msg += f", start_index={start_index}, start_offset={start_offset}"
+
+    log_info("==== Training Configuration ====")
+    print(f"Project:       {path}")
+    print(f"Data:          {data_msg}")
+    print(f"Steps:         {steps}")
+    print(f"Seq length:    {seq_len}")
     if micro_batches > 1:
-        train_msg = (
-            f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}, "
-            f"micro_batches={micro_batches}, "
-            f"micro_batch_size={micro_batch_size}). "
-            f"{pos_msg}. Time: {datetime.now()}"
+        print(
+            f"Batch size:    {batch_size} ({micro_batches} micro-batches x {micro_batch_size})"
         )
     else:
-        train_msg = (
-            f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}). "
-            f"{pos_msg}. Time: {datetime.now()}"
+        print(f"Batch size:    {batch_size}")
+    print(f"Learning rate: {learning_rate}, weight decay: {weight_decay}")
+    print(f"BF16 autocast: {use_bf16}")
+    print(f"Loop dataset:  {loop_dataset}")
+    print(f"SOT/EOT:       {add_sot}/{add_eot}")
+    print(f"Validation:    {val_info}")
+    print(f"Time:          {datetime.now()}")
+    log_info("==============================")
+
+    if writer is not None:
+        device_info: dict = {"type": device}
+        if device == "cuda":
+            device_info["name"] = torch.cuda.get_device_name()
+            free_mem, total_mem = torch.cuda.mem_get_info(device)
+            device_info["gpu_mem_free"] = free_mem
+            device_info["gpu_mem_total"] = total_mem
+
+        dataset_info: dict = {
+            "index": start_index,
+            "offset": start_offset,
+        }
+        if dataset_id:
+            dataset_info["id"] = dataset_id
+
+        writer_val_info: dict = {"batches": val_batches}
+        if val_dataset is not None:
+            val_id = get_dataset_id(val_dataset)
+            if val_id:
+                writer_val_info["dataset_id"] = val_id
+
+        log_entry: dict = {
+            "event": "train_start",
+            "time": datetime.now().isoformat(),
+            "host": socket.gethostname(),
+            "steps": steps,
+            "seq_len": seq_len,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
+            "bf16": use_bf16,
+            "loop_dataset": loop_dataset,
+            "marker": {"sot": add_sot, "eot": add_eot},
+            "device": device_info,
+            "dataset": dataset_info,
+            "validation": writer_val_info,
+        }
+        if micro_batches > 1:
+            log_entry["micro_batches"] = micro_batches
+        writer.add_text(
+            "train/log",
+            json.dumps(log_entry),
+            project_info.train_info.token_count,
         )
 
-    log_important(train_msg)
+    # === Run training loop ===
 
+    t_start = time.perf_counter()
     backup()
+
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
 
     steps_remaining = steps
     steps_done = 0
@@ -937,30 +996,65 @@ def action_train(
         steps_remaining -= actual_steps
         steps_done += actual_steps
         if steps_remaining > 0:
+            # Dataset exhausted before reaching the requested step count.
             if loop_dataset:
                 log_info("Dataset exhausted - restarting from beginning.")
+                train_tracker.index = 0
+                train_tracker.offset = 0
+                start_index = 0
+                start_offset = 0
             else:
-                log_info("Dataset exhausted - resetting train_info position to zero.")
+                log_info("Dataset exhausted - stopping early.")
                 project_info.train_info.index = 0
                 project_info.train_info.offset = 0
                 project_info.train_info.dataset_id = ""
-            train_tracker["index"] = 0
-            train_tracker["offset"] = 0
-            start_index = 0
-            start_offset = 0
-            if not loop_dataset:
                 break
+
+    # === Final save & report ===
 
     save()
 
     t_end = time.perf_counter()
+    elapsed = t_end - t_start
 
-    log_important(f"Training completed. (time: {t_end - t_start:.6f})")
+    if device == "cuda":
+        peak_allocated = torch.cuda.max_memory_allocated(device)
+        peak_reserved = torch.cuda.max_memory_reserved(device)
+    else:
+        peak_allocated = 0
+        peak_reserved = 0
+
+    log_info(f"Training completed. (time: {elapsed:.6f})")
     log_info(
-        f"Reached sample {train_tracker['index']}, offset {train_tracker['offset']} in the dataset."
+        f"Reached sample {train_tracker.index}, offset {train_tracker.offset} in the dataset."
     )
 
+    if device == "cuda":
+        log_info(
+            f"Peak GPU memory: "
+            f"{peak_allocated / (1024**3):.2f} GiB allocated, "
+            f"{peak_reserved / (1024**3):.2f} GiB reserved"
+        )
+
     if writer is not None:
+        end_entry: dict = {
+            "event": "train_end",
+            "elapsed": round(elapsed, 6),
+            "dataset": {
+                "index": train_tracker.index,
+                "offset": train_tracker.offset,
+            },
+        }
+        if device == "cuda":
+            end_entry["gpu"] = {
+                "peak_allocated": peak_allocated,
+                "peak_reserved": peak_reserved,
+            }
+        writer.add_text(
+            "train/log",
+            json.dumps(end_entry),
+            project_info.train_info.token_count,
+        )
         writer.close()
 
 
@@ -1013,7 +1107,7 @@ def action_validate(
     log_info("Running validation.")
     t_start = time.perf_counter()
 
-    avg_loss, avg_entropy = compute_validation_metrics(
+    avg_loss, avg_entropy, val_actual = compute_validation_metrics(
         model=model,
         dataset=dataset,
         seq_len=seq_len,
@@ -1028,18 +1122,17 @@ def action_validate(
         use_bf16=use_bf16,
     )
 
+    if val_actual < num_batches:
+        log_warning(
+            f"Validation dataset exhausted early "
+            f"({val_actual}/{num_batches} batches)."
+        )
+
     if device == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t_start
 
     perplexity = math.exp(avg_loss)
-
-    sot_eot_parts = []
-    if add_sot:
-        sot_eot_parts.append("SOT")
-    if add_eot:
-        sot_eot_parts.append("EOT")
-    sot_eot = "+".join(sot_eot_parts) if sot_eot_parts else "none"
 
     log_info("==== Validation Results ====")
     print(f"Batches:       {num_batches}")
@@ -1047,7 +1140,7 @@ def action_validate(
     print(f"Seq length:    {seq_len}")
     print(f"Start index:   {start_index}")
     print(f"Start offset:  {start_offset}")
-    print(f"SOT/EOT:       {sot_eot}")
+    print(f"SOT/EOT:       {add_sot}/{add_eot}")
     print(f"BF16:          {use_bf16}")
     print(f"Device:        {device}")
     print(f"Time:          {elapsed:.4f}s")
@@ -1248,12 +1341,6 @@ def create_parser() -> ArgumentParser:
         action="store_true",
         help="estimate and report GPU memory required for training, then exit without training",
     )
-    train_parser.add_argument(
-        "--overhead",
-        type=float,
-        default=1.2,
-        help="memory overhead factor for framework, CUDA context, and allocator fragmentation (default: 1.2)",
-    )
 
     # validate
     validate_parser = subparsers.add_parser("validate", help="validate model")
@@ -1322,6 +1409,11 @@ def main():
     if device == "cuda":
         device_name = torch.cuda.get_device_name()
         log_info(f"Using device: {device} ({device_name})")
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        log_info(
+            f"GPU memory: {free_mem / (1024**3):.2f} GiB free / "
+            f"{total_mem / (1024**3):.2f} GiB total"
+        )
     else:
         log_info(f"Using device: {device}")
 
@@ -1339,6 +1431,7 @@ def main():
     # CUDA
     if device == "cuda":
         torch.set_float32_matmul_precision(args.float32_precision)
+        log_info(f"Float32 matmul precision: {args.float32_precision}")
 
     match args.action:
         case "dump_param":
@@ -1392,7 +1485,6 @@ def main():
                 loop_dataset=args.loop_dataset,
                 use_bf16=not args.no_bf16,
                 estimate=args.estimate,
-                overhead=args.overhead,
             )
         case "validate":
             action_validate(

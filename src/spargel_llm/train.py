@@ -23,6 +23,14 @@ class TrainInfo(BaseModel):
     dataset_id: str = ""
 
 
+@dataclass
+class TrainTracker:
+    """Mutable position tracker shared between the batch iterator and the training loop."""
+
+    index: int
+    offset: int
+
+
 @torch.compile
 def compute_loss_step(
     model: Model,
@@ -34,7 +42,7 @@ def compute_loss_step(
     reduction: Reduction = "mean",
 ):
     logits: Tensor = model(input_ids, mask)  # (..., seq_len, vocab_size)
-    flattened_logits = logits.flatten(0, -2)
+    flattened_logits = logits.flatten(0, -2).float()
     flattened_targets = target_ids.flatten(0, -1).to(torch.long)
 
     loss = nn.functional.cross_entropy(
@@ -58,7 +66,7 @@ def validation_metrics_step(
     reduction: Reduction = "mean",
 ):
     logits: Tensor = model(input_ids, mask)  # (..., seq_len, vocab_size)
-    flattened_logits = logits.flatten(0, -2)
+    flattened_logits = logits.flatten(0, -2).float()
     flattened_targets = target_ids.flatten(0, -1).to(torch.long)
 
     loss = nn.functional.cross_entropy(
@@ -69,7 +77,7 @@ def validation_metrics_step(
     )
 
     valid_targets = flattened_targets != pad_index
-    log_probs = torch.log_softmax(flattened_logits.float(), dim=-1)
+    log_probs = torch.log_softmax(flattened_logits, dim=-1)
     entropy_by_token = -(log_probs.exp() * log_probs).sum(dim=-1)
     valid_weights = valid_targets.to(entropy_by_token.dtype)
     entropy_sum = (entropy_by_token * valid_weights).sum()
@@ -209,7 +217,7 @@ def compute_validation_metrics(
     start_index: int = 0,
     start_offset: int = 0,
     use_bf16: bool = True,
-) -> tuple[float, float]:
+) -> tuple[float, float, int]:
     assert num_batches > 0
 
     torch_device = torch.device(device)
@@ -234,6 +242,8 @@ def compute_validation_metrics(
     total_valid_tokens = 0
 
     model.eval()
+
+    actual_batches = 0
 
     with torch.no_grad():
         for _ in range(num_batches):
@@ -261,10 +271,12 @@ def compute_validation_metrics(
             total_loss = total_loss + loss
             total_entropy = total_entropy + entropy_sum
             total_valid_tokens += n_non_pad
+            actual_batches += 1
 
     return (
         total_loss.item() / max(total_valid_tokens, 1),
         total_entropy.item() / max(total_valid_tokens, 1),
+        actual_batches,
     )
 
 
@@ -312,7 +324,7 @@ def iter_batches(
     stride: int | None = None,
     start_index: int = 0,
     start_offset: int = 0,
-    tracker: dict | None = None,
+    tracker: TrainTracker | None = None,
     eot_index: int | None = None,
     sot_index: int | None = None,
 ) -> Iterator[tuple[Tensor, Tensor, Tensor, int, int]]:
@@ -331,9 +343,9 @@ def iter_batches(
 
     Works directly on Arrow's underlying NumPy buffers to avoid the
     Python-object overhead of ``to_pylist()``.  Samples are accumulated
-    into double-buffered batches so that yielded tensors are isolated from
-    subsequent writes (including from partial batches that are never
-    yielded).  Partial batches at the end are silently discarded.
+    into a pre-allocated buffer; on yield the buffer is copied so that
+    returned tensors are independent of subsequent writes.  Partial
+    batches at the end are silently discarded.
 
     *start_index* skips the first N items of *dataset*.
 
@@ -341,9 +353,9 @@ def iter_batches(
     first item (the one at *start_index*); all subsequent items start from
     the beginning.
 
-    If *tracker* is a dict, it is updated before each sample with keys
-    ``index`` (current dataset row) and ``offset`` (window position
-    within that row).
+    If *tracker* is a ``TrainTracker``, it is updated before each sample
+    with ``.index`` (current dataset row) and ``.offset`` (window
+    position within that row).
 
     If *eot_index* is not ``None``, each row is treated as if it ends with
     an additional token of that value, so the effective row length becomes
@@ -356,20 +368,9 @@ def iter_batches(
     if stride is None:
         stride = seq_len
 
-    # Double-buffer isolates yielded tensors from subsequent writes.
-    # Even partial batches (which are never yielded) write to the buffer,
-    # so without isolation a list(iter_batches(...)) would see aliased
-    # memory in earlier tensors.
-    bufs = [
-        (
-            np.full((batch_size, seq_len), pad_index, dtype=np.int32),
-            np.ones((batch_size, seq_len), dtype=bool),
-            np.full((batch_size, seq_len), pad_index, dtype=np.int32),
-        )
-        for _ in range(2)
-    ]
-    cur = 0
-    batch_inputs, batch_masks, batch_targets = bufs[cur]
+    batch_inputs = np.full((batch_size, seq_len), pad_index, dtype=np.int32)
+    batch_masks = np.ones((batch_size, seq_len), dtype=bool)
+    batch_targets = np.full((batch_size, seq_len), pad_index, dtype=np.int32)
     sample_in_batch = 0
     batch_non_pad = 0
 
@@ -429,28 +430,22 @@ def iter_batches(
                 batch_non_pad += L
 
                 if tracker is not None:
-                    tracker["index"] = row_index
-                    tracker["offset"] = pos
+                    tracker.index = row_index
+                    tracker.offset = pos
 
                 sample_in_batch += 1
 
                 if sample_in_batch == batch_size:
                     yield (
-                        torch.from_numpy(batch_inputs),
-                        torch.from_numpy(batch_masks),
-                        torch.from_numpy(batch_targets),
+                        torch.from_numpy(batch_inputs.copy()),
+                        torch.from_numpy(batch_masks.copy()),
+                        torch.from_numpy(batch_targets.copy()),
                         batch_size * seq_len,
                         batch_non_pad,
                     )
-                    cur = 1 - cur
-                    # Reset all buffers: stale target data beyond the
-                    # written L positions would be treated as valid by
-                    # cross_entropy (which ignores only pad_index, not the
-                    # attention mask), inflating the reported loss.
-                    bufs[cur][0].fill(pad_index)
-                    bufs[cur][1].fill(True)
-                    bufs[cur][2].fill(pad_index)
-                    batch_inputs, batch_masks, batch_targets = bufs[cur]
+                    batch_inputs.fill(pad_index)
+                    batch_masks.fill(True)
+                    batch_targets.fill(pad_index)
                     sample_in_batch = 0
                     batch_non_pad = 0
 
