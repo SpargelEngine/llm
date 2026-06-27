@@ -3,6 +3,7 @@ import math
 import os
 import random
 import shutil
+import socket
 import time
 from argparse import ArgumentParser
 from dataclasses import dataclass
@@ -202,6 +203,7 @@ def estimate_memory(
     seq_len: int,
     micro_batch_size: int,
     use_bf16: bool = True,
+    overhead: float = 1.2,
 ) -> dict:
     """Estimate peak GPU memory required for training.
 
@@ -263,9 +265,6 @@ def estimate_memory(
 
     peak_act = embed_act + all_blocks + logit_act
 
-    # ~10 % for framework, CUDA context, allocator fragmentation
-    overhead = 1.1
-
     total = int((model_mem + grad_mem + optim_mem + peak_act) * overhead)
 
     return {
@@ -286,6 +285,7 @@ def _report_memory_estimate(
     batch_size: int,
     micro_batches: int,
     use_bf16: bool,
+    overhead: float,
 ) -> None:
     """Print a human-readable GPU memory estimate."""
     dtype_label = "BF16" if use_bf16 else "FP32"
@@ -301,6 +301,7 @@ def _report_memory_estimate(
         f"{' x ' + str(micro_batches) + ' micro-batches' if micro_batches > 1 else ''})"
     )
     print(f"Seq length:  {seq_len}")
+    print(f"Overhead:    {overhead}")
     print()
 
     def fmt_mib(b: int) -> str:
@@ -708,6 +709,7 @@ def action_train(
     loop_dataset: bool = False,
     use_bf16: bool = True,
     estimate: bool = False,
+    overhead: float = 1.2,
 ):
     assert log_period > 0
 
@@ -750,8 +752,11 @@ def action_train(
             seq_len=seq_len,
             micro_batch_size=micro_batch_size,
             use_bf16=use_bf16,
+            overhead=overhead,
         )
-        _report_memory_estimate(result, seq_len, batch_size, micro_batches, use_bf16)
+        _report_memory_estimate(
+            result, seq_len, batch_size, micro_batches, use_bf16, overhead
+        )
         tokens_per_step = seq_len * batch_size
         total_tokens = tokens_per_step * steps
         log_info("==== Token Throughput ====")
@@ -913,6 +918,7 @@ def action_train(
     backup()
 
     steps_remaining = steps
+    steps_done = 0
     while steps_remaining > 0:
         batch_iterator = make_iterator()
         actual_steps = train(
@@ -925,9 +931,11 @@ def action_train(
             device=device,
             step_callback=step_callback,
             micro_batches=micro_batches,
+            step_offset=steps_done,
             use_bf16=use_bf16,
         )
         steps_remaining -= actual_steps
+        steps_done += actual_steps
         if steps_remaining > 0:
             if loop_dataset:
                 log_info("Dataset exhausted - restarting from beginning.")
@@ -1240,6 +1248,12 @@ def create_parser() -> ArgumentParser:
         action="store_true",
         help="estimate and report GPU memory required for training, then exit without training",
     )
+    train_parser.add_argument(
+        "--overhead",
+        type=float,
+        default=1.2,
+        help="memory overhead factor for framework, CUDA context, and allocator fragmentation (default: 1.2)",
+    )
 
     # validate
     validate_parser = subparsers.add_parser("validate", help="validate model")
@@ -1305,7 +1319,13 @@ def main():
     torch.set_printoptions(linewidth=160)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    log_info(f"Using device: {device}")
+    if device == "cuda":
+        device_name = torch.cuda.get_device_name()
+        log_info(f"Using device: {device} ({device_name})")
+    else:
+        log_info(f"Using device: {device}")
+
+    log_info(f"Host: {socket.gethostname()}")
 
     num_threads = 8
     if args.thread is not None:
@@ -1372,6 +1392,7 @@ def main():
                 loop_dataset=args.loop_dataset,
                 use_bf16=not args.no_bf16,
                 estimate=args.estimate,
+                overhead=args.overhead,
             )
         case "validate":
             action_validate(

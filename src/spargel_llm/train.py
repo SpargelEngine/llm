@@ -102,6 +102,7 @@ def train(
     device: str = "cpu",
     step_callback: Optional[Callable[[StepInfo], None]] = None,
     micro_batches: int = 1,
+    step_offset: int = 0,
     use_bf16: bool = True,
 ) -> int:
     """Run up to *steps* training steps.
@@ -109,6 +110,10 @@ def train(
     Each step consists of *micro_batches* forward/backward passes whose
     gradients are accumulated before a single ``optimizer.step()`` call.
     The effective batch size is ``micro_batch_size x micro_batches``.
+
+    *step_offset* is added to the step number reported to the callback,
+    so callers that restart the data iterator (e.g. for looped datasets)
+    can continue the step counter instead of resetting to 0.
 
     Returns the number of steps actually executed (may be less than *steps*
     if the data iterator is exhausted).
@@ -179,7 +184,7 @@ def train(
         if step_callback is not None:
             step_callback(
                 StepInfo(
-                    step=step,
+                    step=step_offset + step,
                     loss=step_loss.item(),
                     time=step_time,
                     tokens=step_tokens,
