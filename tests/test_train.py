@@ -20,6 +20,20 @@ def _make_parquet(rows: list[list[int]], dataset_id: str = "test") -> pq.Parquet
     return pq.ParquetFile(pa.BufferReader(buf.getvalue()))
 
 
+def _make_parquet_multi_rg(
+    rows: list[list[int]], row_group_size: int, dataset_id: str = "test"
+) -> pq.ParquetFile:
+    """Create an in-memory ParquetFile with multiple row groups."""
+    schema = pa.schema([pa.field("tokens", pa.list_(pa.uint32()))])
+    schema = schema.with_metadata({"dataset_id": dataset_id})
+    table = pa.table(
+        {"tokens": [pa.array(r, type=pa.uint32()) for r in rows]}, schema=schema
+    )
+    buf = pa.BufferOutputStream()
+    pq.write_table(table, buf, row_group_size=row_group_size)
+    return pq.ParquetFile(pa.BufferReader(buf.getvalue()))
+
+
 def _first_batch(*args, **kwargs):
     """Convenience: return (inputs, masks, targets) of the first batch."""
     inputs, masks, targets, _, _ = next(iter(iter_batches(*args, **kwargs)))
@@ -295,3 +309,152 @@ class TestIterBatches:
             )
             count += 1
         assert count > 10, f"expected >10 batches, got {count}"
+
+    # ── start_index ──────────────────────────────────────────────
+
+    def test_start_index_basic(self):
+        """start_index=2 skips the first two rows and processes the rest."""
+        pf = _make_parquet(
+            [
+                [10, 20],  # row 0 — skipped
+                [30, 40],  # row 1 — skipped
+                [1, 2, 3],  # row 2 — processed: 1 sample
+                [4, 5, 6],  # row 3 — processed: 1 sample
+                [7, 8, 9],  # row 4 — fills batch 2
+            ]
+        )
+        inputs, masks, targets = _first_batch(
+            pf, seq_len=2, batch_size=2, pad_index=0, start_index=2
+        )
+        # Row 2 aug_len=3: L=min(2,3-0-1)=2, input=[1,2], target=[2,3]
+        # Row 3 aug_len=3: L=min(2,3-0-1)=2, input=[4,5], target=[5,6]
+        np.testing.assert_array_equal(inputs, [[1, 2], [4, 5]])
+        np.testing.assert_array_equal(targets, [[2, 3], [5, 6]])
+
+    def test_start_index_in_middle_of_row_group(self):
+        """start_index=4 with 2 row groups of 3 rows each.
+
+        The first row group (3 rows) is entirely skipped.  Then the first
+        row of the second row group (dataset row 3) is also skipped,
+        landing us on row 4.
+        """
+        rows = [
+            [1, 2],  # RG0 row 0 — skipped
+            [3, 4],  # RG0 row 1 — skipped
+            [5, 6],  # RG0 row 2 — skipped
+            [7, 8],  # RG1 row 3 — skipped (first row of second RG)
+            [10, 20],  # RG1 row 4 — processed
+            [30, 40],  # RG1 row 5 — processed
+        ]
+        pf = _make_parquet_multi_rg(rows, row_group_size=3)
+        inputs, masks, targets = _first_batch(
+            pf, seq_len=2, batch_size=2, pad_index=0, start_index=4
+        )
+        # Row 4 [10,20] aug_len=2: L=min(2,2-0-1)=1, input=[10,0], target=[20,0]
+        # Row 5 [30,40] aug_len=2: L=min(2,2-0-1)=1, input=[30,0], target=[40,0]
+        np.testing.assert_array_equal(inputs, [[10, 0], [30, 0]])
+        np.testing.assert_array_equal(targets, [[20, 0], [40, 0]])
+
+    def test_start_index_exact_row_group_boundary(self):
+        """start_index lands exactly at a row group boundary.
+
+        The entire first row group is skipped and processing starts at the
+        first row of the second group.
+        """
+        rows = [
+            [1, 2],  # RG0 row 0 — skipped
+            [3, 4],  # RG0 row 1 — skipped
+            [5, 6],  # RG0 row 2 — skipped
+            [10, 20],  # RG1 row 3 — processed
+            [30, 40],  # RG1 row 4 — processed
+        ]
+        pf = _make_parquet_multi_rg(rows, row_group_size=3)
+        inputs, masks, targets = _first_batch(
+            pf, seq_len=2, batch_size=2, pad_index=0, start_index=3
+        )
+        # Row 3 [10,20] aug_len=2: L=min(2,2-0-1)=1, input=[10,0], target=[20,0]
+        # Row 4 [30,40] aug_len=2: L=min(2,2-0-1)=1, input=[30,0], target=[40,0]
+        np.testing.assert_array_equal(inputs, [[10, 0], [30, 0]])
+        np.testing.assert_array_equal(targets, [[20, 0], [40, 0]])
+
+    # ── checkpoint resume (start_index + start_offset) ───────────
+
+    def test_resume_from_checkpoint(self):
+        """start_index=1 + start_offset=2: resume mid-dataset, mid-row."""
+        pf = _make_parquet(
+            [
+                [1, 2, 3, 4],  # row 0 — skipped
+                [10, 20, 30, 40],  # row 1 — starts at offset 2
+                [50, 60, 70, 80],  # row 2 — starts at offset 0
+            ]
+        )
+        inputs, masks, targets = _first_batch(
+            pf,
+            seq_len=2,
+            batch_size=2,
+            pad_index=0,
+            start_index=1,
+            start_offset=2,
+        )
+        # Row 1 offset=2, aug_len=4: L=min(2,4-2-1)=1
+        #   input=[30,0], target=[40,0]
+        # Row 2 offset=0, aug_len=4: L=min(2,4-0-1)=2
+        #   input=[50,60], target=[60,70]
+        np.testing.assert_array_equal(inputs, [[30, 0], [50, 60]])
+        np.testing.assert_array_equal(targets, [[40, 0], [60, 70]])
+
+    # ── single boundary token (SOT-only / EOT-only) ──────────────
+
+    def test_sot_only_at_iter_batches_level(self):
+        """Only sot_index (no eot) through iter_batches end-to-end."""
+        pf = _make_parquet([[10, 20, 30]])
+        inputs, masks, targets = _first_batch(
+            pf,
+            seq_len=3,
+            batch_size=1,
+            pad_index=0,
+            sot_index=5,
+        )
+        # augmented = [5, 10, 20, 30], aug_len=4
+        # pos=0: L=min(3,4-0-1)=3 → input=[5,10,20], target=[10,20,30]
+        np.testing.assert_array_equal(inputs[0], [5, 10, 20])
+        np.testing.assert_array_equal(targets[0], [10, 20, 30])
+
+    def test_eot_only_at_iter_batches_level(self):
+        """Only eot_index (no sot) through iter_batches end-to-end."""
+        pf = _make_parquet([[10, 20, 30]])
+        inputs, masks, targets = _first_batch(
+            pf,
+            seq_len=3,
+            batch_size=1,
+            pad_index=0,
+            eot_index=9,
+        )
+        # augmented = [10, 20, 30, 9], aug_len=4
+        # pos=0: L=min(3,4-0-1)=3 → input=[10,20,30], target=[20,30,9]
+        np.testing.assert_array_equal(inputs[0], [10, 20, 30])
+        np.testing.assert_array_equal(targets[0], [20, 30, 9])
+
+    # ── start_index with boundary tokens ─────────────────────────
+
+    def test_start_index_with_boundary_tokens(self):
+        """start_index with SOT/EOT: skip doesn't affect boundary logic."""
+        pf = _make_parquet(
+            [
+                [1, 2, 3],  # row 0 — skipped
+                [10, 20, 30],  # row 1 — processed with SOT + EOT
+            ]
+        )
+        inputs, masks, targets = _first_batch(
+            pf,
+            seq_len=3,
+            batch_size=1,
+            pad_index=0,
+            start_index=1,
+            sot_index=7,
+            eot_index=8,
+        )
+        # Row 1 augmented = [7, 10, 20, 30, 8], aug_len=5
+        # pos=0: L=min(3,5-0-1)=3 → input=[7,10,20], target=[10,20,30]
+        np.testing.assert_array_equal(inputs[0], [7, 10, 20])
+        np.testing.assert_array_equal(targets[0], [10, 20, 30])

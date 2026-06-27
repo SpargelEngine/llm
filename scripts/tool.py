@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import random
 import shutil
@@ -26,7 +27,6 @@ from spargel_llm.train import (
     StepInfo,
     TrainInfo,
     compute_validation_metrics,
-    estimate_memory,
     generate_step,
     iter_batches,
     train,
@@ -194,6 +194,90 @@ def writer_add_embedding(
 def always_true():
     while True:
         yield True
+
+
+def estimate_memory(
+    config: Config,
+    *,
+    seq_len: int,
+    micro_batch_size: int,
+    use_bf16: bool = True,
+) -> dict:
+    """Estimate peak GPU memory required for training.
+
+    Covers model weights (fp32), gradients (fp32), AdamW optimizer state
+    (fp32 momentum + variance), and per-micro-batch activations.
+    Returns a breakdown in bytes.
+    """
+    embedding_params, body_params = compute_param_counts(config)
+    total_params = embedding_params + body_params
+
+    # fp32 master weights
+    model_mem = total_params * 4
+
+    # fp32 gradients
+    grad_mem = total_params * 4
+
+    # AdamW: fp32 momentum + fp32 variance
+    optim_mem = total_params * 8
+
+    B = micro_batch_size
+    S = seq_len
+    H = config.num_head
+    D = config.dim
+    d_k = config.dim_key
+    d_v = config.dim_value
+    d_ff = config.dim_ff_hidden
+    n_layer = config.num_layer
+
+    # Most activations stay in BF16 (2 bytes) under autocast;
+    # attention softmax outputs are typically fp32 (4 bytes).
+    act_bytes = 2 if use_bf16 else 4
+
+    # Embedding lookup output
+    embed_act = B * S * D * act_bytes
+
+    # Per transformer block activations saved for backward:
+    #   norm1 input (residual)         B*S*D
+    #   Q, K, V                        3 * B*H*S*d_k
+    #   attention softmax output       B*H*S*S  (fp32)
+    #   pre-W_o (attention output)     B*H*S*d_v
+    #   post-W_o (residual)            B*S*D
+    #   norm2 input (residual)         B*S*D
+    #   FF hidden (post-activation)    B*S*d_ff
+    attn_score_bytes = 4  # softmax upcasts to fp32
+    per_block = (
+        B * S * D * act_bytes
+        + 3 * B * H * S * d_k * act_bytes
+        + B * H * S * S * attn_score_bytes
+        + B * H * S * d_v * act_bytes
+        + B * S * D * act_bytes
+        + B * S * D * act_bytes
+        + B * S * d_ff * act_bytes
+    )
+
+    all_blocks = n_layer * per_block
+
+    # LM head logits (fp32 for cross-entropy)
+    logit_act = B * S * config.vocab_size * 4
+
+    peak_act = embed_act + all_blocks + logit_act
+
+    # ~10 % for framework, CUDA context, allocator fragmentation
+    overhead = 1.1
+
+    total = int((model_mem + grad_mem + optim_mem + peak_act) * overhead)
+
+    return {
+        "total_params": total_params,
+        "embedding_params": embedding_params,
+        "body_params": body_params,
+        "model_mem": model_mem,
+        "grad_mem": grad_mem,
+        "optim_mem": optim_mem,
+        "activation_mem": int(peak_act),
+        "total": total,
+    }
 
 
 def _report_memory_estimate(
@@ -668,6 +752,11 @@ def action_train(
             use_bf16=use_bf16,
         )
         _report_memory_estimate(result, seq_len, batch_size, micro_batches, use_bf16)
+        tokens_per_step = seq_len * batch_size
+        total_tokens = tokens_per_step * steps
+        log_info("==== Token Throughput ====")
+        print(f"Tokens per step: {tokens_per_step:,}")
+        print(f"Total tokens ({steps} steps): {total_tokens:,}")
         return
 
     # data
@@ -800,16 +889,23 @@ def action_train(
 
     t_start = time.perf_counter()
 
+    dataset_id = project_info.train_info.dataset_id
+    pos_msg = f"dataset={data_path!r}"
+    if dataset_id:
+        pos_msg += f", dataset_id={dataset_id!r}"
+    pos_msg += f", start_index={start_index}, start_offset={start_offset}"
+
     if micro_batches > 1:
         train_msg = (
             f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}, "
             f"micro_batches={micro_batches}, "
-            f"micro_batch_size={micro_batch_size}). Time: {datetime.now()}"
+            f"micro_batch_size={micro_batch_size}). "
+            f"{pos_msg}. Time: {datetime.now()}"
         )
     else:
         train_msg = (
             f"Training for {steps} steps (seq_len={seq_len}, batch_size={batch_size}). "
-            f"Time: {datetime.now()}"
+            f"{pos_msg}. Time: {datetime.now()}"
         )
 
     log_important(train_msg)
@@ -858,6 +954,99 @@ def action_train(
 
     if writer is not None:
         writer.close()
+
+
+def action_validate(
+    path: StrOrPath,
+    val_path: str,
+    num_batches: int,
+    *,
+    seq_len: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    start_index: int = 0,
+    start_offset: int = 0,
+    add_eot: bool = False,
+    add_sot: bool = False,
+    use_bf16: bool = True,
+):
+    assert num_batches > 0
+
+    project_info = load_project(path)
+    model_state_file = resolve_parent(path) / project_info.model_state_file
+    train_config = project_info.train_config
+
+    if seq_len is None:
+        seq_len = train_config.seq_len
+    if seq_len <= 0:
+        raise ValueError(
+            "seq_len is not configured in the project; specify -l / --seq-len"
+        )
+
+    if batch_size is None:
+        micro_batches = train_config.micro_batches or 1
+        batch_size = train_config.batch_size // micro_batches
+    if batch_size <= 0:
+        raise ValueError(
+            "batch_size is not configured in the project; specify -bs / --batch-size"
+        )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = Model(project_info.config).to(device)
+    log_info("Loading model state.")
+    load_model_state(model_state_file, model, device=device)
+
+    log_info("Loading validation dataset.")
+    dataset = load_dataset(val_path)
+
+    eot_index = EOT if add_eot else None
+    sot_index = SOT if add_sot else None
+
+    log_info("Running validation.")
+    t_start = time.perf_counter()
+
+    avg_loss, avg_entropy = compute_validation_metrics(
+        model=model,
+        dataset=dataset,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        pad_index=PAD,
+        device=device,
+        num_batches=num_batches,
+        eot_index=eot_index,
+        sot_index=sot_index,
+        start_index=start_index,
+        start_offset=start_offset,
+        use_bf16=use_bf16,
+    )
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t_start
+
+    perplexity = math.exp(avg_loss)
+
+    sot_eot_parts = []
+    if add_sot:
+        sot_eot_parts.append("SOT")
+    if add_eot:
+        sot_eot_parts.append("EOT")
+    sot_eot = "+".join(sot_eot_parts) if sot_eot_parts else "none"
+
+    log_info("==== Validation Results ====")
+    print(f"Batches:       {num_batches}")
+    print(f"Batch size:    {batch_size}")
+    print(f"Seq length:    {seq_len}")
+    print(f"Start index:   {start_index}")
+    print(f"Start offset:  {start_offset}")
+    print(f"SOT/EOT:       {sot_eot}")
+    print(f"BF16:          {use_bf16}")
+    print(f"Device:        {device}")
+    print(f"Time:          {elapsed:.4f}s")
+    print()
+    print(f"Loss:          {avg_loss:.6f}")
+    print(f"Entropy:       {avg_entropy:.6f}")
+    print(f"Perplexity:    {perplexity:.4f}")
 
 
 #### main ####
@@ -1052,6 +1241,60 @@ def create_parser() -> ArgumentParser:
         help="estimate and report GPU memory required for training, then exit without training",
     )
 
+    # validate
+    validate_parser = subparsers.add_parser("validate", help="validate model")
+    validate_parser.add_argument("path", help="project file")
+    validate_parser.add_argument("val_data", help="validation dataset path")
+    validate_parser.add_argument(
+        "num_batches",
+        type=int,
+        help="number of validation batches",
+    )
+    validate_parser.add_argument(
+        "-l",
+        "--seq-len",
+        type=int,
+        default=None,
+        help="sequence length (default: from training config)",
+    )
+    validate_parser.add_argument(
+        "-bs",
+        "--batch-size",
+        type=int,
+        default=None,
+        help="batch size for validation (default: micro-batch size from training config)",
+    )
+    validate_parser.add_argument(
+        "-si",
+        "--start-index",
+        type=int,
+        default=0,
+        help="start validation from this sample index in the dataset (default: 0)",
+    )
+    validate_parser.add_argument(
+        "-so",
+        "--start-offset",
+        type=int,
+        default=0,
+        help="initial window offset for the first sample (default: 0)",
+    )
+    validate_parser.add_argument(
+        "--sot",
+        action="store_true",
+        help="prepend SOT to each validation text",
+    )
+    validate_parser.add_argument(
+        "--eot",
+        action="store_true",
+        help="append EOT to each validation text",
+    )
+    validate_parser.add_argument(
+        "-n16",
+        "--no-bf16",
+        action="store_true",
+        help="disable bfloat16 autocast",
+    )
+
     return parser
 
 
@@ -1129,6 +1372,19 @@ def main():
                 loop_dataset=args.loop_dataset,
                 use_bf16=not args.no_bf16,
                 estimate=args.estimate,
+            )
+        case "validate":
+            action_validate(
+                args.path,
+                args.val_data,
+                args.num_batches,
+                seq_len=args.seq_len,
+                batch_size=args.batch_size,
+                start_index=args.start_index,
+                start_offset=args.start_offset,
+                add_eot=args.eot,
+                add_sot=args.sot,
+                use_bf16=not args.no_bf16,
             )
         case _:
             raise ValueError(f"unrecognized action: {args.action}")
