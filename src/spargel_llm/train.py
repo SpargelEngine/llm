@@ -340,7 +340,7 @@ def iter_batches(
     """Iterate through a pre-tokenized Parquet dataset and yield tensor batches.
 
     For each row, a window of ``seq_len + 1`` tokens slides with the given
-    *stride* (default: ``seq_len``).  Each window produces one sample:
+    *stride* (default: ``seq_len + 1``).  Each window produces one sample:
     ``(input_ids, mask, target_ids)``.  Short tails are padded with
     *pad_index*.
 
@@ -375,7 +375,7 @@ def iter_batches(
     becomes ``row_len + 1`` and the first window's input starts with SOT.
     """
     if stride is None:
-        stride = seq_len
+        stride = seq_len + 1
 
     batch_inputs = np.full((batch_size, seq_len), pad_index, dtype=np.int32)
     batch_masks = np.ones((batch_size, seq_len), dtype=bool)

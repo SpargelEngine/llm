@@ -330,6 +330,7 @@ def _report_memory_estimate(
 def log_step_callback(
     info: StepInfo,
     state: LogState,
+    train_info: TrainInfo,
     *,
     log_period: int,
     model: Model,
@@ -343,14 +344,14 @@ def log_step_callback(
     sot_index: int | None,
     use_bf16: bool = True,
     writer: SummaryWriter | None,
-    get_token_count: Callable[[], int],
     on_save: Callable[[], None],
     on_backup: Callable[[], None],
 ) -> None:
-    token_count = get_token_count()
+    token_count = train_info.token_count
 
     if writer is not None:
         writer.add_scalar("loss/train", info.loss, token_count)
+        writer.add_scalar("metric/time/elapsed", train_info.time, token_count)
 
     state.sum_loss += info.loss * info.tokens_non_pad
     state.sum_time += info.time
@@ -873,6 +874,7 @@ def action_train(
         log_step_callback(
             info,
             state,
+            project_info.train_info,
             log_period=log_period,
             model=model,
             val_dataset=val_dataset,
@@ -885,7 +887,6 @@ def action_train(
             sot_index=sot_index,
             use_bf16=use_bf16,
             writer=writer,
-            get_token_count=lambda: project_info.train_info.token_count,
             on_save=save,
             on_backup=backup,
         )

@@ -76,7 +76,9 @@ class TestIterBatches:
     def test_single_row_basic(self):
         """Row [1,2,3,4,5], seq_len=3, stride=3 → 2 windows."""
         pf = _make_parquet([[1, 2, 3, 4, 5]])
-        inputs, masks, targets = _first_batch(pf, seq_len=3, batch_size=2, pad_index=0)
+        inputs, masks, targets = _first_batch(
+            pf, seq_len=3, batch_size=2, pad_index=0, stride=3
+        )
         # pos=0: L=3, input=[1,2,3]       target=[2,3,4]
         # pos=3: L=1, input=[4,0,0]       target=[5,0,0]
         np.testing.assert_array_equal(inputs, [[1, 2, 3], [4, 0, 0]])
@@ -85,7 +87,9 @@ class TestIterBatches:
     def test_partial_batch_discarded(self):
         """4 windows, batch_size=3 → 1 full batch, last window discarded."""
         pf = _make_parquet([[1, 2, 3, 4], [5, 6, 7, 8]])
-        batches = list(iter_batches(pf, seq_len=2, batch_size=3, pad_index=0))
+        batches = list(
+            iter_batches(pf, seq_len=2, batch_size=3, pad_index=0, stride=2)
+        )
         assert len(batches) == 1
         inputs, _, _, _, _ = batches[0]
         # Row 0: pos=0 L=2 [1,2], pos=2 L=1 [3,0]
@@ -134,6 +138,7 @@ class TestIterBatches:
             seq_len=2,
             batch_size=2,
             pad_index=0,
+            stride=2,
             start_offset=2,
         )
         # pos=2: L=2, input=[3,4]  target=[4,5]
@@ -154,6 +159,21 @@ class TestIterBatches:
         # pos=0: L=2 [1,2]  pos=1: L=2 [2,3]
         # pos=2: L=2 [3,4]  pos=3: L=1 [4,0]
         np.testing.assert_array_equal(inputs, [[1, 2], [2, 3], [3, 4], [4, 0]])
+
+    def test_default_stride_non_overlapping(self):
+        """Default stride (seq_len+1) produces non-overlapping windows.
+
+        Row [1,2,3,4,5,6], seq_len=2 → default stride=3:
+        pos=0 L=2 [1,2], pos=3 L=2 [4,5]. No sample at pos=2 (would overlap).
+        """
+        pf = _make_parquet([[1, 2, 3, 4, 5, 6]])
+        inputs, _, targets = _first_batch(
+            pf, seq_len=2, batch_size=2, pad_index=0
+        )
+        # pos=0: L=2, input=[1,2], target=[2,3]
+        # pos=3: L=2, input=[4,5], target=[5,6]
+        np.testing.assert_array_equal(inputs, [[1, 2], [4, 5]])
+        np.testing.assert_array_equal(targets, [[2, 3], [5, 6]])
 
     def test_tracker(self):
         pf = _make_parquet([[1, 2, 3, 4], [5, 6, 7, 8]])
