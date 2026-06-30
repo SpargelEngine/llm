@@ -65,7 +65,10 @@ only performed by the `resume` subcommand.
     "loop_dataset": false,
     "seed": 1234,
     "use_bf16": true,
-    "float32_precision": "high"
+    "float32_precision": "high",
+    "lr_schedule": {
+      "type": "constant"
+    }
   }
 }
 ```
@@ -75,3 +78,26 @@ only performed by the `resume` subcommand.
 Relative dataset and tokenizer paths are interpreted relative to the repo root.
 The tokenizer path is recorded for reproducibility; training consumes the
 pre-tokenized Parquet files directly.
+
+`train.lr_schedule` is optional. When omitted, the runner uses constant LR at
+`train.learning_rate`, matching older configs:
+
+```json
+"lr_schedule": {"type": "constant"}
+```
+
+For linear warmup, a constant plateau, then linear cooldown, use:
+
+```json
+"lr_schedule": {
+  "type": "warmup_constant_cooldown",
+  "warmup_steps": 200,
+  "cooldown_steps": 500,
+  "min_lr": 0.00001
+}
+```
+
+`train.learning_rate` is the constant LR or peak LR. Warmup uses the global
+zero-based optimizer update step and reaches the peak on the final warmup
+update. Cooldown covers the final `cooldown_steps` updates and reaches `min_lr`
+on the final training update.

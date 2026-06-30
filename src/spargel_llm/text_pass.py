@@ -394,10 +394,7 @@ class ReplacePass(TextPassModel):
                     return text.replace(self.old, self.new)
 
 
-
-def _literal_positions(
-    text: str, sep: str
-) -> Iterator[tuple[int, int, None]]:
+def _literal_positions(text: str, sep: str) -> Iterator[tuple[int, int, None]]:
     """Yield (start, end, None) of each occurrence of *sep* in *text*."""
     if not sep:
         return
@@ -499,9 +496,7 @@ class SplitPass(TextPassModel):
                     )
                 else:
                     raise RuntimeError("no self.cap_pattern")
-                yield from _split_iter(
-                    positions, text, self.max_split, self.behavior
-                )
+                yield from _split_iter(positions, text, self.max_split, self.behavior)
 
 
 class StripPass(TextPassModel):

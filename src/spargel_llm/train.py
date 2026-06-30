@@ -10,6 +10,7 @@ from pydantic import BaseModel, NonNegativeFloat, NonNegativeInt
 from torch import Tensor
 from torch.optim import Optimizer
 
+from spargel_llm.lr_schedule import LearningRateSchedule, set_optimizer_learning_rate
 from spargel_llm.model import Model
 
 type Reduction = Literal["mean", "sum"]
@@ -97,6 +98,8 @@ class StepInfo:
     time: float
     tokens: int
     tokens_non_pad: int
+    learning_rate: float | None = None
+
 
 @dataclass
 class BatchData:
@@ -105,6 +108,7 @@ class BatchData:
     target_ids: Tensor
     tokens: int
     tokens_non_pad: int
+
 
 def train(
     info: TrainInfo,
@@ -119,6 +123,7 @@ def train(
     micro_batches: int = 1,
     step_offset: int = 0,
     use_bf16: bool = True,
+    lr_schedule: LearningRateSchedule | None = None,
 ) -> int:
     """Run up to *steps* training steps.
 
@@ -148,7 +153,7 @@ def train(
         for _ in range(micro_batches):
             try:
                 batch_data = next(batch_iterator)
-                # inputs, masks, targets, tokens, tokens_non_pad = 
+                # inputs, masks, targets, tokens, tokens_non_pad =
             except StopIteration:
                 if not cpu_batches:
                     return step
@@ -186,7 +191,13 @@ def train(
             loss.backward()
 
         # update weights
+        current_lr = None
+        if lr_schedule is not None:
+            current_lr = lr_schedule.lr_at_step(step_offset + step)
+            set_optimizer_learning_rate(optimizer, current_lr)
         optimizer.step()
+        if current_lr is None and optimizer.param_groups:
+            current_lr = optimizer.param_groups[0].get("lr")
 
         if device == "cuda":
             torch.cuda.synchronize()
@@ -205,6 +216,7 @@ def train(
                     time=step_time,
                     tokens=step_tokens,
                     tokens_non_pad=step_tokens_non_pad,
+                    learning_rate=current_lr,
                 )
             )
 

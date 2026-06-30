@@ -14,7 +14,9 @@ from pydantic import ValidationError
 
 from spargel_llm.train import TrainInfo
 
-RUN_EXP_PATH = Path(__file__).resolve().parents[1] / "scripts" / "tianjiao" / "run_exp.py"
+RUN_EXP_PATH = (
+    Path(__file__).resolve().parents[2] / "scripts" / "tianjiao" / "run_exp.py"
+)
 SPEC = importlib.util.spec_from_file_location("run_exp_under_test", RUN_EXP_PATH)
 assert SPEC is not None
 assert SPEC.loader is not None
@@ -107,6 +109,54 @@ def test_config_validation_accepts_valid_config():
     assert config.schema_version == 1
     assert config.train.validation_batches is None
     assert config.train.batch_size == 2
+    assert config.train.lr_schedule.type == "constant"
+
+
+def test_config_validation_accepts_nested_lr_schedule():
+    config = run_exp.ExperimentConfig.model_validate(
+        _config_dict(
+            train={
+                "lr_schedule": {
+                    "type": "warmup_constant_cooldown",
+                    "warmup_steps": 1,
+                    "cooldown_steps": 2,
+                    "min_lr": 0.0001,
+                }
+            }
+        )
+    )
+
+    schedule = run_exp.build_lr_schedule(config.train)
+    assert isinstance(schedule, run_exp.LinearWarmupConstantCooldownSchedule)
+    assert schedule.peak_lr == pytest.approx(0.001)
+    assert schedule.total_steps == 3
+    assert schedule.warmup_steps == 1
+    assert schedule.cooldown_steps == 2
+    assert schedule.min_lr == pytest.approx(0.0001)
+
+
+def test_config_validation_rejects_invalid_nested_lr_schedule():
+    data = _config_dict(
+        train={
+            "lr_schedule": {
+                "type": "warmup_constant_cooldown",
+                "warmup_steps": 2,
+                "cooldown_steps": 2,
+                "min_lr": 0.0001,
+            }
+        }
+    )
+    with pytest.raises(ValidationError, match="warmup_steps \\+ cooldown_steps"):
+        run_exp.ExperimentConfig.model_validate(data)
+
+
+def test_default_lr_schedule_builds_constant_schedule():
+    config = run_exp.ExperimentConfig.model_validate(_config_dict())
+
+    schedule = run_exp.build_lr_schedule(config.train)
+
+    assert isinstance(schedule, run_exp.ConstantLearningRateSchedule)
+    assert schedule.lr_at_step(0) == pytest.approx(0.001)
 
 
 def test_config_validation_rejects_invalid_batch_split():
@@ -220,7 +270,7 @@ def test_resume_state_loading(tmp_path):
     assert loaded_state.tag == "a"
 
 
-def test_smoke_run_creates_state_and_checkpoints(tmp_path):
+def test_smoke_run_creates_state_and_checkpoints(tmp_path, capsys):
     assert "scripts.tool" not in sys.modules
 
     rows = [
@@ -256,3 +306,56 @@ def test_smoke_run_creates_state_and_checkpoints(tmp_path):
     assert state.steps_trained == 3
     assert state.latest_checkpoint == "iter3"
     assert [record.step for record in state.checkpoint_records] == [0, 2, 3]
+
+    captured = capsys.readouterr()
+    assert "lr=0.001" in captured.out
+
+
+def test_smoke_run_with_warmup_cooldown_finishes_at_scheduled_lr(tmp_path, capsys):
+    rows = [
+        [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+    ]
+    _write_tokens(tmp_path / "data" / "train.parquet", rows)
+
+    config_path = tmp_path / "exps" / "tiny.json"
+    _write_json(
+        config_path,
+        _config_dict(
+            train={
+                "lr_schedule": {
+                    "type": "warmup_constant_cooldown",
+                    "warmup_steps": 1,
+                    "cooldown_steps": 2,
+                    "min_lr": 0.0001,
+                }
+            }
+        ),
+    )
+
+    run_dir = run_exp.start_experiment(
+        config_path,
+        repo_root=tmp_path,
+        runs_dir=tmp_path / "runs",
+        enforce_git=False,
+        git_commit="abcdef1234567890",
+        device="cpu",
+        now=datetime(2026, 1, 2, 3, 4, 5),
+        threads=1,
+    )
+
+    state = run_exp.load_state(run_dir / "state.json")
+    assert state.status == "completed"
+    assert state.steps_trained == 3
+    assert state.latest_checkpoint == "iter3"
+
+    optimizer_state = run_exp.torch.load(
+        run_dir / "iter3" / "optimizer_state.pth",
+        weights_only=True,
+        map_location="cpu",
+    )
+    assert optimizer_state["param_groups"][0]["lr"] == pytest.approx(0.0001)
+
+    captured = capsys.readouterr()
+    assert "lr=0.0001" in captured.out

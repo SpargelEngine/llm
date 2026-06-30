@@ -87,9 +87,7 @@ class TestIterBatches:
     def test_partial_batch_discarded(self):
         """4 windows, batch_size=3 → 1 full batch, last window discarded."""
         pf = _make_parquet([[1, 2, 3, 4], [5, 6, 7, 8]])
-        batches = list(
-            iter_batches(pf, seq_len=2, batch_size=3, pad_index=0, stride=2)
-        )
+        batches = list(iter_batches(pf, seq_len=2, batch_size=3, pad_index=0, stride=2))
         assert len(batches) == 1
         inputs, _, _, _, _ = batches[0]
         # Row 0: pos=0 L=2 [1,2], pos=2 L=1 [3,0]
@@ -167,9 +165,7 @@ class TestIterBatches:
         pos=0 L=2 [1,2], pos=3 L=2 [4,5]. No sample at pos=2 (would overlap).
         """
         pf = _make_parquet([[1, 2, 3, 4, 5, 6]])
-        inputs, _, targets = _first_batch(
-            pf, seq_len=2, batch_size=2, pad_index=0
-        )
+        inputs, _, targets = _first_batch(pf, seq_len=2, batch_size=2, pad_index=0)
         # pos=0: L=2, input=[1,2], target=[2,3]
         # pos=3: L=2, input=[4,5], target=[5,6]
         np.testing.assert_array_equal(inputs, [[1, 2], [4, 5]])
@@ -285,8 +281,7 @@ class TestIterBatches:
             assert tokens == inputs.numel(), "tokens must equal total elements"
             actual_non_pad = (targets != 0).sum().item()
             assert n_non_pad == actual_non_pad, (
-                f"n_non_pad={n_non_pad} != actual={actual_non_pad}; "
-                f"targets=\n{targets}"
+                f"n_non_pad={n_non_pad} != actual={actual_non_pad}; targets=\n{targets}"
             )
 
     def test_all_batches_have_consistent_masks(self):

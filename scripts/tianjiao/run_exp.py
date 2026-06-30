@@ -36,6 +36,11 @@ from pydantic import (
 from torch.optim import AdamW, Optimizer
 from torch.utils.tensorboard import SummaryWriter
 
+from spargel_llm.lr_schedule import (
+    ConstantLearningRateSchedule,
+    LearningRateSchedule,
+    LinearWarmupConstantCooldownSchedule,
+)
 from spargel_llm.model import Config, Model
 from spargel_llm.parquet_utils import get_dataset_id
 from spargel_llm.train import (
@@ -73,6 +78,24 @@ class DataConfig(BaseModel):
     add_eot: bool = False
 
 
+class ConstantLrScheduleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["constant"] = "constant"
+
+
+class WarmupConstantCooldownLrScheduleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["warmup_constant_cooldown"]
+    warmup_steps: NonNegativeInt
+    cooldown_steps: NonNegativeInt
+    min_lr: NonNegativeFloat
+
+
+LrScheduleConfig = ConstantLrScheduleConfig | WarmupConstantCooldownLrScheduleConfig
+
+
 class TrainRunConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -89,15 +112,42 @@ class TrainRunConfig(BaseModel):
     seed: int = 0
     use_bf16: bool = True
     float32_precision: Float32Precision = "high"
+    lr_schedule: LrScheduleConfig = Field(
+        default_factory=ConstantLrScheduleConfig,
+        discriminator="type",
+    )
 
     @model_validator(mode="after")
-    def _validate_batch_shape(self) -> "TrainRunConfig":
+    def _validate_train_config(self) -> "TrainRunConfig":
         if self.batch_size % self.micro_batches != 0:
             raise ValueError(
                 "batch_size must be divisible by micro_batches "
                 f"({self.batch_size} % {self.micro_batches} != 0)"
             )
+        if self.lr_schedule.type == "warmup_constant_cooldown":
+            scheduled_steps = (
+                self.lr_schedule.warmup_steps + self.lr_schedule.cooldown_steps
+            )
+            if scheduled_steps > self.steps:
+                raise ValueError("warmup_steps + cooldown_steps must be <= steps")
+            if self.lr_schedule.min_lr > self.learning_rate:
+                raise ValueError("lr_schedule.min_lr must be <= learning_rate")
         return self
+
+
+def build_lr_schedule(config: TrainRunConfig) -> LearningRateSchedule:
+    lr_schedule = config.lr_schedule
+    if lr_schedule.type == "constant":
+        return ConstantLearningRateSchedule(config.learning_rate)
+    if lr_schedule.type == "warmup_constant_cooldown":
+        return LinearWarmupConstantCooldownSchedule(
+            peak_lr=config.learning_rate,
+            total_steps=config.steps,
+            warmup_steps=lr_schedule.warmup_steps,
+            cooldown_steps=lr_schedule.cooldown_steps,
+            min_lr=lr_schedule.min_lr,
+        )
+    raise ValueError(f"unknown lr_schedule type: {lr_schedule.type}")
 
 
 class ExperimentConfig(BaseModel):
@@ -262,7 +312,9 @@ def ensure_run_dir_in_runs(
     try:
         path.relative_to(runs_dir)
     except ValueError as exc:
-        raise ExperimentError(f"run directory must be under {runs_dir}: {path}") from exc
+        raise ExperimentError(
+            f"run directory must be under {runs_dir}: {path}"
+        ) from exc
     if not path.is_dir():
         raise ExperimentError(f"run directory does not exist: {path}")
     return path
@@ -413,7 +465,9 @@ def load_checkpoint(
     if not model_path.is_file() or not optimizer_path.is_file():
         raise ExperimentError(f"checkpoint is incomplete: {checkpoint_dir}")
 
-    model.load_state_dict(torch.load(model_path, weights_only=True, map_location=device))
+    model.load_state_dict(
+        torch.load(model_path, weights_only=True, map_location=device)
+    )
     optimizer.load_state_dict(torch.load(optimizer_path, map_location=device))
 
 
@@ -512,6 +566,8 @@ def _log_step(
     if writer is not None:
         writer.add_scalar("loss/train", step_info.loss, token_count)
         writer.add_scalar("metric/time/elapsed", train_info.time, token_count)
+        if step_info.learning_rate is not None:
+            writer.add_scalar("lr/train", step_info.learning_rate, token_count)
 
     log_state.sum_loss += step_info.loss * step_info.tokens_non_pad
     log_state.sum_time += step_info.time
@@ -558,17 +614,24 @@ def _log_step(
         if val_metrics is not None:
             writer.add_scalar("metric/time/val", val_time, token_count)
 
+    lr_text = (
+        "unknown"
+        if step_info.learning_rate is None
+        else f"{step_info.learning_rate:.6g}"
+    )
+
     if val_metrics is None:
         print(
             f"  {completed_step}: avg_loss={avg_loss:.6f}, "
-            f"avg_time={avg_time:.6f}"
+            f"lr={lr_text}, avg_time={avg_time:.6f}"
         )
     else:
         val_loss, val_entropy = val_metrics
         print(
             f"  {completed_step}: avg_loss={avg_loss:.6f}, "
             f"val_loss={val_loss:.6f}, val_entropy={val_entropy:.6f}, "
-            f"avg_time={avg_time:.6f}, val_time={val_time:.6f}"
+            f"lr={lr_text}, avg_time={avg_time:.6f}, "
+            f"val_time={val_time:.6f}"
         )
         if writer is not None:
             writer.add_scalar("loss/val", val_loss, token_count)
@@ -651,6 +714,7 @@ def _train_to_target(
     train_info = state.train_info.model_copy(deep=True)
     log_state = LogState()
     writer = SummaryWriter(str(run_dir / "tensorboard"))
+    lr_schedule = build_lr_schedule(config.train)
 
     try:
         while state.steps_trained < config.train.steps:
@@ -717,6 +781,7 @@ def _train_to_target(
                 micro_batches=config.train.micro_batches,
                 step_offset=state.steps_trained,
                 use_bf16=config.train.use_bf16,
+                lr_schedule=lr_schedule,
             )
 
             if actual_steps == remaining:

@@ -1125,8 +1125,7 @@ def action_validate(
 
     if val_actual < num_batches:
         log_warning(
-            f"Validation dataset exhausted early "
-            f"({val_actual}/{num_batches} batches)."
+            f"Validation dataset exhausted early ({val_actual}/{num_batches} batches)."
         )
 
     if device == "cuda":
