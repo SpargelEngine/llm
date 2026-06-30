@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "model": {
+    "vocab_size": 8192,
+    "max_seq_len": 256,
+    "num_layer": 4,
+    "num_head": 4,
+    "dim": 256,
+    "dim_key": 64,
+    "dim_value": 64,
+    "dim_ff_hidden": 1024,
+    "use_rope": true,
+    "ff_activation": "relu"
+  },
+  "tokenizer": "data/tokenizer.json",
+  "data": {
+    "train_path": "data/tokens.parquet",
+    "validation_path": "data/tokens_val.parquet",
+    "start_index": 0,
+    "start_offset": 0,
+    "add_sot": false,
+    "add_eot": false
+  },
+  "train": {
+    "steps": 5000,
+    "seq_len": 256,
+    "batch_size": 1024,
+    "learning_rate": 0.001,
+    "weight_decay": 0.1,
+    "micro_batches": 1,
+    "log_period": 10,
+    "checkpoint_interval": 100,
+    "validation_batches": 1,
+    "loop_dataset": true,
+    "seed": 0,
+    "use_bf16": true,
+    "float32_precision": "high"
+  }
+}
