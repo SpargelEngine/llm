@@ -25,7 +25,7 @@ def run_git(args: list[str]) -> str | None:
 def check_git_status() -> bool:
     """Return True if the working tree is up to date with remote."""
     output = run_git(["status", "--porcelain"])
-    if not output:
+    if output is None or output != "":
         return False
     output = run_git(
         ["log", "@{u}..HEAD", "--oneline"],
