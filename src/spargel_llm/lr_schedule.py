@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from torch.optim import Optimizer
 
@@ -55,6 +55,50 @@ class LinearWarmupConstantCooldownSchedule:
             return self.peak_lr + (self.min_lr - self.peak_lr) * progress
 
         return self.peak_lr
+
+
+@dataclass(frozen=True)
+class LinearWarmupStepDecaySchedule:
+    peak_lr: float
+    total_steps: int
+    warmup_steps: int
+    decay_steps: Sequence[int]
+    decay_factor: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "decay_steps", tuple(self.decay_steps))
+
+        if self.peak_lr < 0:
+            raise ValueError("peak_lr must be non-negative")
+        if self.total_steps <= 0:
+            raise ValueError("total_steps must be positive")
+        if self.warmup_steps < 0:
+            raise ValueError("warmup_steps must be non-negative")
+        if not 0 < self.decay_factor <= 1:
+            raise ValueError("decay_factor must satisfy 0 < decay_factor <= 1")
+
+        previous = -1
+        for decay_step in self.decay_steps:
+            if decay_step <= previous:
+                raise ValueError("decay_steps must be strictly increasing")
+            if decay_step < self.warmup_steps:
+                raise ValueError("decay_steps must be >= warmup_steps")
+            if decay_step >= self.total_steps:
+                raise ValueError("decay_steps must be < total_steps")
+            previous = decay_step
+
+    def lr_at_step(self, step: int) -> float:
+        _validate_step(step)
+
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            return self.peak_lr * (step + 1) / self.warmup_steps
+
+        decay_count = 0
+        for decay_step in self.decay_steps:
+            if step < decay_step:
+                break
+            decay_count += 1
+        return self.peak_lr * (self.decay_factor**decay_count)
 
 
 def set_optimizer_learning_rate(optimizer: Optimizer, learning_rate: float) -> None:

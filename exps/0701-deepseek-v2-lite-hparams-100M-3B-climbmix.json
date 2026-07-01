@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "model": {
+    "vocab_size": 8192,
+    "max_seq_len": 4096,
+    "num_layer": 12,
+    "num_head": 8,
+    "dim": 1024,
+    "dim_key": 128,
+    "dim_value": 128,
+    "dim_ff_hidden": 4096,
+    "use_rope": true,
+    "ff_activation": "relu"
+  },
+  "tokenizer": "data/tokenizer.json",
+  "data": {
+    "train_path": "data/climbmix_small/shards_0_7.train.parquet",
+    "validation_path": "data/climbmix_small/shards_0_7.val.parquet",
+    "start_index": 0,
+    "start_offset": 0,
+    "add_sot": false,
+    "add_eot": false
+  },
+  "train": {
+    "steps": 11445,
+    "seq_len": 256,
+    "batch_size": 1024,
+    "learning_rate": 0.00042,
+    "weight_decay": 0.1,
+    "micro_batches": 2,
+    "log_period": 10,
+    "checkpoint_interval": 100,
+    "validation_batches": 1,
+    "loop_dataset": true,
+    "seed": 0,
+    "use_bf16": true,
+    "float32_precision": "high",
+    "optimizer": {
+      "type": "adamw",
+      "beta1": 0.9,
+      "beta2": 0.95,
+      "eps": 1e-8
+    },
+    "gradient_clip_norm": 1.0,
+    "lr_schedule": {
+      "type": "warmup_step_decay",
+      "warmup_steps": 2000,
+      "decay_steps": [
+        9156,
+        10301
+      ],
+      "decay_factor": 0.316
+    }
+  }
+}

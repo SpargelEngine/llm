@@ -109,6 +109,13 @@ class BatchData:
     tokens: int
     tokens_non_pad: int
 
+    def __iter__(self) -> Iterator[Tensor | int]:
+        yield self.input_ids
+        yield self.mask
+        yield self.target_ids
+        yield self.tokens
+        yield self.tokens_non_pad
+
 
 def train(
     info: TrainInfo,
@@ -124,6 +131,7 @@ def train(
     step_offset: int = 0,
     use_bf16: bool = True,
     lr_schedule: LearningRateSchedule | None = None,
+    gradient_clip_norm: float | None = None,
 ) -> int:
     """Run up to *steps* training steps.
 
@@ -139,6 +147,8 @@ def train(
     if the data iterator is exhausted).
     """
     assert micro_batches >= 1
+    if gradient_clip_norm is not None and gradient_clip_norm <= 0:
+        raise ValueError("gradient_clip_norm must be positive")
 
     torch_device = torch.device(device)
     device_type = torch_device.type
@@ -191,6 +201,9 @@ def train(
             loss.backward()
 
         # update weights
+        if gradient_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+
         current_lr = None
         if lr_schedule is not None:
             current_lr = lr_schedule.lr_at_step(step_offset + step)

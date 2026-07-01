@@ -39,6 +39,7 @@ from torch.utils.tensorboard import SummaryWriter
 from spargel_llm.lr_schedule import (
     ConstantLearningRateSchedule,
     LearningRateSchedule,
+    LinearWarmupStepDecaySchedule,
     LinearWarmupConstantCooldownSchedule,
 )
 from spargel_llm.model import Config, Model
@@ -93,7 +94,32 @@ class WarmupConstantCooldownLrScheduleConfig(BaseModel):
     min_lr: NonNegativeFloat
 
 
-LrScheduleConfig = ConstantLrScheduleConfig | WarmupConstantCooldownLrScheduleConfig
+class WarmupStepDecayLrScheduleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["warmup_step_decay"]
+    warmup_steps: NonNegativeInt
+    decay_steps: list[NonNegativeInt]
+    decay_factor: PositiveFloat
+
+
+LrScheduleConfig = (
+    ConstantLrScheduleConfig
+    | WarmupConstantCooldownLrScheduleConfig
+    | WarmupStepDecayLrScheduleConfig
+)
+
+
+class AdamWOptimizerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["adamw"] = "adamw"
+    beta1: float = Field(default=0.9, ge=0, lt=1)
+    beta2: float = Field(default=0.999, ge=0, lt=1)
+    eps: PositiveFloat = 1e-8
+
+
+OptimizerConfig = AdamWOptimizerConfig
 
 
 class TrainRunConfig(BaseModel):
@@ -112,6 +138,8 @@ class TrainRunConfig(BaseModel):
     seed: int = 0
     use_bf16: bool = True
     float32_precision: Float32Precision = "high"
+    optimizer: OptimizerConfig = Field(default_factory=AdamWOptimizerConfig)
+    gradient_clip_norm: PositiveFloat | None = None
     lr_schedule: LrScheduleConfig = Field(
         default_factory=ConstantLrScheduleConfig,
         discriminator="type",
@@ -132,6 +160,22 @@ class TrainRunConfig(BaseModel):
                 raise ValueError("warmup_steps + cooldown_steps must be <= steps")
             if self.lr_schedule.min_lr > self.learning_rate:
                 raise ValueError("lr_schedule.min_lr must be <= learning_rate")
+        elif self.lr_schedule.type == "warmup_step_decay":
+            if self.lr_schedule.decay_factor > 1:
+                raise ValueError(
+                    "lr_schedule.decay_factor must satisfy 0 < decay_factor <= 1"
+                )
+            previous = -1
+            for decay_step in self.lr_schedule.decay_steps:
+                if decay_step <= previous:
+                    raise ValueError("lr_schedule.decay_steps must be sorted")
+                if decay_step < self.lr_schedule.warmup_steps:
+                    raise ValueError(
+                        "lr_schedule.decay_steps must be >= warmup_steps"
+                    )
+                if decay_step >= self.steps:
+                    raise ValueError("lr_schedule.decay_steps must be < steps")
+                previous = decay_step
         return self
 
 
@@ -146,6 +190,14 @@ def build_lr_schedule(config: TrainRunConfig) -> LearningRateSchedule:
             warmup_steps=lr_schedule.warmup_steps,
             cooldown_steps=lr_schedule.cooldown_steps,
             min_lr=lr_schedule.min_lr,
+        )
+    if lr_schedule.type == "warmup_step_decay":
+        return LinearWarmupStepDecaySchedule(
+            peak_lr=config.learning_rate,
+            total_steps=config.steps,
+            warmup_steps=lr_schedule.warmup_steps,
+            decay_steps=lr_schedule.decay_steps,
+            decay_factor=lr_schedule.decay_factor,
         )
     raise ValueError(f"unknown lr_schedule type: {lr_schedule.type}")
 
@@ -403,9 +455,22 @@ def set_seed(seed: int) -> None:
 
 
 def create_optimizer(
-    model: Model, *, learning_rate: float, weight_decay: float
+    model: Model,
+    *,
+    learning_rate: float,
+    weight_decay: float,
+    optimizer_config: OptimizerConfig | None = None,
 ) -> AdamW:
-    return AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer_config = optimizer_config or AdamWOptimizerConfig()
+    if optimizer_config.type == "adamw":
+        return AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            betas=(optimizer_config.beta1, optimizer_config.beta2),
+            eps=optimizer_config.eps,
+        )
+    raise ValueError(f"unknown optimizer type: {optimizer_config.type}")
 
 
 def build_model_and_optimizer(
@@ -416,6 +481,7 @@ def build_model_and_optimizer(
         model,
         learning_rate=config.train.learning_rate,
         weight_decay=config.train.weight_decay,
+        optimizer_config=config.train.optimizer,
     )
     return model, optimizer
 
@@ -782,6 +848,7 @@ def _train_to_target(
                 step_offset=state.steps_trained,
                 use_bf16=config.train.use_bf16,
                 lr_schedule=lr_schedule,
+                gradient_clip_norm=config.train.gradient_clip_norm,
             )
 
             if actual_steps == remaining:
