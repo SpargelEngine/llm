@@ -56,8 +56,8 @@ class TestCombinePass:
         """Each pass runs on the full upstream iterator independently."""
         inst = self._build(
             [
-                PlainTextPass(name="text", texts=["a", "b"]),
-                PlainTextPass(name="text", texts=["c"]),
+                PlainTextPass(texts=["a", "b"]),
+                PlainTextPass(texts=["c"]),
             ]
         )
         result = set(inst.process(["x", "y"]))
@@ -70,8 +70,8 @@ class TestCombinePass:
         """Strip pass and split pass each operate on the same input."""
         inst = self._build(
             [
-                StripPass(name="strip"),
-                SplitPass(name="split", separator="\n"),
+                StripPass(),
+                SplitPass(separator="\n"),
             ]
         )
         result = list(inst.process(["  a\nb  ", "  c  "]))
@@ -89,13 +89,13 @@ class TestCombinePass:
         assert result == []
 
     def test_empty_input(self):
-        inst = self._build([StripPass(name="strip")])
+        inst = self._build([StripPass()])
         result = list(inst.process([]))
         assert result == []
 
     def test_single_pass_is_identity_equivalent(self):
         """Single pass in combine yields same as running pass directly."""
-        inst = self._build([StripPass(name="strip")])
+        inst = self._build([StripPass()])
         result = list(inst.process(["  a  ", "  b  "]))
         assert set(result) == {"a", "b"}
 
@@ -103,8 +103,8 @@ class TestCombinePass:
         """Each pass produces 1:1 output, so total count = passes * inputs."""
         inst = self._build(
             [
-                StripPass(name="strip"),
-                StripPass(name="strip"),
+                StripPass(),
+                StripPass(),
             ]
         )
         result = list(inst.process(["  a  ", "  b  "]))
@@ -237,12 +237,12 @@ class TestFilterPass:
         assert result == ["foo", "a foo b"]
 
     def test_end_to_end_filter(self):
-        passes = [FilterPass(name="filter", pattern=r"keep")]
+        passes = [FilterPass(pattern=r"keep")]
         result = list(process_texts(["keep me", "discard", "also keep this"], passes))
         assert result == ["keep me", "also keep this"]
 
     def test_end_to_end_filter_invert(self):
-        passes = [FilterPass(name="filter", pattern=r"drop", invert=True)]
+        passes = [FilterPass(pattern=r"drop", invert=True)]
         result = list(process_texts(["drop me", "keep this", "drop that too"], passes))
         assert result == ["keep this"]
 
@@ -258,7 +258,7 @@ class TestFilterPass:
 class TestFindPass:
     @staticmethod
     def _build(**kwargs):
-        return FindPass(name="find", **kwargs).build(".")
+        return FindPass(**kwargs).build(".")
 
     def _make_tree(self, tmp_path):
         base = tmp_path / "root"
@@ -324,7 +324,7 @@ class TestFindPass:
         base.mkdir()
         (base / "a.txt").write_text("a")
 
-        p = FindPass(name="find", base="data", file_pattern=r".*\.txt")
+        p = FindPass(base="data", file_pattern=r".*\.txt")
         inst = p.build(config)
         paths = sorted(inst.process([]))
         assert len(paths) == 1
@@ -359,19 +359,17 @@ class TestForEachPass:
         return ForEachPass(passes=passes).build(".")
 
     def test_applies_single_pass_to_each_text(self):
-        inst = self._build([StripPass(name="strip")])
+        inst = self._build([StripPass()])
         result = list(inst.process(["  a  ", "  b  ", "  c  "]))
         assert result == ["a", "b", "c"]
 
     def test_applies_split_to_each_text(self):
-        inst = self._build([SplitPass(name="split", separator="\n")])
+        inst = self._build([SplitPass(separator="\n")])
         result = list(inst.process(["a\nb", "c\nd"]))
         assert result == ["a", "b", "c", "d"]
 
     def test_chains_multiple_passes_per_text(self):
-        inst = self._build(
-            [StripPass(name="strip"), SplitPass(name="split", separator="\n")]
-        )
+        inst = self._build([StripPass(), SplitPass(separator="\n")])
         result = list(inst.process([" a\nb ", " c "]))
         assert result == ["a", "b", "c"]
 
@@ -381,15 +379,15 @@ class TestForEachPass:
         assert result == ["hello", "world"]
 
     def test_empty_input(self):
-        inst = self._build([StripPass(name="strip")])
+        inst = self._build([StripPass()])
         assert list(inst.process([])) == []
 
     def test_split_strip_join_preserves_text_count(self):
         inst = self._build(
             [
-                SplitPass(name="split", separator="\n"),
-                StripPass(name="strip"),
-                JoinPass(name="join", separator="\n"),
+                SplitPass(separator="\n"),
+                StripPass(),
+                JoinPass(separator="\n"),
             ]
         )
         result = list(inst.process(["  a  \n  b  ", "  c  \n  d  "]))
@@ -398,9 +396,9 @@ class TestForEachPass:
     def test_split_strip_join_single_text(self):
         inst = self._build(
             [
-                SplitPass(name="split", separator="\n"),
-                StripPass(name="strip"),
-                JoinPass(name="join", separator="\n"),
+                SplitPass(separator="\n"),
+                StripPass(),
+                JoinPass(separator="\n"),
             ]
         )
         result = list(inst.process(["  hello  \n  world  \n  !  "]))
@@ -409,9 +407,9 @@ class TestForEachPass:
     def test_split_strip_join_empty_lines_become_empty_string(self):
         inst = self._build(
             [
-                SplitPass(name="split", separator="\n"),
-                StripPass(name="strip"),
-                JoinPass(name="join", separator="\n"),
+                SplitPass(separator="\n"),
+                StripPass(),
+                JoinPass(separator="\n"),
             ]
         )
         result = list(inst.process(["a\n   \nb"]))
@@ -420,14 +418,12 @@ class TestForEachPass:
     # nesting — ForEachPass can contain ForEachPass
 
     def test_nests_for_each_inside_for_each(self):
-        inst = self._build([ForEachPass(passes=[StripPass(name="strip")])])
+        inst = self._build([ForEachPass(passes=[StripPass()])])
         result = list(inst.process(["  a  ", "  b  ", "  c  "]))
         assert result == ["a", "b", "c"]
 
     def test_nests_deeply(self):
-        inst = self._build(
-            [ForEachPass(passes=[ForEachPass(passes=[StripPass(name="strip")])])]
-        )
+        inst = self._build([ForEachPass(passes=[ForEachPass(passes=[StripPass()])])])
         result = list(inst.process(["  a  ", "  b  "]))
         assert result == ["a", "b"]
 
@@ -436,12 +432,12 @@ class TestForEachPass:
             [
                 ForEachPass(
                     passes=[
-                        SplitPass(name="split", separator="\n"),
-                        StripPass(name="strip"),
-                        JoinPass(name="join", separator="\n"),
+                        SplitPass(separator="\n"),
+                        StripPass(),
+                        JoinPass(separator="\n"),
                     ]
                 ),
-                StripPass(name="strip"),
+                StripPass(),
             ]
         )
         result = list(inst.process(["  a  \n  b  ", "  c  \n  d  "]))
@@ -452,8 +448,8 @@ class TestForEachPass:
             [
                 ForEachPass(
                     passes=[
-                        SplitPass(name="split", separator="\n"),
-                        FilterPass(name="filter", pattern=r"keep"),
+                        SplitPass(separator="\n"),
+                        FilterPass(pattern=r"keep"),
                     ]
                 ),
             ]
@@ -462,7 +458,7 @@ class TestForEachPass:
         assert result == ["keep", "keep2"]
 
     def test_via_process_texts(self):
-        passes = [ForEachPass(passes=[StripPass(name="strip")])]
+        passes = [ForEachPass(passes=[StripPass()])]
         result = list(process_texts(["  a  ", "  b  "], passes))
         assert result == ["a", "b"]
 
@@ -470,9 +466,9 @@ class TestForEachPass:
         passes = [
             ForEachPass(
                 passes=[
-                    SplitPass(name="split", separator="\n"),
-                    StripPass(name="strip"),
-                    JoinPass(name="join", separator="\n"),
+                    SplitPass(separator="\n"),
+                    StripPass(),
+                    JoinPass(separator="\n"),
                 ]
             )
         ]
@@ -481,9 +477,9 @@ class TestForEachPass:
 
     def test_via_process_texts_mixed_flat_and_for_each(self):
         passes = [
-            StripPass(name="strip"),
-            ForEachPass(passes=[SplitPass(name="split", separator="\n")]),
-            StripPass(name="strip"),
+            StripPass(),
+            ForEachPass(passes=[SplitPass(separator="\n")]),
+            StripPass(),
         ]
         result = list(process_texts(["  a\nb  "], passes))
         assert result == ["a", "b"]
@@ -596,7 +592,7 @@ class TestForEachPassModel:
 class TestJSONPass:
     @staticmethod
     def _build(**kwargs):
-        return JSONPass(name="json", **kwargs).build(".")
+        return JSONPass(**kwargs).build(".")
 
     def test_extracts_string_field(self):
         inst = self._build(key="content")
@@ -654,10 +650,10 @@ class TestJSONPass:
             encoding="utf-8",
         )
 
-        read_inst = ReadFilePass(name="read_file", base=str(d), lines=True).build(".")
-        strip_inst = StripPass(name="strip").build(".")
-        filter_inst = FilterPass(name="filter", pattern=r"^$", invert=True).build(".")
-        json_inst = JSONPass(name="json", key="text").build(".")
+        read_inst = ReadFilePass(base=str(d), lines=True).build(".")
+        strip_inst = StripPass().build(".")
+        filter_inst = FilterPass(pattern=r"^$", invert=True).build(".")
+        json_inst = JSONPass(key="text").build(".")
 
         chain = ChainPassInstance([read_inst, strip_inst, filter_inst, json_inst])
         result = list(chain.process([jsonl_path.name]))
@@ -667,7 +663,7 @@ class TestJSONPass:
 class TestJoinPass:
     @staticmethod
     def _build(**kwargs):
-        return JoinPass(name="join", **kwargs).build(".")
+        return JoinPass(**kwargs).build(".")
 
     def test_join_default_empty_separator(self):
         inst = self._build()
@@ -698,7 +694,7 @@ class TestJoinPass:
 class TestPlainTextPass:
     @staticmethod
     def _build(**kwargs):
-        return PlainTextPass(name="text", **kwargs).build(".")
+        return PlainTextPass(**kwargs).build(".")
 
     def test_process_yields_given_texts(self):
         inst = self._build(texts=["hello", "world"])
@@ -724,7 +720,7 @@ class TestPlainTextPass:
 class TestReadFilePass:
     @staticmethod
     def _build(**kwargs):
-        return ReadFilePass(name="read_file", **kwargs).build(".")
+        return ReadFilePass(**kwargs).build(".")
 
     def test_reads_single_file(self, tmp_path):
         f = tmp_path / "data" / "file.txt"
@@ -752,7 +748,7 @@ class TestReadFilePass:
         d.mkdir()
         (d / "file.txt").write_text("hello")
 
-        p = ReadFilePass(name="read_file", base="data")
+        p = ReadFilePass(base="data")
         inst = p.build(config)
         result = list(inst.process(["file.txt"]))
         assert result == ["hello"]
@@ -846,7 +842,7 @@ class TestReadFilePass:
 class TestReferencePass:
     @staticmethod
     def _build(**kwargs):
-        return ReferencePass(name="ref", **kwargs).build(".")
+        return ReferencePass(**kwargs).build(".")
 
     def test_references_external_passes(self, tmp_path):
         d = tmp_path / "data"
@@ -896,7 +892,7 @@ class TestReferencePass:
         refs_dir.mkdir()
         (refs_dir / "ops.json").write_text(json.dumps({"passes": [{"name": "strip"}]}))
 
-        p = ReferencePass(name="ref", base="refs", paths=["ops.json"])
+        p = ReferencePass(base="refs", paths=["ops.json"])
         inst = p.build(config)
         result = list(inst.process(["  hello  "]))
         assert result == ["hello"]
@@ -914,7 +910,7 @@ class TestReferencePass:
         assert result == ["nested"]
 
     def test_missing_ref_file_raises(self, tmp_path):
-        p = ReferencePass(name="ref", base=str(tmp_path), paths=["nope.json"])
+        p = ReferencePass(base=str(tmp_path), paths=["nope.json"])
         with pytest.raises(FileNotFoundError):
             p.build(".")
 
@@ -998,12 +994,12 @@ class TestReplacePass:
         assert result == ["x"]
 
     def test_end_to_end_replace(self):
-        passes = [ReplacePass(name="replace", old="foo", new="bar")]
+        passes = [ReplacePass(old="foo", new="bar")]
         result = list(process_texts(["foo bar foo"], passes))
         assert result == ["bar bar bar"]
 
     def test_end_to_end_replace_regex(self):
-        passes = [ReplacePass(name="replace", regex=True, old=r"\b\w{3}\b", new="???")]
+        passes = [ReplacePass(regex=True, old=r"\b\w{3}\b", new="???")]
         result = list(process_texts(["abc def ghij"], passes))
         assert result == ["??? ??? ghij"]
 
@@ -1292,7 +1288,7 @@ class TestSplitPass:
 class TestStripPass:
     @staticmethod
     def _build(**kwargs):
-        return StripPass(name="strip", **kwargs).build(".")
+        return StripPass(**kwargs).build(".")
 
     def test_strips_whitespace(self):
         inst = self._build()
@@ -1337,14 +1333,14 @@ class TestStripPass:
 
 class TestChainPassInstance:
     def test_chains_two_instances(self):
-        a = StripPass(name="strip").build(".")
-        b = SplitPass(name="split", separator="\n").build(".")
+        a = StripPass().build(".")
+        b = SplitPass(separator="\n").build(".")
         chain = ChainPassInstance([a, b])
         result = list(chain.process([" a\nb ", " c "]))
         assert result == ["a", "b", "c"]
 
     def test_chain_single_instance(self):
-        a = StripPass(name="strip").build(".")
+        a = StripPass().build(".")
         chain = ChainPassInstance([a])
         result = list(chain.process(["  x  "]))
         assert result == ["x"]
@@ -1355,22 +1351,22 @@ class TestChainPassInstance:
         assert result == ["a", "b"]
 
     def test_three_pass_chain(self):
-        a = PlainTextPass(name="text", texts=["extra"]).build(".")
-        b = StripPass(name="strip").build(".")
-        c = SplitPass(name="split", separator="\n").build(".")
+        a = PlainTextPass(texts=["extra"]).build(".")
+        b = StripPass().build(".")
+        c = SplitPass(separator="\n").build(".")
         chain = ChainPassInstance([a, b, c])
         result = list(chain.process(["  hello\n  "]))
         assert result == ["hello", "extra"]
 
     def test_chain_with_for_each_instance(self):
-        fe = ForEachPass(passes=[StripPass(name="strip")]).build(".")
-        j = JoinPass(name="join", separator="|").build(".")
+        fe = ForEachPass(passes=[StripPass()]).build(".")
+        j = JoinPass(separator="|").build(".")
         chain = ChainPassInstance([fe, j])
         result = list(chain.process(["  a  ", "  b  ", "  c  "]))
         assert result == ["a|b|c"]
 
     def test_chain_mixed_sources(self):
-        a = StripPass(name="strip").build(".")
+        a = StripPass().build(".")
         b = (
             TextPassList.model_validate(
                 {"passes": [{"name": "split", "separator": "\n"}]}
@@ -1383,15 +1379,15 @@ class TestChainPassInstance:
         assert result == ["a", "b", "c"]
 
     def test_chain_for_each_followed_by_filter(self):
-        fe = ForEachPass(passes=[SplitPass(name="split", separator="\n")]).build(".")
-        f = FilterPass(name="filter", pattern=r"keep").build(".")
+        fe = ForEachPass(passes=[SplitPass(separator="\n")]).build(".")
+        f = FilterPass(pattern=r"keep").build(".")
         chain = ChainPassInstance([fe, f])
         result = list(chain.process(["keep\nskip", "also keep"]))
         assert result == ["keep", "also keep"]
 
     def test_chain_filter_followed_by_for_each(self):
-        f = FilterPass(name="filter", pattern=r"good").build(".")
-        fe = ForEachPass(passes=[StripPass(name="strip")]).build(".")
+        f = FilterPass(pattern=r"good").build(".")
+        fe = ForEachPass(passes=[StripPass()]).build(".")
         chain = ChainPassInstance([f, fe])
         result = list(chain.process(["  good  ", "  bad  ", "  good2  "]))
         assert result == ["good", "good2"]
@@ -1444,15 +1440,15 @@ class TestTextPassList:
 
 class TestProcessTexts:
     def test_code_constructed_strip(self):
-        passes = [StripPass(name="strip")]
+        passes = [StripPass()]
         result = list(process_texts(["  hello  ", "  world  "], passes))
         assert result == ["hello", "world"]
 
     def test_code_constructed_multi_pass_pipeline(self):
         passes = [
-            PlainTextPass(name="text", texts=["extra"]),
-            StripPass(name="strip"),
-            JoinPass(name="join", separator=" "),
+            PlainTextPass(texts=["extra"]),
+            StripPass(),
+            JoinPass(separator=" "),
         ]
         result = list(process_texts(["  hello  "], passes))
         assert result == ["hello extra"]
@@ -1461,8 +1457,8 @@ class TestProcessTexts:
         passes = [
             ForEachPass(
                 passes=[
-                    SplitPass(name="split", separator="\n"),
-                    StripPass(name="strip"),
+                    SplitPass(separator="\n"),
+                    StripPass(),
                 ]
             )
         ]
@@ -1473,7 +1469,7 @@ class TestProcessTexts:
         model_passes = TextPassList.model_validate(
             {"passes": [{"name": "strip"}]}
         ).passes
-        code_for_each = ForEachPass(passes=[SplitPass(name="split", separator="\n")])
+        code_for_each = ForEachPass(passes=[SplitPass(separator="\n")])
         combined = [code_for_each, *model_passes]
         result = list(process_texts([" a\nb "], combined))
         assert result == ["a", "b"]
@@ -1486,8 +1482,8 @@ class TestProcessTexts:
         (data / "f.txt").write_text("hello")
 
         passes = [
-            FindPass(name="find", base="data", paths=["."], file_pattern=r".*\.txt"),
-            ReadFilePass(name="read_file", base="data"),
+            FindPass(base="data", paths=["."], file_pattern=r".*\.txt"),
+            ReadFilePass(base="data"),
         ]
         result = list(process_texts([], passes, path=config))
         assert result == ["hello"]
@@ -1610,17 +1606,16 @@ class TestIntegration:
 
         passes = [
             FindPass(
-                name="find",
                 base=str(d),
                 paths=["."],
                 file_pattern=r".*\.txt",
             ),
-            ReadFilePass(name="read_file", base=str(d)),
+            ReadFilePass(base=str(d)),
             ForEachPass(
                 passes=[
-                    SplitPass(name="split", separator="\n"),
-                    StripPass(name="strip"),
-                    JoinPass(name="join", separator="\n"),
+                    SplitPass(separator="\n"),
+                    StripPass(),
+                    JoinPass(separator="\n"),
                 ]
             ),
         ]
@@ -1634,9 +1629,9 @@ class TestIntegration:
         (d / "b.txt").write_text("  world  ")
 
         passes = [
-            FindPass(name="find", base=str(d), paths=["."], file_pattern=r".*\.txt"),
-            ReadFilePass(name="read_file", base=str(d)),
-            StripPass(name="strip"),
+            FindPass(base=str(d), paths=["."], file_pattern=r".*\.txt"),
+            ReadFilePass(base=str(d)),
+            StripPass(),
         ]
         result = list(process_texts([], passes, path="."))
         assert sorted(result) == ["hello", "world"]
@@ -1649,12 +1644,11 @@ class TestIntegration:
 
         passes = [
             FindPass(
-                name="find",
                 base=str(tmp_path),
                 paths=["A", "B"],
                 file_pattern=r".*\.txt",
             ),
-            ReadFilePass(name="read_file", base=str(tmp_path)),
+            ReadFilePass(base=str(tmp_path)),
         ]
         result = list(process_texts([], passes))
         assert sorted(result) == ["aaa", "bbb"]
@@ -1663,9 +1657,9 @@ class TestIntegration:
         passes = [
             ForEachPass(
                 passes=[
-                    SplitPass(name="split", separator="\n"),
-                    StripPass(name="strip"),
-                    JoinPass(name="join", separator="\n"),
+                    SplitPass(separator="\n"),
+                    StripPass(),
+                    JoinPass(separator="\n"),
                 ]
             )
         ]

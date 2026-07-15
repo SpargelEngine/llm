@@ -100,8 +100,8 @@ class CombinePass(TextPass):
 class CombinePassModel(TextPassModel):
     """Apply passes independently and concatenate results (Model)."""
 
-    name: Literal["combine"]
-    passes: Sequence[DiscriminatedTextPass]
+    name: Literal["combine"] = "combine"
+    passes: list[DiscriminatedTextPass]
 
     @override
     def build(self, config_path):
@@ -112,7 +112,7 @@ class CombinePassModel(TextPassModel):
 class FilterPass(TextPassModel):
     """Filter texts by regex pattern."""
 
-    name: Literal["filter"]
+    name: Literal["filter"] = "filter"
     pattern: str
     invert: bool = False
 
@@ -137,7 +137,7 @@ class FilterPass(TextPassModel):
 class FindPass(TextPassModel):
     """Find files in a directory."""
 
-    name: Literal["find"]
+    name: Literal["find"] = "find"
     base: str = "."
     paths: list[str] = ["."]
     file_pattern: str | None = None
@@ -205,8 +205,8 @@ class ForEachPass(TextPass):
 class ForEachPassModel(TextPassModel):
     """Apply passes to each text (Model)."""
 
-    name: Literal["for_each"]
-    passes: Sequence[DiscriminatedTextPass]
+    name: Literal["for_each"] = "for_each"
+    passes: list[DiscriminatedTextPass]
 
     @override
     def build(self, config_path):
@@ -217,7 +217,7 @@ class ForEachPassModel(TextPassModel):
 class JSONPass(TextPassModel):
     """Parse each text as JSON and extract a key field."""
 
-    name: Literal["json"]
+    name: Literal["json"] = "json"
     key: str
 
     @override
@@ -243,7 +243,7 @@ class JSONPass(TextPassModel):
 class JoinPass(TextPassModel):
     """Join texts."""
 
-    name: Literal["join"]
+    name: Literal["join"] = "join"
     separator: str = ""
 
     @override
@@ -262,7 +262,7 @@ class JoinPass(TextPassModel):
 class PlainTextPass(TextPassModel):
     """Provide a list of plain texts directly."""
 
-    name: Literal["text"]
+    name: Literal["text"] = "text"
     texts: list[str]
 
     @override
@@ -284,7 +284,7 @@ class ReadFilePass(TextPassModel):
     When ``lines`` is true, yields individual lines (via ``readline()`` loop).
     """
 
-    name: Literal["read_file"]
+    name: Literal["read_file"] = "read_file"
     base: str = "."
     encoding: str | None = None
     compression: Literal["gzip"] | None = None
@@ -328,7 +328,7 @@ class ReadFilePass(TextPassModel):
 class ReferencePass(TextPassModel):
     """Reference external passes."""
 
-    name: Literal["ref"]
+    name: Literal["ref"] = "ref"
     base: str = "."
     paths: list[str]
 
@@ -349,7 +349,7 @@ class ReferencePass(TextPassModel):
 class ReplacePass(TextPassModel):
     """Replace All"""
 
-    name: Literal["replace"]
+    name: Literal["replace"] = "replace"
     regex: bool = False
     old: str
     new: str
@@ -394,10 +394,7 @@ class ReplacePass(TextPassModel):
                     return text.replace(self.old, self.new)
 
 
-
-def _literal_positions(
-    text: str, sep: str
-) -> Iterator[tuple[int, int, None]]:
+def _literal_positions(text: str, sep: str) -> Iterator[tuple[int, int, None]]:
     """Yield (start, end, None) of each occurrence of *sep* in *text*."""
     if not sep:
         return
@@ -445,7 +442,7 @@ def _split_iter(
 class SplitPass(TextPassModel):
     """Split text by a separator or regex pattern."""
 
-    name: Literal["split"]
+    name: Literal["split"] = "split"
     separator: str
     regex: bool = False
     max_split: int = 0
@@ -499,15 +496,13 @@ class SplitPass(TextPassModel):
                     )
                 else:
                     raise RuntimeError("no self.cap_pattern")
-                yield from _split_iter(
-                    positions, text, self.max_split, self.behavior
-                )
+                yield from _split_iter(positions, text, self.max_split, self.behavior)
 
 
 class StripPass(TextPassModel):
     """Strip text (remove leading and trailing whitespace)."""
 
-    name: Literal["strip"]
+    name: Literal["strip"] = "strip"
     chars: str | None = None
     right: bool = False
 

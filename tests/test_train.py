@@ -36,7 +36,7 @@ def _make_parquet_multi_rg(
 
 def _first_batch(*args, **kwargs):
     """Convenience: return (inputs, masks, targets) of the first batch."""
-    inputs, masks, targets, _, _ = next(iter(iter_batches(*args, **kwargs)))
+    inputs, masks, targets, _, _, _ = next(iter(iter_batches(*args, **kwargs)))
     return inputs, masks, targets
 
 
@@ -84,17 +84,55 @@ class TestIterBatches:
         np.testing.assert_array_equal(inputs, [[1, 2, 3], [4, 0, 0]])
         np.testing.assert_array_equal(targets, [[2, 3, 4], [5, 0, 0]])
 
-    def test_partial_batch_discarded(self):
-        """4 windows, batch_size=3 → 1 full batch, last window discarded."""
+    def test_partial_batch_yielded(self):
+        """4 windows, batch_size=3 → 1 full batch + 1 partial (padded)."""
         pf = _make_parquet([[1, 2, 3, 4], [5, 6, 7, 8]])
-        batches = list(
-            iter_batches(pf, seq_len=2, batch_size=3, pad_index=0, stride=2)
+        batches = list(iter_batches(pf, seq_len=2, batch_size=3, pad_index=0, stride=2))
+        assert len(batches) == 2
+
+        # Batch 1 (full): Row 0 pos=0 L=2, Row 0 pos=2 L=1, Row 1 pos=0 L=2
+        inputs_1, masks_1, targets_1, _, tokens_1, non_pad_1 = batches[0]
+        np.testing.assert_array_equal(inputs_1, [[1, 2], [3, 0], [5, 6]])
+        np.testing.assert_array_equal(targets_1, [[2, 3], [4, 0], [6, 7]])
+        np.testing.assert_array_equal(
+            masks_1, [[False, False], [False, True], [False, False]]
         )
+        assert tokens_1 == 6
+        assert non_pad_1 == 5
+
+        # Batch 2 (partial): Row 1 pos=2 L=1 + 2 unfilled rows
+        inputs_2, masks_2, targets_2, _, tokens_2, non_pad_2 = batches[1]
+        np.testing.assert_array_equal(inputs_2, [[7, 0], [0, 0], [0, 0]])
+        np.testing.assert_array_equal(targets_2, [[8, 0], [0, 0], [0, 0]])
+        # Unfilled slots have all-False mask so attention never sees
+        # all-masked queries (would produce NaN in softmax).
+        np.testing.assert_array_equal(
+            masks_2, [[False, True], [False, False], [False, False]]
+        )
+        assert tokens_2 == 6
+        assert non_pad_2 == 1
+
+    def test_only_partial_batch(self):
+        """Fewer windows than batch_size → only one partial batch."""
+        pf = _make_parquet([[1, 2, 3, 4]])
+        # aug_len=4, seq_len=2, stride=2 → 2 windows (L=2, L=1)
+        batches = list(iter_batches(pf, seq_len=2, batch_size=4, pad_index=0, stride=2))
         assert len(batches) == 1
-        inputs, _, _, _, _ = batches[0]
-        # Row 0: pos=0 L=2 [1,2], pos=2 L=1 [3,0]
-        # Row 1: pos=0 L=2 [5,6], pos=2 L=1 [7,0] ← discarded
-        np.testing.assert_array_equal(inputs, [[1, 2], [3, 0], [5, 6]])
+
+        inputs, masks, targets, _, tokens, non_pad = batches[0]
+        np.testing.assert_array_equal(inputs, [[1, 2], [3, 0], [0, 0], [0, 0]])
+        np.testing.assert_array_equal(targets, [[2, 3], [4, 0], [0, 0], [0, 0]])
+        np.testing.assert_array_equal(
+            masks,
+            [
+                [False, False],
+                [False, True],
+                [False, False],
+                [False, False],
+            ],
+        )
+        assert tokens == 8
+        assert non_pad == 3
 
     def test_sot_eot(self):
         """[10,20] + SOT=1,EOT=2 → augmented=[1,10,20,2], one window L=3."""
@@ -167,9 +205,7 @@ class TestIterBatches:
         pos=0 L=2 [1,2], pos=3 L=2 [4,5]. No sample at pos=2 (would overlap).
         """
         pf = _make_parquet([[1, 2, 3, 4, 5, 6]])
-        inputs, _, targets = _first_batch(
-            pf, seq_len=2, batch_size=2, pad_index=0
-        )
+        inputs, _, targets = _first_batch(pf, seq_len=2, batch_size=2, pad_index=0)
         # pos=0: L=2, input=[1,2], target=[2,3]
         # pos=3: L=2, input=[4,5], target=[5,6]
         np.testing.assert_array_equal(inputs, [[1, 2], [4, 5]])
@@ -191,6 +227,27 @@ class TestIterBatches:
         # Row 0, pos=0; Row 0, pos=2 → batch 0 (yielded)
         # Row 1, pos=0; Row 1, pos=2 → batch 1 (yielded)
         # Tracker ends at last yielded sample: row 1, offset 2
+        assert tracker.index == 1
+        assert tracker.offset == 2
+
+    def test_tracker_with_partial_batch(self):
+        """Tracker records the last sample in a partial batch correctly."""
+        pf = _make_parquet([[1, 2, 3, 4], [5, 6, 7, 8]])
+        tracker = TrainTracker(index=0, offset=0)
+        batches = list(
+            iter_batches(
+                pf,
+                seq_len=2,
+                batch_size=3,
+                pad_index=0,
+                tracker=tracker,
+                stride=2,
+            )
+        )
+        assert len(batches) == 2
+        # Full batch has samples from Row 0 pos=0, Row 0 pos=2, Row 1 pos=0
+        # Partial batch has sample from Row 1 pos=2 (L=1)
+        # Tracker should reflect the last sample added: row 1, offset 2
         assert tracker.index == 1
         assert tracker.offset == 2
 
@@ -232,7 +289,7 @@ class TestIterBatches:
         it = iter_batches(pf, seq_len=4, batch_size=2, pad_index=0, stride=3)
 
         # Batch 1 (buffer 0): Row 0 pos=0 L=4, pos=3 L=4
-        inputs_1, _, targets_1, _, n_non_pad_1 = next(it)
+        inputs_1, _, targets_1, _, _, n_non_pad_1 = next(it)
         np.testing.assert_array_equal(inputs_1[0], [1, 2, 3, 4])
         np.testing.assert_array_equal(targets_1[0], [2, 3, 4, 5])
         np.testing.assert_array_equal(inputs_1[1], [4, 5, 6, 7])
@@ -240,7 +297,7 @@ class TestIterBatches:
         assert n_non_pad_1 == 8
 
         # Batch 2 (buffer 1): Row 0 pos=6 L=1, Row 1 pos=0 L=4
-        inputs_2, _, targets_2, _, n_non_pad_2 = next(it)
+        inputs_2, _, targets_2, _, _, n_non_pad_2 = next(it)
         np.testing.assert_array_equal(inputs_2[0], [7, 0, 0, 0])
         np.testing.assert_array_equal(targets_2[0], [8, 0, 0, 0])
         np.testing.assert_array_equal(inputs_2[1], [10, 20, 30, 40])
@@ -248,7 +305,7 @@ class TestIterBatches:
         assert n_non_pad_2 == 5
 
         # Batch 3 (buffer 0 reused): Row 1 pos=3 L=4, pos=6 L=1
-        inputs_3, masks_3, targets_3, _, n_non_pad_3 = next(it)
+        inputs_3, masks_3, targets_3, _, _, n_non_pad_3 = next(it)
         np.testing.assert_array_equal(inputs_3[0], [40, 50, 60, 70])
         np.testing.assert_array_equal(targets_3[0], [50, 60, 70, 80])
         np.testing.assert_array_equal(inputs_3[1], [70, 0, 0, 0])
@@ -279,7 +336,7 @@ class TestIterBatches:
                 [8, 9, 10, 11, 12, 13, 14],
             ]
         )
-        for inputs, masks, targets, tokens, n_non_pad in iter_batches(
+        for inputs, masks, targets, _, tokens, n_non_pad in iter_batches(
             pf, seq_len=3, batch_size=3, pad_index=0, stride=2
         ):
             assert tokens == inputs.numel(), "tokens must equal total elements"
@@ -298,7 +355,7 @@ class TestIterBatches:
                 [8, 9, 10, 11, 12, 13, 14],
             ]
         )
-        for _, masks, targets, _, _ in iter_batches(
+        for _, masks, targets, _, _, _ in iter_batches(
             pf, seq_len=3, batch_size=3, pad_index=0, stride=2
         ):
             np.testing.assert_array_equal(
@@ -317,7 +374,7 @@ class TestIterBatches:
         rows = [[i % 100 + 1] * 20 for i in range(100)]
         pf = _make_parquet(rows)
         count = 0
-        for inputs, masks, targets, tokens, n_non_pad in iter_batches(
+        for inputs, masks, targets, _, tokens, n_non_pad in iter_batches(
             pf, seq_len=4, batch_size=4, pad_index=0, stride=3
         ):
             assert tokens == inputs.numel()
@@ -396,6 +453,28 @@ class TestIterBatches:
         # Row 4 [30,40] aug_len=2: L=min(2,2-0-1)=1, input=[30,0], target=[40,0]
         np.testing.assert_array_equal(inputs, [[10, 0], [30, 0]])
         np.testing.assert_array_equal(targets, [[20, 0], [40, 0]])
+
+    def test_partial_batch_after_start_index(self):
+        """start_index leaves fewer samples than batch_size → partial batch."""
+        pf = _make_parquet(
+            [
+                [1, 2, 3],  # row 0 — skipped
+                [4, 5, 6],  # row 1 — skipped
+                [10, 20, 30],  # row 2 — processed
+            ]
+        )
+        # Row 2 aug_len=3, seq_len=2, stride=2: pos=0 L=2 → 1 window
+        # batch_size=2, only 1 sample → partial batch
+        batches = list(
+            iter_batches(pf, seq_len=2, batch_size=2, pad_index=0, start_index=2)
+        )
+        assert len(batches) == 1
+        inputs, masks, targets, _, tokens, non_pad = batches[0]
+        np.testing.assert_array_equal(inputs, [[10, 20], [0, 0]])
+        np.testing.assert_array_equal(targets, [[20, 30], [0, 0]])
+        np.testing.assert_array_equal(masks, [[False, False], [False, False]])
+        assert tokens == 4
+        assert non_pad == 2
 
     # ── checkpoint resume (start_index + start_offset) ───────────
 

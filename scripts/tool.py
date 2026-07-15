@@ -1,5 +1,4 @@
 import json
-import math
 import os
 import random
 import shutil
@@ -13,15 +12,17 @@ from typing import Callable, Optional
 
 import pyarrow.parquet as pq
 import torch
-from pydantic import BaseModel, NonNegativeInt
+from pydantic import BaseModel, NonNegativeInt, TypeAdapter
 from rich import print as rich_print
 from tokenizers import Tokenizer
 from tokenizers.decoders import DecodeStream
 from torch import Tensor
 from torch.optim import AdamW, Optimizer
+from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.tensorboard import SummaryWriter
 
 from spargel_llm.logging import log_info, log_success, log_warning
+from spargel_llm.lr_scheduler import LRSchedulerModel
 from spargel_llm.model import Config, Model, compute_param_counts
 from spargel_llm.parquet_utils import get_dataset_id
 from spargel_llm.train import (
@@ -44,10 +45,12 @@ EOT = 3
 class TrainConfig(BaseModel):
     seq_len: NonNegativeInt
     batch_size: NonNegativeInt
+    micro_batches: NonNegativeInt = 1
     learning_rate: float
     weight_decay: float
     optimizer_state_file: str
-    micro_batches: NonNegativeInt = 1
+    lr_scheduler: LRSchedulerModel
+    lr_scheduler_state_file: str
 
 
 class ProjectInfo(BaseModel):
@@ -107,8 +110,22 @@ def save_optimizer_state(path: StrOrPath, optimizer: Optimizer):
     torch.save(optimizer.state_dict(), path)
 
 
+def load_lr_scheduler_state(path: StrOrPath, lr_scheduler: LRScheduler):
+    lr_scheduler.load_state_dict(torch.load(path))
+
+
+def save_lr_scheduler_state(path: StrOrPath, lr_scheduler: LRScheduler):
+    torch.save(lr_scheduler.state_dict(), path)
+
+
 def create_optimizer(model: Model, learning_rate: float, weight_decay: float) -> AdamW:
     return AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+
+def create_lr_scheduler(
+    optimizer: Optimizer, model: LRSchedulerModel, last_step: int = -1
+) -> LRScheduler:
+    return model.build(optimizer, last_step)
 
 
 #### other helpers ####
@@ -346,12 +363,15 @@ def log_step_callback(
     writer: SummaryWriter | None,
     on_save: Callable[[], None],
     on_backup: Callable[[], None],
+    lr_scheduler: LRScheduler | None = None,
 ) -> None:
     token_count = train_info.token_count
 
     if writer is not None:
         writer.add_scalar("loss/train", info.loss, token_count)
         writer.add_scalar("metric/time/elapsed", train_info.time, token_count)
+        if lr_scheduler is not None:
+            writer.add_scalar("lr", lr_scheduler.get_last_lr()[0], token_count)
 
     state.sum_loss += info.loss * info.tokens_non_pad
     state.sum_time += info.time
@@ -369,7 +389,7 @@ def log_step_callback(
         if val_dataset is not None:
             t_val_start = time.perf_counter()
 
-            val_loss, val_entropy, val_actual = compute_validation_metrics(
+            val_actual, val_loss, val_perplexity = compute_validation_metrics(
                 model=model,
                 dataset=val_dataset,
                 seq_len=seq_len,
@@ -389,7 +409,7 @@ def log_step_callback(
                 )
                 state.val_exhausted_warned = True
 
-            val_metrics = (val_loss, val_entropy)
+            val_metrics = (val_loss, val_perplexity)
 
             if device == "cuda":
                 torch.cuda.synchronize()
@@ -402,18 +422,26 @@ def log_step_callback(
                 writer.add_scalar("metric/time/val", val_time, token_count)
 
         # Console output
+        lr_msg = ""
+        if lr_scheduler is not None:
+            lr_msg = f"lr={lr_scheduler.get_last_lr()[0]:.2e}"
         if val_metrics is not None:
-            val_loss, val_entropy = val_metrics
+            val_loss, val_perplexity = val_metrics
             parts = [
-                f"  {step}: avg_loss={avg_loss:.6f}, val_loss={val_loss:.6f}, val_entropy={val_entropy:.6f}",
+                f"  {step}: avg_loss={avg_loss:.6f}, val_loss={val_loss:.6f}, val_perplexity={val_perplexity:.4f}",
+                lr_msg,
                 f"avg_time={avg_time:.6f}, val_time={val_time:.6f}",
             ]
             print(", ".join(parts))
             if writer is not None:
                 writer.add_scalar("loss/val", val_loss, token_count)
-                writer.add_scalar("entropy/val", val_entropy, token_count)
+                writer.add_scalar("perplexity/val", val_perplexity, token_count)
         else:
-            parts = [f"  {step}: avg_loss={avg_loss:.6f}", f"avg_time={avg_time:.6f}"]
+            parts = [
+                f"  {step}: avg_loss={avg_loss:.6f}",
+                lr_msg,
+                f"avg_time={avg_time:.6f}",
+            ]
             print(", ".join(parts))
 
         if step % (log_period * 10) == 0:
@@ -663,11 +691,27 @@ def action_init(path: StrOrPath):
         tokenizer=tokenizer,
         train_info=TrainInfo(),
         train_config=TrainConfig(
-            seq_len=0,
-            batch_size=0,
+            seq_len=64,
+            batch_size=64,
             learning_rate=1e-3,
             weight_decay=0.1,
             optimizer_state_file="optimizer_state.pth",
+            lr_scheduler=TypeAdapter(LRSchedulerModel).validate_python(
+                {
+                    "name": "sequential",
+                    "schedulers": [
+                        {
+                            "name": "linear",
+                            "start_factor": 0.1,
+                            "end_factor": 1.0,
+                            "total_iters": 1000,
+                        },
+                        {"name": "cosine_annealing", "T_max": 9000},
+                    ],
+                    "milestones": [1000],
+                }
+            ),
+            lr_scheduler_state_file="lr_scheduler_state.pth",
         ),
     )
 
@@ -675,25 +719,54 @@ def action_init(path: StrOrPath):
     log_success(f"Initialized project at {path}.")
 
 
-def action_model_init(path: StrOrPath):
+def action_state_init(
+    path: StrOrPath,
+    *,
+    device: str = "cpu",
+    optimizer_only: bool = False,
+    lr_scheduler_only: bool = False,
+):
+    """(Re)initialize training state files from the project configuration.
+
+    By default, all three state files (model, optimizer, lr_scheduler) are
+    reset.  ``--optimizer`` resets only the optimizer and lr_scheduler,
+    leaving the model weights untouched.  ``--lr-scheduler`` resets only
+    the lr_scheduler, loading the existing optimizer state.
+    """
     project_info = load_project(path)
-    model_state_file = resolve_parent(path) / project_info.model_state_file
+    base = resolve_parent(path)
     train_config = project_info.train_config
-    optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
+    model_state_file = base / project_info.model_state_file
+    optimizer_state_file = base / train_config.optimizer_state_file
+    lr_scheduler_state_file = base / train_config.lr_scheduler_state_file
 
-    model = Model(project_info.config)
-    save_model_state(model_state_file, model)
-    log_success(f"Initialized model state at {model_state_file}.")
+    # --- model ---
+    if not optimizer_only and not lr_scheduler_only:
+        model = Model(project_info.config)
+        save_model_state(model_state_file, model)
+        log_success(f"Initialized model state at {model_state_file}.")
+        project_info.train_info = TrainInfo()
+        save_project(path, project_info)
+    else:
+        model = Model(project_info.config).to(device)
+        log_info("Loading model state.")
+        load_model_state(model_state_file, model, device=device)
 
+    # --- optimizer ---
     optimizer = create_optimizer(
         model, train_config.learning_rate, train_config.weight_decay
     )
-    save_optimizer_state(optimizer_state_file, optimizer)
-    log_success(f"Initialized optimizer state at {optimizer_state_file}.")
+    if lr_scheduler_only:
+        log_info("Loading optimizer state.")
+        load_optimizer_state(optimizer_state_file, optimizer)
+    else:
+        save_optimizer_state(optimizer_state_file, optimizer)
+        log_success(f"Initialized optimizer state at {optimizer_state_file}.")
 
-    project_info.train_info = TrainInfo()
-
-    save_project(path, project_info)
+    # --- lr_scheduler (always reinitialized) ---
+    lr_scheduler = create_lr_scheduler(optimizer, train_config.lr_scheduler)
+    save_lr_scheduler_state(lr_scheduler_state_file, lr_scheduler)
+    log_success(f"Initialized lr_scheduler state at {lr_scheduler_state_file}.")
 
 
 def action_train(
@@ -703,8 +776,6 @@ def action_train(
     *,
     seq_len: Optional[int] = None,
     batch_size: Optional[int] = None,
-    learning_rate: Optional[float] = None,
-    weight_decay: Optional[float] = None,
     val_path: Optional[str] = None,
     val_batches: Optional[int] = None,
     log_period: int = 10,
@@ -727,6 +798,10 @@ def action_train(
     model_state_file = resolve_parent(path) / project_info.model_state_file
     train_config = project_info.train_config
     optimizer_state_file = resolve_parent(path) / train_config.optimizer_state_file
+    lr_scheduler_state_file = (
+        resolve_parent(path) / train_config.lr_scheduler_state_file
+    )
+    train_info = project_info.train_info
 
     # === Parse & validate configuration ===
 
@@ -745,8 +820,6 @@ def action_train(
     assert batch_size > 0
     should_reset_optimizer = batch_size != prev_batch_size
 
-    learning_rate = _apply("learning_rate", learning_rate)
-    weight_decay = _apply("weight_decay", weight_decay)
     micro_batches = _apply("micro_batches", micro_batches) or 1
     assert micro_batches >= 1
     assert batch_size % micro_batches == 0, (
@@ -777,19 +850,19 @@ def action_train(
     dataset = load_dataset(data_path)
 
     new_id = get_dataset_id(dataset)
-    old_id = project_info.train_info.dataset_id
+    old_id = train_info.dataset_id
     if new_id and new_id != old_id:
         log_info(f"Dataset changed ({old_id!r} -> {new_id!r}).")
         if start_index is None:
-            project_info.train_info.index = 0
+            train_info.index = 0
         if start_offset is None:
-            project_info.train_info.offset = 0
-        project_info.train_info.dataset_id = new_id
+            train_info.offset = 0
+        train_info.dataset_id = new_id
 
     if start_index is None:
-        start_index = project_info.train_info.index
+        start_index = train_info.index
     if start_offset is None:
-        start_offset = project_info.train_info.offset
+        start_offset = train_info.offset
 
     log_info(f"Start position: index={start_index}, offset={start_offset}")
 
@@ -830,14 +903,49 @@ def action_train(
 
     # === Build optimizer ===
 
-    optimizer = create_optimizer(model, learning_rate, weight_decay)
+    optimizer = create_optimizer(
+        model, train_config.learning_rate, train_config.weight_decay
+    )
     if should_reset_optimizer:
         log_info("Batch size changed, optimizer reset.")
+        train_info.last_step = 0
     elif optimizer_state_file.exists():
         log_info("Loading optimizer state.")
         load_optimizer_state(optimizer_state_file, optimizer)
     else:
         log_info("Optimizer state file not found, using fresh optimizer.")
+        train_info.last_step = 0
+
+    # === Build lr_scheduler ===
+    #
+    # Three cases:
+    #   1. Config changed      → fresh scheduler, discard old state
+    #   2. Resuming from file  → restore state and sync optimizer LR
+    #   3. No state file found → fresh scheduler
+
+    if should_reset_optimizer:
+        lr_scheduler = create_lr_scheduler(optimizer, train_config.lr_scheduler)
+        log_info("Config changed, using fresh lr_scheduler.")
+        train_info.last_step = 0
+    elif lr_scheduler_state_file.exists():
+        lr_scheduler = create_lr_scheduler(
+            optimizer, train_config.lr_scheduler, train_info.last_step
+        )
+        log_info("Loading lr_scheduler state.")
+        load_lr_scheduler_state(lr_scheduler_state_file, lr_scheduler)
+        log_info(f"Last step: {train_info.last_step}")
+        # SequentialLR.__init__ unconditionally resets optimizer LR to initial_lr,
+        # and load_state_dict only restores scheduler internals, not the optimizer's
+        # actual LR.  Sync them back so incremental schedulers (e.g. cosine) produce
+        # correct values on the first post-resume step.
+        for group, lr in zip(
+            optimizer.param_groups, lr_scheduler.get_last_lr(), strict=True
+        ):
+            group["lr"] = lr
+    else:
+        lr_scheduler = create_lr_scheduler(optimizer, train_config.lr_scheduler)
+        log_info("LR scheduler state file not found, using fresh lr_scheduler.")
+        train_info.last_step = 0
 
     if use_bf16 and device == "cpu":
         log_warning(
@@ -861,12 +969,16 @@ def action_train(
         save_project(path, project_info)
         save_model_state(model_state_file, model)
         save_optimizer_state(optimizer_state_file, optimizer)
+        save_lr_scheduler_state(lr_scheduler_state_file, lr_scheduler)
 
     def backup():
         log_info("Making backups.")
         shutil.copyfile(path, get_backup_path(path))
         shutil.copyfile(model_state_file, get_backup_path(model_state_file))
         shutil.copyfile(optimizer_state_file, get_backup_path(optimizer_state_file))
+        shutil.copyfile(
+            lr_scheduler_state_file, get_backup_path(lr_scheduler_state_file)
+        )
 
     state = LogState()
 
@@ -889,21 +1001,27 @@ def action_train(
             writer=writer,
             on_save=save,
             on_backup=backup,
+            lr_scheduler=lr_scheduler,
         )
 
     # === Log training configuration ===
 
-    dataset_id = project_info.train_info.dataset_id
+    dataset_id = get_dataset_id(dataset)
+    val_dataset_id = get_dataset_id(val_dataset) if val_dataset else None
 
     # console (include file paths for troubleshooting)
-    val_info = f"{val_batches} batches"
-    if val_path is not None:
-        val_info += f", dataset={val_path!r}"
 
     data_msg = f"{data_path!r}"
     if dataset_id:
-        data_msg += f", dataset_id={dataset_id!r}"
+        data_msg += f", id={dataset_id!r}"
     data_msg += f", start_index={start_index}, start_offset={start_offset}"
+
+    if val_dataset:
+        val_msg = f"{val_batches} batches, {val_path!r}"
+        if val_dataset_id:
+            val_msg += f", id={val_dataset_id!r}"
+    else:
+        val_msg = None
 
     log_info("==== Training Configuration ====")
     print(f"Project:       {path}")
@@ -916,11 +1034,11 @@ def action_train(
         )
     else:
         print(f"Batch size:    {batch_size}")
-    print(f"Learning rate: {learning_rate}, weight decay: {weight_decay}")
     print(f"BF16 autocast: {use_bf16}")
     print(f"Loop dataset:  {loop_dataset}")
     print(f"SOT/EOT:       {add_sot}/{add_eot}")
-    print(f"Validation:    {val_info}")
+    if val_msg:
+        print(f"Validation:    {val_msg}")
     print(f"Time:          {datetime.now()}")
     log_info("==============================")
 
@@ -952,8 +1070,7 @@ def action_train(
             "steps": steps,
             "seq_len": seq_len,
             "batch_size": batch_size,
-            "learning_rate": learning_rate,
-            "weight_decay": weight_decay,
+            "weight_decay": train_config.weight_decay,
             "bf16": use_bf16,
             "loop_dataset": loop_dataset,
             "marker": {"sot": add_sot, "eot": add_eot},
@@ -978,24 +1095,22 @@ def action_train(
         torch.cuda.reset_peak_memory_stats()
 
     steps_remaining = steps
-    steps_done = 0
     while steps_remaining > 0:
         batch_iterator = make_iterator()
         actual_steps = train(
             info=project_info.train_info,
             model=model,
             optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
             batch_iterator=batch_iterator,
             pad_index=PAD,
             steps=steps_remaining,
             device=device,
             step_callback=step_callback,
             micro_batches=micro_batches,
-            step_offset=steps_done,
             use_bf16=use_bf16,
         )
         steps_remaining -= actual_steps
-        steps_done += actual_steps
         if steps_remaining > 0:
             # Dataset exhausted before reaching the requested step count.
             if loop_dataset:
@@ -1108,7 +1223,7 @@ def action_validate(
     log_info("Running validation.")
     t_start = time.perf_counter()
 
-    avg_loss, avg_entropy, val_actual = compute_validation_metrics(
+    val_actual, avg_loss, avg_perplexity = compute_validation_metrics(
         model=model,
         dataset=dataset,
         seq_len=seq_len,
@@ -1133,8 +1248,6 @@ def action_validate(
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t_start
 
-    perplexity = math.exp(avg_loss)
-
     log_info("==== Validation Results ====")
     print(f"Batches:       {num_batches}")
     print(f"Batch size:    {batch_size}")
@@ -1147,8 +1260,7 @@ def action_validate(
     print(f"Time:          {elapsed:.4f}s")
     print()
     print(f"Loss:          {avg_loss:.6f}")
-    print(f"Entropy:       {avg_entropy:.6f}")
-    print(f"Perplexity:    {perplexity:.4f}")
+    print(f"Perplexity:    {avg_perplexity:.4f}")
 
 
 #### main ####
@@ -1257,12 +1369,25 @@ def create_parser() -> ArgumentParser:
     init_parser = subparsers.add_parser("init", help="initialize a new project")
     init_parser.add_argument("path", help="project file")
 
-    # model_init
-    model_init_parser = subparsers.add_parser(
-        "model_init",
-        help="initialize model accroding to configuration and fill with random weights",
+    # state_init
+    state_init_parser = subparsers.add_parser(
+        "state_init",
+        help="(re)initialize training state files from project configuration",
     )
-    model_init_parser.add_argument("path", help="project file")
+    state_init_parser.add_argument("path", help="project file")
+    state_init_group = state_init_parser.add_mutually_exclusive_group()
+    state_init_group.add_argument(
+        "-opt",
+        "--optimizer",
+        action="store_true",
+        help="reset only optimizer and lr_scheduler (keep model weights)",
+    )
+    state_init_group.add_argument(
+        "-lr",
+        "--lr-scheduler",
+        action="store_true",
+        help="reset only lr_scheduler (keep model weights and optimizer state)",
+    )
 
     # train
     train_parser = subparsers.add_parser("train", help="train model")
@@ -1271,10 +1396,6 @@ def create_parser() -> ArgumentParser:
     train_parser.add_argument("steps", type=int, help="number of steps")
     train_parser.add_argument("-l", "--seq-len", type=int, help="sequence length")
     train_parser.add_argument("-bs", "--batch-size", type=int, help="batch size")
-    train_parser.add_argument(
-        "-lr", "--learning-rate", type=float, help="learning rate"
-    )
-    train_parser.add_argument("-wd", "--weight-decay", type=float, help="weight decay")
     train_parser.add_argument("-v", "--val", help="validation dataset directory")
     train_parser.add_argument(
         "-tb", "--tensorboard-dir", help="TensorBoard write directory"
@@ -1462,8 +1583,13 @@ def main():
             action_info(args.path)
         case "init":
             action_init(args.path)
-        case "model_init":
-            action_model_init(args.path)
+        case "state_init":
+            action_state_init(
+                args.path,
+                device=device,
+                optimizer_only=args.optimizer,
+                lr_scheduler_only=args.lr_scheduler,
+            )
         case "train":
             action_train(
                 args.path,
@@ -1471,8 +1597,6 @@ def main():
                 steps=args.steps,
                 seq_len=args.seq_len,
                 batch_size=args.batch_size,
-                learning_rate=args.learning_rate,
-                weight_decay=args.weight_decay,
                 val_path=args.val,
                 val_batches=args.validation_batches,
                 device=device,

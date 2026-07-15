@@ -1,6 +1,7 @@
+import math
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterator, Literal, Optional
+from typing import Callable, Iterator, Literal, NamedTuple, Optional
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -9,6 +10,7 @@ import torch.nn as nn
 from pydantic import BaseModel, NonNegativeFloat, NonNegativeInt
 from torch import Tensor
 from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
 
 from spargel_llm.model import Model
 
@@ -18,6 +20,7 @@ type Reduction = Literal["mean", "sum"]
 class TrainInfo(BaseModel):
     time: NonNegativeFloat = 0
     token_count: NonNegativeInt = 0
+    last_step: NonNegativeInt = 0
     index: NonNegativeInt = 0
     offset: NonNegativeInt = 0
     dataset_id: str = ""
@@ -37,11 +40,19 @@ def compute_loss_step(
     input_ids: Tensor,
     mask: Tensor,
     target_ids: Tensor,
+    slot_valid: Tensor,
     *,
     pad_index: int,
     reduction: Reduction = "mean",
 ):
-    logits: Tensor = model(input_ids, mask)  # (..., seq_len, vocab_size)
+    logits: Tensor = model(input_ids, mask)  # (batch, seq_len, vocab_size)
+
+    # Zero out logits from invalid slots before cross_entropy.  Their
+    # targets are all pad_index and would be ignored anyway; this is a
+    # safety net so meaningless outputs from unfilled batch slots never
+    # contribute to the loss.
+    logits = torch.where(slot_valid[:, None, None], logits, torch.zeros_like(logits))
+
     flattened_logits = logits.flatten(0, -2).float()
     flattened_targets = target_ids.flatten(0, -1).to(torch.long)
 
@@ -53,36 +64,6 @@ def compute_loss_step(
     )
 
     return loss
-
-
-@torch.compile
-def validation_metrics_step(
-    model: Model,
-    input_ids: Tensor,
-    mask: Tensor,
-    target_ids: Tensor,
-    *,
-    pad_index: int,
-    reduction: Reduction = "mean",
-):
-    logits: Tensor = model(input_ids, mask)  # (..., seq_len, vocab_size)
-    flattened_logits = logits.flatten(0, -2).float()
-    flattened_targets = target_ids.flatten(0, -1).to(torch.long)
-
-    loss = nn.functional.cross_entropy(
-        flattened_logits,
-        flattened_targets,
-        ignore_index=pad_index,
-        reduction=reduction,
-    )
-
-    valid_targets = flattened_targets != pad_index
-    log_probs = torch.log_softmax(flattened_logits, dim=-1)
-    entropy_by_token = -(log_probs.exp() * log_probs).sum(dim=-1)
-    valid_weights = valid_targets.to(entropy_by_token.dtype)
-    entropy_sum = (entropy_by_token * valid_weights).sum()
-
-    return loss, entropy_sum
 
 
 @torch.compile
@@ -98,18 +79,21 @@ class StepInfo:
     tokens: int
     tokens_non_pad: int
 
-@dataclass
-class BatchData:
+
+class BatchData(NamedTuple):
     input_ids: Tensor
     mask: Tensor
     target_ids: Tensor
+    slot_valid: Tensor  # (batch_size,) bool, False for unfilled slots in partial batch
     tokens: int
     tokens_non_pad: int
+
 
 def train(
     info: TrainInfo,
     model: Model,
     optimizer: Optimizer,
+    lr_scheduler: LRScheduler,
     batch_iterator: Iterator[BatchData],
     pad_index: int,
     steps: int,
@@ -117,7 +101,6 @@ def train(
     device: str = "cpu",
     step_callback: Optional[Callable[[StepInfo], None]] = None,
     micro_batches: int = 1,
-    step_offset: int = 0,
     use_bf16: bool = True,
 ) -> int:
     """Run up to *steps* training steps.
@@ -125,10 +108,6 @@ def train(
     Each step consists of *micro_batches* forward/backward passes whose
     gradients are accumulated before a single ``optimizer.step()`` call.
     The effective batch size is ``micro_batch_size x micro_batches``.
-
-    *step_offset* is added to the step number reported to the callback,
-    so callers that restart the data iterator (e.g. for looped datasets)
-    can continue the step counter instead of resetting to 0.
 
     Returns the number of steps actually executed (may be less than *steps*
     if the data iterator is exhausted).
@@ -148,7 +127,6 @@ def train(
         for _ in range(micro_batches):
             try:
                 batch_data = next(batch_iterator)
-                # inputs, masks, targets, tokens, tokens_non_pad = 
             except StopIteration:
                 if not cpu_batches:
                     return step
@@ -169,6 +147,7 @@ def train(
             inputs = batch_data.input_ids.to(torch_device)
             masks = batch_data.mask.to(torch_device)
             targets = batch_data.target_ids.to(torch_device)
+            slot_valid = batch_data.slot_valid.to(torch_device)
 
             with torch.autocast(
                 device_type=device_type, dtype=torch.bfloat16, enabled=use_bf16
@@ -178,6 +157,7 @@ def train(
                     input_ids=inputs,
                     mask=masks,
                     target_ids=targets,
+                    slot_valid=slot_valid,
                     pad_index=pad_index,
                     reduction="sum",
                 )
@@ -187,6 +167,9 @@ def train(
 
         # update weights
         optimizer.step()
+
+        # update learning rate
+        lr_scheduler.step()
 
         if device == "cuda":
             torch.cuda.synchronize()
@@ -200,13 +183,15 @@ def train(
         if step_callback is not None:
             step_callback(
                 StepInfo(
-                    step=step_offset + step,
+                    step=info.last_step,
                     loss=step_loss.item(),
                     time=step_time,
                     tokens=step_tokens,
                     tokens_non_pad=step_tokens_non_pad,
                 )
             )
+
+        info.last_step += 1
 
     return steps
 
@@ -225,7 +210,7 @@ def compute_validation_metrics(
     start_index: int = 0,
     start_offset: int = 0,
     use_bf16: bool = True,
-) -> tuple[float, float, int]:
+) -> tuple[int, float, float]:
     assert num_batches > 0
 
     torch_device = torch.device(device)
@@ -246,8 +231,8 @@ def compute_validation_metrics(
     iterator = make_iterator()
 
     total_loss = torch.tensor(0.0, device=torch_device, dtype=torch.float32)
-    total_entropy = torch.tensor(0.0, device=torch_device, dtype=torch.float32)
     total_valid_tokens = 0
+    batch_perplexities: list[float] = []
 
     model.eval()
 
@@ -263,30 +248,32 @@ def compute_validation_metrics(
             inputs = batch_data.input_ids.to(torch_device)
             masks = batch_data.mask.to(torch_device)
             targets = batch_data.target_ids.to(torch_device)
+            slot_valid = batch_data.slot_valid.to(torch_device)
             n_non_pad = batch_data.tokens_non_pad
 
             with torch.autocast(
                 device_type=device_type, dtype=torch.bfloat16, enabled=use_bf16
             ):
-                loss, entropy_sum = validation_metrics_step(
+                loss = compute_loss_step(
                     model=model,
                     input_ids=inputs,
                     mask=masks,
                     target_ids=targets,
+                    slot_valid=slot_valid,
                     pad_index=pad_index,
                     reduction="sum",
                 )
 
             total_loss = total_loss + loss
-            total_entropy = total_entropy + entropy_sum
             total_valid_tokens += n_non_pad
+            per_batch_loss = loss.item() / n_non_pad
+            batch_perplexities.append(math.exp(per_batch_loss))
             actual_batches += 1
 
-    return (
-        total_loss.item() / max(total_valid_tokens, 1),
-        total_entropy.item() / max(total_valid_tokens, 1),
-        actual_batches,
-    )
+    avg_loss = total_loss.item() / max(total_valid_tokens, 1)
+    avg_perplexity = sum(batch_perplexities) / len(batch_perplexities)
+
+    return actual_batches, avg_loss, avg_perplexity
 
 
 def _augment_row(
@@ -344,7 +331,8 @@ def iter_batches(
     ``(input_ids, mask, target_ids)``.  Short tails are padded with
     *pad_index*.
 
-    Yields ``(inputs, masks, targets, tokens, tokens_non_pad)`` where
+    Yields :class:`BatchData` named tuples whose fields are
+    ``(input_ids, mask, target_ids, slot_valid, tokens, tokens_non_pad)``.
     *tokens* is the total number of elements in the batch tensors and
     *tokens_non_pad* is the number of valid (non-PAD) tokens — both
     computed during construction so the caller doesn't need a
@@ -353,8 +341,8 @@ def iter_batches(
     Works directly on Arrow's underlying NumPy buffers to avoid the
     Python-object overhead of ``to_pylist()``.  Samples are accumulated
     into a pre-allocated buffer; on yield the buffer is copied so that
-    returned tensors are independent of subsequent writes.  Partial
-    batches at the end are silently discarded.
+    returned tensors are independent of subsequent writes.  The final
+    incomplete batch (if any) is yielded with remaining slots padded.
 
     *start_index* skips the first N items of *dataset*.
 
@@ -449,6 +437,7 @@ def iter_batches(
                         torch.from_numpy(batch_inputs.copy()),
                         torch.from_numpy(batch_masks.copy()),
                         torch.from_numpy(batch_targets.copy()),
+                        torch.ones(batch_size, dtype=torch.bool),
                         batch_size * seq_len,
                         batch_non_pad,
                     )
@@ -461,3 +450,22 @@ def iter_batches(
                 pos += stride
 
             row_index += 1
+
+    if sample_in_batch > 0:
+        # Unfilled slots retain the initial all-True mask (every position
+        # masked as pad), which makes attention softmax receive all -inf
+        # and produce NaN.  Clear their masks so only the causal mask
+        # applies — each query can attend to at least itself.
+        if sample_in_batch < batch_size:
+            batch_masks[sample_in_batch:, :] = False
+
+        slot_valid = torch.zeros(batch_size, dtype=torch.bool)
+        slot_valid[:sample_in_batch] = True
+        yield BatchData(
+            torch.from_numpy(batch_inputs.copy()),
+            torch.from_numpy(batch_masks.copy()),
+            torch.from_numpy(batch_targets.copy()),
+            slot_valid,
+            batch_size * seq_len,
+            batch_non_pad,
+        )

@@ -196,6 +196,7 @@ def action_info(path: str, col: str | None = None, row_group: int = 0):
 
     label = "characters" if col == "text" else "tokens"
     print(f"Length statistics from row group {row_group}:")
+    print(f"  Number of rows:   {table.num_rows}")
     print(f"  Total {label}:     {lengths.sum():,}")
     print(f"  Average length:   {lengths.mean():.1f}")
     print(f"  Min length:       {lengths.min()}")
