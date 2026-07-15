@@ -20,7 +20,7 @@ type Reduction = Literal["mean", "sum"]
 class TrainInfo(BaseModel):
     time: NonNegativeFloat = 0
     token_count: NonNegativeInt = 0
-    last_step: NonNegativeInt = 0
+    steps: NonNegativeInt = 0
     index: NonNegativeInt = 0
     offset: NonNegativeInt = 0
     dataset_id: str = ""
@@ -179,19 +179,18 @@ def train(
 
         info.time += step_time
         info.token_count += step_tokens_non_pad
+        info.steps += 1
 
         if step_callback is not None:
             step_callback(
                 StepInfo(
-                    step=info.last_step,
+                    step=info.steps,
                     loss=step_loss.item(),
                     time=step_time,
                     tokens=step_tokens,
                     tokens_non_pad=step_tokens_non_pad,
                 )
             )
-
-        info.last_step += 1
 
     return steps
 

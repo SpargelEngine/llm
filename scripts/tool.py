@@ -378,7 +378,7 @@ def log_step_callback(
     state.tokens += info.tokens
     state.tokens_non_pad += info.tokens_non_pad
 
-    step = info.step + 1
+    step = info.step
 
     if step % log_period == 0:
         avg_loss = state.sum_loss / max(state.tokens_non_pad, 1)
@@ -908,13 +908,13 @@ def action_train(
     )
     if should_reset_optimizer:
         log_info("Batch size changed, optimizer reset.")
-        train_info.last_step = 0
+        train_info.steps = 0
     elif optimizer_state_file.exists():
         log_info("Loading optimizer state.")
         load_optimizer_state(optimizer_state_file, optimizer)
     else:
         log_info("Optimizer state file not found, using fresh optimizer.")
-        train_info.last_step = 0
+        train_info.steps = 0
 
     # === Build lr_scheduler ===
     #
@@ -926,14 +926,14 @@ def action_train(
     if should_reset_optimizer:
         lr_scheduler = create_lr_scheduler(optimizer, train_config.lr_scheduler)
         log_info("Config changed, using fresh lr_scheduler.")
-        train_info.last_step = 0
+        train_info.steps = 0
     elif lr_scheduler_state_file.exists():
         lr_scheduler = create_lr_scheduler(
-            optimizer, train_config.lr_scheduler, train_info.last_step
+            optimizer, train_config.lr_scheduler, train_info.steps
         )
         log_info("Loading lr_scheduler state.")
         load_lr_scheduler_state(lr_scheduler_state_file, lr_scheduler)
-        log_info(f"Last step: {train_info.last_step}")
+        log_info(f"Last step: {train_info.steps}")
         # SequentialLR.__init__ unconditionally resets optimizer LR to initial_lr,
         # and load_state_dict only restores scheduler internals, not the optimizer's
         # actual LR.  Sync them back so incremental schedulers (e.g. cosine) produce
@@ -945,7 +945,7 @@ def action_train(
     else:
         lr_scheduler = create_lr_scheduler(optimizer, train_config.lr_scheduler)
         log_info("LR scheduler state file not found, using fresh lr_scheduler.")
-        train_info.last_step = 0
+        train_info.steps = 0
 
     if use_bf16 and device == "cpu":
         log_warning(
