@@ -35,7 +35,7 @@ from spargel_llm.train import (
     train,
 )
 from spargel_llm.typing import StrOrPath
-from spargel_llm.utils import escape_whitespace
+from spargel_llm.utils import escape_whitespace, format_bytes, format_flops
 
 PAD = 1
 SOT = 2
@@ -223,24 +223,25 @@ def estimate_memory(
     micro_batch_size: int,
     use_bf16: bool = True,
 ) -> dict:
-    """Estimate peak GPU memory required for training.
+    """Estimate peak GPU memory and training FLOPs.
 
     Covers model weights (fp32), gradients (fp32), AdamW optimizer state
-    (fp32 momentum + variance), and per-micro-batch activations.
-    Returns a breakdown in bytes.
+    (fp32 momentum + variance), per-micro-batch activations, and
+    forward+backward FLOPs per training step.
+
+    Returns a breakdown in bytes and FLOP counts.
     """
     embedding_params, body_params = compute_param_counts(config)
     total_params = embedding_params + body_params
 
     # fp32 master weights
     model_mem = total_params * 4
-
     # fp32 gradients
     grad_mem = total_params * 4
-
     # AdamW: fp32 momentum + fp32 variance
     optim_mem = total_params * 8
 
+    # ---- shorthand aliases ----
     B = micro_batch_size
     S = seq_len
     H = config.num_head
@@ -249,51 +250,85 @@ def estimate_memory(
     d_v = config.dim_value
     d_ff = config.dim_ff_hidden
     n_layer = config.num_layer
+    V = config.vocab_size
 
-    # Most activations stay in BF16 (2 bytes) under autocast;
-    # attention softmax outputs are typically fp32 (4 bytes).
+    # ---- precision constants ----
+    # Activations under autocast: most ops → bf16 (2 B), softmax → fp32 (4 B).
+    # RMSNorm (use_fp32=True) saves its fp32 input for backward (4 B).
     act_bytes = 2 if use_bf16 else 4
+    fp32 = 4
 
-    # Embedding lookup output
-    embed_act = B * S * D * act_bytes
+    # Recurring volume: one residual / norm-IO tensor.
+    residual = B * S * D
 
-    # Per transformer block activations saved for backward:
-    #   norm1 input (residual)         B*S*D
-    #   Q, K, V                        3 * B*H*S*d_k
-    #   attention softmax output       B*H*S*S  (fp32)
-    #   pre-W_o (attention output)     B*H*S*d_v
-    #   post-W_o (residual)            B*S*D
-    #   norm2 input (residual)         B*S*D
-    #   FF hidden (post-activation)    B*S*d_ff
-    attn_score_bytes = 4  # softmax upcasts to fp32
+    # ---- memory ----
+
+    embed_act = residual * act_bytes
+
+    # Per-block activations saved for backward.
     per_block = (
-        B * S * D * act_bytes
-        + 3 * B * H * S * d_k * act_bytes
-        + B * H * S * S * attn_score_bytes
-        + B * H * S * d_v * act_bytes
-        + B * S * D * act_bytes
-        + B * S * D * act_bytes
-        + B * S * d_ff * act_bytes
+        residual * fp32                    # norm1 input (RMSNorm saves fp32)
+        + residual * act_bytes             # norm1 output (for W_q/k/v grads)
+        + B * H * S * (2 * d_k + d_v) * act_bytes  # Q, K, V
+        + B * H * S * S * fp32             # attention softmax
+        + B * H * S * d_v * act_bytes      # pre-W_o
+        + residual * fp32                  # norm2 input (RMSNorm saves fp32)
+        + residual * act_bytes             # norm2 output (for FF up grad)
+        + B * S * d_ff * act_bytes         # FF hidden (ReLU saves input)
     )
 
     all_blocks = n_layer * per_block
 
-    # LM head logits (fp32 for cross-entropy)
-    logit_act = B * S * config.vocab_size * 4
+    # final_norm input (fp32, saved by RMSNorm) + output (bf16, saved by lm_head)
+    final_norm_act = residual * fp32 + residual * act_bytes
 
-    peak_act = embed_act + all_blocks + logit_act
+    # Cross-entropy stores logits in fp32 for numerical stability.
+    logit_act = B * S * V * fp32
+
+    peak_act = embed_act + all_blocks + final_norm_act + logit_act
 
     total = int(model_mem + grad_mem + optim_mem + peak_act)
 
+    # ---- FLOPs (forward pass, per micro-batch) ----
+
+    # Q, K, V projections
+    flops_qkv = 2 * B * H * S * D * (2 * d_k + d_v)
+    # attention scores: Q @ K^T  → (B, H, S, S)
+    flops_attn_scores = 2 * B * H * S * S * d_k
+    # attention output: scores @ V  → (B, H, S, d_v)
+    flops_attn_values = 2 * B * H * S * S * d_v
+    # output projection
+    flops_out_proj = 2 * B * H * S * d_v * D
+    # feed-forward: up (D→d_ff) + down (d_ff→D)
+    flops_ff = 4 * B * S * D * d_ff
+
+    flops_attn_block = (
+        flops_qkv + flops_attn_scores + flops_attn_values + flops_out_proj
+    )
+    flops_per_block = flops_attn_block + flops_ff
+    flops_fwd = int(n_layer * flops_per_block + 2 * B * S * D * V)
+
+    # Forward + backward ≈ 3× forward.
+    flops_fwd_bwd = 3 * flops_fwd
+
     return {
+        # params
         "total_params": total_params,
         "embedding_params": embedding_params,
         "body_params": body_params,
+        # memory
         "model_mem": model_mem,
         "grad_mem": grad_mem,
         "optim_mem": optim_mem,
         "activation_mem": int(peak_act),
         "total": total,
+        # FLOPs (all values are per micro-batch)
+        "flops_fwd_per_micro_batch": flops_fwd,
+        "flops_fwd_bwd_per_micro_batch": flops_fwd_bwd,
+        "flops_fwd_attn_per_block": int(flops_attn_block),
+        "flops_fwd_ff_per_block": int(flops_ff),
+        "flops_fwd_attn_scores_per_block": int(flops_attn_scores),
+        "flops_fwd_attn_values_per_block": int(flops_attn_values),
     }
 
 
@@ -302,9 +337,10 @@ def _report_memory_estimate(
     seq_len: int,
     batch_size: int,
     micro_batches: int,
+    steps: int,
     use_bf16: bool,
 ) -> None:
-    """Print a human-readable GPU memory estimate."""
+    """Print a human-readable GPU memory and FLOPs estimate."""
     dtype_label = "BF16" if use_bf16 else "FP32"
     log_info("==== Memory Estimate ====")
     print(
@@ -319,29 +355,41 @@ def _report_memory_estimate(
     )
     print(f"Seq length:  {seq_len}")
     print()
-
-    def fmt_mib(b: int) -> str:
-        return f"{b / (1024 * 1024):,.1f} MiB"
-
-    def fmt_gib(b: int) -> str:
-        return f"{b / (1024 * 1024 * 1024):,.2f} GiB"
-
-    print(
-        f"  Model weights:     {fmt_mib(result['model_mem']):>10s}  ({fmt_gib(result['model_mem'])})"
-    )
-    print(
-        f"  Gradients:         {fmt_mib(result['grad_mem']):>10s}  ({fmt_gib(result['grad_mem'])})"
-    )
-    print(
-        f"  Optimizer (AdamW): {fmt_mib(result['optim_mem']):>10s}  ({fmt_gib(result['optim_mem'])})"
-    )
-    print(
-        f"  Activations:       {fmt_mib(result['activation_mem']):>10s}  ({fmt_gib(result['activation_mem'])})"
-    )
+    print(f"  Model weights:     {format_bytes(result['model_mem'])}")
+    print(f"  Gradients:         {format_bytes(result['grad_mem'])}")
+    print(f"  Optimizer (AdamW): {format_bytes(result['optim_mem'])}")
+    print(f"  Activations:       {format_bytes(result['activation_mem'])}")
     print("  ─────────────────────────────")
-    print(
-        f"  Estimated total:   {fmt_mib(result['total']):>10s}  ({fmt_gib(result['total'])})"
-    )
+    print(f"  Estimated total:   {format_bytes(result['total'])}")
+
+    # ---- FLOPs ----
+
+    tokens_per_step = seq_len * batch_size
+    total_tokens = tokens_per_step * steps
+    # All FLOPs values from estimate_memory are per micro-batch;
+    # each step runs micro_batches micro-batches.
+    flops_fwd_micro = result["flops_fwd_per_micro_batch"]
+    flops_fwd_bwd_micro = result["flops_fwd_bwd_per_micro_batch"]
+    flops_fwd_step = flops_fwd_micro * micro_batches
+    flops_fwd_bwd_step = flops_fwd_bwd_micro * micro_batches
+    flops_total = flops_fwd_bwd_step * steps
+
+    print()
+    log_info("==== FLOPs Estimate ====")
+    if micro_batches > 1:
+        print(
+            f"  Forward (per micro-batch):  {format_flops(flops_fwd_micro)}"
+        )
+        print(
+            f"  Fwd + bwd (per micro-batch):  {format_flops(flops_fwd_bwd_micro)}"
+        )
+    print(f"Tokens per step:             {tokens_per_step:,}")
+    print(f"Total tokens:                {total_tokens:,} ({steps} steps)")
+    print()
+    print(f"  Forward (per step):        {format_flops(flops_fwd_step)}")
+    print(f"  Forward + backward (step): {format_flops(flops_fwd_bwd_step)}")
+    print(f"  Total ({steps} steps):     {format_flops(flops_total)}")
+    print(f"  FLOPs per token:           {flops_fwd_bwd_step / tokens_per_step:,.1f}")
 
 
 def log_step_callback(
@@ -836,12 +884,9 @@ def action_train(
             micro_batch_size=micro_batch_size,
             use_bf16=use_bf16,
         )
-        _report_memory_estimate(result, seq_len, batch_size, micro_batches, use_bf16)
-        tokens_per_step = seq_len * batch_size
-        total_tokens = tokens_per_step * steps
-        log_info("==== Token Throughput ====")
-        print(f"Tokens per step: {tokens_per_step:,}")
-        print(f"Total tokens ({steps} steps): {total_tokens:,}")
+        _report_memory_estimate(
+            result, seq_len, batch_size, micro_batches, steps, use_bf16
+        )
         return
 
     # === Load training data ===
