@@ -39,7 +39,7 @@ def action_dump(path: str, min_len: int | None = None):
         print(f"{i}: |{label}|")
 
 
-def action_encode(path: str, texts_path: str, output: str, batch_size: int = 1000):
+def action_encode(path: str, texts_path: str, output: str, batch_size: int = 1000, field: str = "text"):
     tokenizer = Tokenizer.from_file(path)
     pf = pq.ParquetFile(texts_path)
     schema = make_tokens_schema()
@@ -49,7 +49,7 @@ def action_encode(path: str, texts_path: str, output: str, batch_size: int = 100
         for batch in tqdm(
             pf.iter_batches(batch_size=batch_size), desc="batches", total=total
         ):
-            texts = batch.column("text").to_pylist()
+            texts = batch.column(field).to_pylist()
             encoded = tokenizer.encode_batch_fast(texts)
             writer.write_table(
                 pa.table({"tokens": [x.ids for x in encoded]}, schema=schema)
@@ -94,7 +94,7 @@ def action_show(tokenizer_path: str, tokens_path: str, row: int | None = None):
     print(text)
 
 
-def action_train(path: str, texts_path: str, vocab_size: int):
+def action_train(path: str, texts_path: str, vocab_size: int, field: str = "text"):
     tokenizer = Tokenizer.from_file(path)
 
     special_tokens = ["<unk>", "<pad>", "<sot>", "<eot>"]
@@ -106,7 +106,7 @@ def action_train(path: str, texts_path: str, vocab_size: int):
 
     def text_iter():
         for batch in pf.iter_batches():
-            for text in batch.column("text").to_pylist():
+            for text in batch.column(field).to_pylist():
                 yield text
 
     tokenizer.train_from_iterator(text_iter(), trainer, length=pf.metadata.num_rows)
@@ -150,6 +150,12 @@ def create_parser() -> ArgumentParser:
         default=1,
         help="batch size for encoding (default: 1000)",
     )
+    encode_parser.add_argument(
+        "--field",
+        "-f",
+        default="text",
+        help="column name in the input Parquet file (default: text)",
+    )
 
     # info
     info_parser = subparsers.add_parser("info", help="show tokenizer info")
@@ -179,6 +185,12 @@ def create_parser() -> ArgumentParser:
     train_parser.add_argument("path", help="tokenizer JSON file")
     train_parser.add_argument("texts_path", help="path to Parquet file")
     train_parser.add_argument("vocab_size", type=int, help="vocabulary size")
+    train_parser.add_argument(
+        "--field",
+        "-f",
+        default="text",
+        help="column name in the input Parquet file (default: text)",
+    )
 
     return parser
 
@@ -194,7 +206,7 @@ def main():
             action_dump(args.path, min_len=args.min_len)
         case "encode":
             action_encode(
-                args.path, args.texts_path, args.output, batch_size=args.batch_size
+                args.path, args.texts_path, args.output, batch_size=args.batch_size, field=args.field
             )
         case "info":
             action_info(args.path)
@@ -203,7 +215,7 @@ def main():
         case "show":
             action_show(args.tokenizer_path, args.tokens_path, args.row)
         case "train":
-            action_train(args.path, args.texts_path, args.vocab_size)
+            action_train(args.path, args.texts_path, args.vocab_size, field=args.field)
 
 
 if __name__ == "__main__":

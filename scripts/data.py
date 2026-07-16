@@ -378,7 +378,7 @@ def action_split(input_path: str, pos: int, output1: str, output2: str):
     print(f"{input_path} -> {output1} ({n1:,} rows) + {output2} ({n2:,} rows)")
 
 
-def action_text_show(path: str, row: int | None = None):
+def action_text_show(path: str, row: int | None = None, field: str = "text"):
     """Print the text content of a specific row from a texts.parquet file.
 
     Only reads the row group containing the target row, skipping all others.
@@ -386,8 +386,8 @@ def action_text_show(path: str, row: int | None = None):
     """
     pf = pq.ParquetFile(path)
     row = resolve_row(pf, row)
-    local_idx, table = read_row(pf, row, ["text"])
-    text = table.column("text")[local_idx].as_py()
+    local_idx, table = read_row(pf, row, [field])
+    text = table.column(field)[local_idx].as_py()
     print(f"[{row}/{pf.metadata.num_rows}] length={len(text)}")
     print(text)
 
@@ -449,8 +449,8 @@ def create_parser() -> ArgumentParser:
         "path", help="path to a tokens.parquet or texts.parquet file"
     )
     info_parser.add_argument(
-        "-c",
-        "--col",
+        "-f",
+        "--field",
         default=None,
         help="column to sample for length statistics (default: try 'text', then 'tokens')",
     )
@@ -519,6 +519,12 @@ def create_parser() -> ArgumentParser:
         help="zero-based row index to print (negative indices count from the end; "
         "random if omitted)",
     )
+    text_show_parser.add_argument(
+        "--field",
+        "-f",
+        default="text",
+        help="column name to read from the Parquet file (default: text)",
+    )
 
     return parser
 
@@ -537,7 +543,7 @@ def main():
                 args.input, args.output_format, args.num_files, args.random_seed
             )
         case "info":
-            action_info(args.path, col=args.col, row_group=args.row_group)
+            action_info(args.path, col=args.field, row_group=args.row_group)
         case "shuffle":
             action_shuffle(
                 args.input,
@@ -551,7 +557,7 @@ def main():
         case "split":
             action_split(args.input, args.pos, args.output1, args.output2)
         case "text_show":
-            action_text_show(args.path, args.row)
+            action_text_show(args.path, args.row, field=args.field)
         case _:
             raise ValueError(f"unrecognized action: {args.action}")
 

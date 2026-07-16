@@ -30,6 +30,12 @@ def main():
         default=1000,
         help="row group size for Parquet writing (default: 1000)",
     )
+    parser.add_argument(
+        "--field",
+        "-f",
+        default="text",
+        help="column name in the output Parquet file (default: text)",
+    )
     args = parser.parse_args()
 
     output_path = Path(args.output)
@@ -40,10 +46,10 @@ def main():
         for text in tqdm(load_texts(args.config)):
             batch.append(text)
             if len(batch) >= args.batch_size:
-                writer.write_table(pa.table({"text": batch}, schema=schema))
+                writer.write_table(pa.table({args.field: batch}, schema=schema))
                 batch = []
         if batch:
-            writer.write_table(pa.table({"text": batch}, schema=schema))
+            writer.write_table(pa.table({args.field: batch}, schema=schema))
 
     print(f"Parquet saved to {output_path.resolve()}")
 
