@@ -2,6 +2,7 @@
 
 import gzip
 import json
+from compression import zstd
 from pathlib import Path
 
 import pytest
@@ -836,6 +837,40 @@ class TestReadFilePass:
 
         inst = self._build(base=str(d), compression="gzip", lines=True)
         result = list(inst.process(["file.txt.gz"]))
+        assert result == ["x\n", "y\n"]
+
+    def test_zstd_compression(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        path = d / "file.txt.zst"
+        with zstd.open(path, "wt", encoding="utf-8") as f:
+            f.write("compressed content")
+
+        inst = self._build(base=str(d), compression="zstd")
+        result = list(inst.process(["file.txt.zst"]))
+        assert result == ["compressed content"]
+
+    def test_zstd_with_encoding(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        path = d / "file.txt.zst"
+        content = "héllo wörld"
+        with zstd.open(path, "wt", encoding="utf-8") as f:
+            f.write(content)
+
+        inst = self._build(base=str(d), compression="zstd", encoding="utf-8")
+        result = list(inst.process(["file.txt.zst"]))
+        assert result == [content]
+
+    def test_lines_with_zstd(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        path = d / "file.txt.zst"
+        with zstd.open(path, "wt", encoding="utf-8") as f:
+            f.write("x\ny\n")
+
+        inst = self._build(base=str(d), compression="zstd", lines=True)
+        result = list(inst.process(["file.txt.zst"]))
         assert result == ["x\n", "y\n"]
 
 

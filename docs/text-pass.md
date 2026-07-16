@@ -278,12 +278,13 @@ Read the file at each input path and yield its content. With `lines=false` (defa
 | ----------- | ---------------- | ------- | -------------------------------------- |
 | base        | `str`            | `"."`   | Base directory for relative paths      |
 | encoding    | `str \| null`    | `null`  | File encoding; `null` = system default |
-| compression | `"gzip" \| null` | `null`  | Decompression; supports `gzip`         |
+| compression | `"gzip" \| "zstd" \| null` | `null`  | Decompression; supports `gzip`, `zstd` |
 | lines       | `bool`           | `false` | Yield lines via ``readline()`` loop    |
 
 ```json
 { "name": "read_file", "base": "./data", "encoding": "utf-8" }
 { "name": "read_file", "compression": "gzip" }
+{ "name": "read_file", "compression": "zstd" }
 { "name": "read_file", "lines": true }
 ```
 

@@ -5,6 +5,7 @@ import itertools
 import json
 import logging
 import os
+from compression import zstd
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Iterable, Iterator, Literal, Sequence, override
@@ -287,7 +288,7 @@ class ReadFilePass(TextPassModel):
     name: Literal["read_file"] = "read_file"
     base: str = "."
     encoding: str | None = None
-    compression: Literal["gzip"] | None = None
+    compression: Literal["gzip", "zstd"] | None = None
     lines: bool = False
 
     @override
@@ -299,7 +300,7 @@ class ReadFilePass(TextPassModel):
     class _Instance(TextPassInstance):
         base: Path
         encoding: str | None
-        compression: Literal["gzip"] | None
+        compression: Literal["gzip", "zstd"] | None
         lines: bool
 
         @override
@@ -310,6 +311,9 @@ class ReadFilePass(TextPassModel):
                     match self.compression:
                         case "gzip":
                             with gzip.open(path, "rt", encoding=self.encoding) as f:
+                                yield from self._read(f)
+                        case "zstd":
+                            with zstd.open(path, "rt", encoding=self.encoding) as f:
                                 yield from self._read(f)
                         case _:
                             with open(path, "r", encoding=self.encoding) as f:
