@@ -254,7 +254,10 @@ def estimate_memory(
 
     # ---- precision constants ----
     # Activations under autocast: most ops → bf16 (2 B), softmax → fp32 (4 B).
-    # RMSNorm (use_fp32=True) saves its fp32 input for backward (4 B).
+    # RMSNorm (use_fp32=True) converts its input to fp32 for computation.
+    # torch.compile (Inductor) may store the saved input in bf16/fp16 when
+    # the per-sample activation volume (B × S) is large enough that the
+    # memory savings outweigh the recomputation cost during backward.
     act_bytes = 2 if use_bf16 else 4
     fp32 = 4
 
@@ -265,22 +268,28 @@ def estimate_memory(
 
     embed_act = residual * act_bytes
 
+    # Precision of RMSNorm saved inputs under torch.compile.
+    if B * S >= 200_000:
+        norm_bytes = act_bytes
+    else:
+        norm_bytes = fp32
+
     # Per-block activations saved for backward.
     per_block = (
-        residual * fp32                    # norm1 input (RMSNorm saves fp32)
+        residual * norm_bytes              # norm1 input
         + residual * act_bytes             # norm1 output (for W_q/k/v grads)
         + B * H * S * (2 * d_k + d_v) * act_bytes  # Q, K, V
         + B * H * S * S * fp32             # attention softmax
         + B * H * S * d_v * act_bytes      # pre-W_o
-        + residual * fp32                  # norm2 input (RMSNorm saves fp32)
+        + residual * norm_bytes            # norm2 input
         + residual * act_bytes             # norm2 output (for FF up grad)
         + B * S * d_ff * act_bytes         # FF hidden (ReLU saves input)
     )
 
     all_blocks = n_layer * per_block
 
-    # final_norm input (fp32, saved by RMSNorm) + output (bf16, saved by lm_head)
-    final_norm_act = residual * fp32 + residual * act_bytes
+    # final_norm input + output (bf16, saved by lm_head)
+    final_norm_act = residual * norm_bytes + residual * act_bytes
 
     # Cross-entropy stores logits in fp32 for numerical stability.
     logit_act = B * S * V * fp32
