@@ -1139,6 +1139,55 @@ def action_train(
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
+    # === Initial validation (step 0) ===
+
+    if project_info.train_info.token_count == 0:
+        if writer is not None:
+            writer.add_scalar("metric/time/elapsed", 0.0, 0)
+            if lr_scheduler is not None:
+                writer.add_scalar("lr", lr_scheduler.get_last_lr()[0], 0)
+
+        if val_dataset is not None:
+            t_val_start = time.perf_counter()
+
+            val_actual, val_loss, val_perplexity = compute_validation_metrics(
+                model=model,
+                dataset=val_dataset,
+                seq_len=seq_len,
+                batch_size=micro_batch_size,
+                pad_index=PAD,
+                device=device,
+                num_batches=val_batches,
+                eot_index=eot_index,
+                sot_index=sot_index,
+                use_bf16=use_bf16,
+            )
+
+            if val_actual < val_batches:
+                log_warning(
+                    f"Initial validation: dataset exhausted early "
+                    f"({val_actual}/{val_batches} batches)."
+                )
+
+            if device == "cuda":
+                torch.cuda.synchronize()
+            val_time = time.perf_counter() - t_val_start
+
+            # Console output
+            lr_msg = ""
+            if lr_scheduler is not None:
+                lr_msg = f", lr={lr_scheduler.get_last_lr()[0]:.2e}"
+            print(
+                f"  0: val_loss={val_loss:.6f}, val_perplexity={val_perplexity:.4f}"
+                f"{lr_msg}, val_time={val_time:.6f}"
+            )
+
+            # TensorBoard
+            if writer is not None:
+                writer.add_scalar("loss/val", val_loss, 0)
+                writer.add_scalar("perplexity/val", val_perplexity, 0)
+                writer.add_scalar("metric/time/val", val_time, 0)
+
     steps_remaining = steps
     while steps_remaining > 0:
         batch_iterator = make_iterator()
