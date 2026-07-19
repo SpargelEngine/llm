@@ -253,22 +253,25 @@ def estimate_memory(
     V = config.vocab_size
 
     # ---- precision constants ----
-    # Activations under autocast: most ops → bf16 (2 B), softmax → fp32 (4 B).
-    # RMSNorm (use_fp32=True) converts its input to fp32 for computation.
-    # torch.compile (Inductor) may store the saved input in bf16/fp16 when
-    # the per-sample activation volume (B × S) is large enough that the
-    # memory savings outweigh the recomputation cost during backward.
+    # Autocast: matmuls / most pointwise ops → bf16 (2 B).
+    # softmax & cross-entropy logits → fp32 (4 B) for numerical stability
+    # (Inductor upcasts bf16→fp32 internally even under autocast).
     act_bytes = 2 if use_bf16 else 4
     fp32 = 4
 
-    # Recurring volume: one residual / norm-IO tensor.
     residual = B * S * D
 
     # ---- memory ----
 
     embed_act = residual * act_bytes
 
-    # Precision of RMSNorm saved inputs under torch.compile.
+    # RMSNorm (use_fp32=True) saves its input for backward.  Inductor's
+    # min-cut partitioner bans recomputation when dist_from_bw > 4, which
+    # covers nearly all layers, so the saved tensor precision is determined
+    # by a cost-model heuristic: store the saved input in bf16 when the
+    # memory savings outweigh the backward recomputation cost of the fp32
+    # cast.  Both savings and recomputation cost scale linearly with D, so
+    # the decision boundary depends only on the per-sample token count B×S.
     if B * S >= 200_000:
         norm_bytes = act_bytes
     else:
