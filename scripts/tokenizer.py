@@ -39,7 +39,9 @@ def action_dump(path: str, min_len: int | None = None):
         print(f"{i}: |{label}|")
 
 
-def action_encode(path: str, texts_path: str, output: str, batch_size: int = 1000, field: str = "text"):
+def action_encode(
+    path: str, texts_path: str, output: str, batch_size: int = 1000, field: str = "text"
+):
     tokenizer = Tokenizer.from_file(path)
     pf = pq.ParquetFile(texts_path)
     schema = make_tokens_schema()
@@ -97,7 +99,7 @@ def action_show(tokenizer_path: str, tokens_path: str, row: int | None = None):
 def action_train(path: str, texts_path: str, vocab_size: int, field: str = "text"):
     tokenizer = Tokenizer.from_file(path)
 
-    special_tokens = ["<unk>", "<pad>", "<sot>", "<eot>"]
+    special_tokens = ["<unk>", "<pad>", "<sot>", "<eot>", "<sep>"]
     special_tokens += [f"<placeholder{i}>" for i in range(len(special_tokens), 16)]
     assert len(special_tokens) == 16
 
@@ -206,7 +208,11 @@ def main():
             action_dump(args.path, min_len=args.min_len)
         case "encode":
             action_encode(
-                args.path, args.texts_path, args.output, batch_size=args.batch_size, field=args.field
+                args.path,
+                args.texts_path,
+                args.output,
+                batch_size=args.batch_size,
+                field=args.field,
             )
         case "info":
             action_info(args.path)

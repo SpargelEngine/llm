@@ -13,8 +13,10 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from spargel_llm.model import Model
+from spargel_llm.parquet_utils import iter_row_groups
 
 type Reduction = Literal["mean", "sum"]
+type _FlatItem = tuple[np.ndarray, int, Callable[[int], None] | None]
 
 
 class TrainInfo(BaseModel):
@@ -28,7 +30,12 @@ class TrainInfo(BaseModel):
 
 @dataclass
 class TrainTracker:
-    """Mutable position tracker shared between the batch iterator and the training loop."""
+    """Checkpoint token — records where the **next** sample will start.
+
+    Mutated in-place by :func:`iter_batches` and :func:`iter_batches_indep`
+    after each sample is added.  Save ``(index, offset)`` and pass them as
+    *start_index* / *start_offset* to resume without sample duplication.
+    """
 
     index: int
     offset: int
@@ -203,31 +210,36 @@ def compute_validation_metrics(
     pad_index: int,
     device: str,
     num_batches: int = 1,
-    eot_index: int | None = None,
-    sot_index: int | None = None,
     *,
-    start_index: int = 0,
-    start_offset: int = 0,
     use_bf16: bool = True,
+    indep: bool = False,
+    sep_index: int | None = None,
+    sot_index: int | None = None,
+    eot_index: int | None = None,
 ) -> tuple[int, float, float]:
     assert num_batches > 0
 
     torch_device = torch.device(device)
     device_type = torch_device.type
 
-    def make_iterator():
-        return iter_batches(
+    if indep:
+        iterator = iter_batches_indep(
             dataset,
             seq_len,
             batch_size,
             pad_index,
             eot_index=eot_index,
             sot_index=sot_index,
-            start_index=start_index,
-            start_offset=start_offset,
         )
-
-    iterator = make_iterator()
+    else:
+        assert sep_index is not None
+        iterator = iter_batches(
+            dataset,
+            seq_len,
+            batch_size,
+            pad_index,
+            sep_index,
+        )
 
     total_loss = torch.tensor(0.0, device=torch_device, dtype=torch.float32)
     total_valid_tokens = 0
@@ -311,160 +323,270 @@ def _augment_row(
     return augmented
 
 
+def _resolve_start_row_group(
+    dataset: pq.ParquetFile, start_index: int
+) -> tuple[int, int]:
+    """Return ``(first_rg, rows_skipped)`` for the given *start_index*."""
+    for rg_idx, offset, rg_rows in iter_row_groups(dataset):
+        if offset + rg_rows > start_index:
+            return rg_idx, offset
+    # start_index beyond all row groups → skip everything
+    return dataset.metadata.num_row_groups, dataset.metadata.num_rows
+
+
+def _read_row_group(
+    dataset: pq.ParquetFile, rg_idx: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(offsets, values)`` numpy arrays for the tokens column."""
+    table = dataset.read_row_group(rg_idx)
+    col = table.column("tokens").combine_chunks()
+    return col.offsets.to_numpy(), col.values.to_numpy()
+
+
+def _yield_batches_from_arrays(
+    arrays_iter: Iterator[_FlatItem],
+    seq_len: int,
+    batch_size: int,
+    pad_index: int,
+    *,
+    stride: int | None = None,
+) -> Iterator[BatchData]:
+    """Slide windows over flat arrays and accumulate into batches.
+
+    *arrays_iter* yields ``(flat, start_pos, on_sample)`` tuples:
+
+    * *flat* — 1-D int32 token array.
+    * *start_pos* — initial window position within *flat*.
+    * *on_sample* — optional ``Callable[[int], None]`` called after each
+      sample with the next position in *flat*.  Used by callers to update
+      ``TrainTracker``.
+
+    Yields :class:`BatchData` when the buffer fills.  A final partial
+    batch is yielded after *arrays_iter* is exhausted.
+    """
+    if stride is None:
+        stride = seq_len + 1
+
+    bs, sl = batch_size, seq_len
+    inputs = np.full((bs, sl), pad_index, dtype=np.int32)
+    masks = np.ones((bs, sl), dtype=bool)
+    targets = np.full((bs, sl), pad_index, dtype=np.int32)
+    count = 0
+    non_pad = 0
+
+    def _emit(slot_valid: torch.Tensor) -> BatchData:
+        return BatchData(
+            torch.from_numpy(inputs.copy()),
+            torch.from_numpy(masks.copy()),
+            torch.from_numpy(targets.copy()),
+            slot_valid,
+            bs * sl,
+            non_pad,
+        )
+
+    for flat, start_pos, on_sample in arrays_iter:
+        max_pos = len(flat) - 2  # need ≥ 1 input + 1 target token
+        pos = start_pos
+
+        while pos <= max_pos:
+            L = min(sl, len(flat) - pos - 1)
+
+            inputs[count, :L] = flat[pos : pos + L]
+            targets[count, :L] = flat[pos + 1 : pos + 1 + L]
+            masks[count, :L] = False
+            non_pad += L
+            count += 1
+            pos += stride
+
+            if on_sample is not None:
+                on_sample(pos)
+
+            if count == bs:
+                yield _emit(torch.ones(bs, dtype=torch.bool))
+                inputs.fill(pad_index)
+                masks.fill(True)
+                targets.fill(pad_index)
+                count = 0
+                non_pad = 0
+
+    if count > 0:
+        if count < bs:
+            masks[count:, :] = False
+        slot_valid = torch.zeros(bs, dtype=torch.bool)
+        slot_valid[:count] = True
+        yield _emit(slot_valid)
+
+
 def iter_batches(
     dataset: pq.ParquetFile,
     seq_len: int,
     batch_size: int,
     pad_index: int,
+    sep_index: int,
+    *,
     stride: int | None = None,
-    start_index: int = 0,
-    start_offset: int = 0,
     tracker: TrainTracker | None = None,
-    eot_index: int | None = None,
-    sot_index: int | None = None,
 ) -> Iterator[BatchData]:
-    """Iterate through a pre-tokenized Parquet dataset and yield tensor batches.
+    """Yield batches with rows concatenated by *sep_index* within each row group.
 
-    For each row, a window of ``seq_len + 1`` tokens slides with the given
-    *stride* (default: ``seq_len + 1``).  Each window produces one sample:
-    ``(input_ids, mask, target_ids)``.  Short tails are padded with
-    *pad_index*.
+    Rows in the same row group are joined with *sep_index* between non-last
+    rows, then a sliding window produces samples.  Windows never cross row
+    group boundaries.  Tails are padded with *pad_index*.
 
-    Yields :class:`BatchData` named tuples whose fields are
-    ``(input_ids, mask, target_ids, slot_valid, tokens, tokens_non_pad)``.
-    *tokens* is the total number of elements in the batch tensors and
-    *tokens_non_pad* is the number of valid (non-PAD) tokens — both
-    computed during construction so the caller doesn't need a
-    GPU-synchronising ``.item()`` call.
-
-    Works directly on Arrow's underlying NumPy buffers to avoid the
-    Python-object overhead of ``to_pylist()``.  Samples are accumulated
-    into a pre-allocated buffer; on yield the buffer is copied so that
-    returned tensors are independent of subsequent writes.  The final
-    incomplete batch (if any) is yielded with remaining slots padded.
-
-    *start_index* skips the first N items of *dataset*.
-
-    *start_offset* is used as the initial window position only for the
-    first item (the one at *start_index*); all subsequent items start from
-    the beginning.
-
-    If *tracker* is a ``TrainTracker``, it is updated before each sample
-    with ``.index`` (current dataset row) and ``.offset`` (window
-    position within that row).
-
-    If *eot_index* is not ``None``, each row is treated as if it ends with
-    an additional token of that value, so the effective row length becomes
-    ``row_len + 1`` and the final window's target includes the EOT token.
-
-    If *sot_index* is not ``None``, each row is treated as if it begins
-    with an additional token of that value, so the effective row length
-    becomes ``row_len + 1`` and the first window's input starts with SOT.
+    If *tracker* is given, its ``index`` / ``offset`` are used as the
+    start position and updated after each sample for checkpointing.
     """
-    if stride is None:
-        stride = seq_len + 1
 
-    batch_inputs = np.full((batch_size, seq_len), pad_index, dtype=np.int32)
-    batch_masks = np.ones((batch_size, seq_len), dtype=bool)
-    batch_targets = np.full((batch_size, seq_len), pad_index, dtype=np.int32)
-    sample_in_batch = 0
-    batch_non_pad = 0
+    start_index = tracker.index if tracker is not None else 0
+    start_offset = tracker.offset if tracker is not None else 0
 
-    first = True
-    row_index = 0
+    def _flat_iter():
+        total_rows = dataset.metadata.num_rows
+        first = True
+        start_rg, row_idx = _resolve_start_row_group(dataset, start_index)
 
-    # Skip row groups that are entirely before start_index.
-    start_rg = 0
-    rg_start = 0
-    while start_rg < dataset.metadata.num_row_groups:
-        rg_rows = dataset.metadata.row_group(start_rg).num_rows
-        if rg_start + rg_rows <= start_index:
-            rg_start += rg_rows
-            row_index += rg_rows
-            start_rg += 1
-            continue
-        break
+        for rg_idx in range(start_rg, dataset.metadata.num_row_groups):
+            offsets, values = _read_row_group(dataset, rg_idx)
+            n_col = len(offsets) - 1
 
-    for rg_idx in range(start_rg, dataset.metadata.num_row_groups):
-        table = dataset.read_row_group(rg_idx)
-        col = table.column("tokens").combine_chunks()
-        offsets = col.offsets.to_numpy()
-        values = col.values.to_numpy()
+            total_len = 0
+            rows: list[tuple[int, int, bool, int]] = (
+                []
+            )  # (start, end, is_last, global_idx)
 
-        n_rows = len(col)
+            for i in range(n_col):
+                if row_idx < start_index:
+                    row_idx += 1
+                    continue
 
-        for i in range(n_rows):
-            if row_index < start_index:
-                row_index += 1
+                rs = int(offsets[i])
+                re = int(offsets[i + 1])
+
+                if first and start_offset > 0:
+                    rs = min(rs + start_offset, re)
+                    first = False
+
+                n = re - rs
+                if n == 0:
+                    row_idx += 1
+                    continue
+
+                is_last = row_idx >= total_rows - 1
+                rows.append((rs, re, is_last, row_idx))
+                total_len += n + (0 if is_last else 1)  # +1 for SEP
+                row_idx += 1
+
+            if not rows:
                 continue
 
-            row_start = int(offsets[i])
-            row_end = int(offsets[i + 1])
+            flat = np.empty(total_len, dtype=np.int32)
+            bp = np.empty(len(rows), dtype=np.int64)
+            ri = np.empty(len(rows), dtype=np.int64)
+            wp = 0
 
-            augmented = _augment_row(
-                values,
-                row_start,
-                row_end,
-                sot_index=sot_index,
-                eot_index=eot_index,
-            )
-            aug_len = len(augmented)
+            for bi, (rs, re, is_last, gidx) in enumerate(rows):
+                n = re - rs
+                flat[wp : wp + n] = values[rs:re]
+                bp[bi] = wp
+                ri[bi] = gidx
+                wp += n
+                if not is_last:
+                    flat[wp] = sep_index
+                    wp += 1
 
-            if aug_len <= 1:
-                row_index += 1
-                continue
+            if tracker is not None:
+                cursor = 0
+                n_bp = len(bp)
 
-            pos = start_offset if first else 0
-            first = False
+                def on_sample(pos: int) -> None:
+                    nonlocal cursor
+                    while cursor + 1 < n_bp and bp[cursor + 1] <= pos:
+                        cursor += 1
+                    assert tracker is not None
+                    tracker.index = int(ri[cursor])
+                    tracker.offset = pos - int(bp[cursor])
 
-            while pos + 1 < aug_len:
-                L = min(seq_len, aug_len - pos - 1)
+                yield flat, 0, on_sample
+            else:
+                yield flat, 0, None
 
-                batch_inputs[sample_in_batch, :L] = augmented[pos : pos + L]
-                batch_targets[sample_in_batch, :L] = augmented[pos + 1 : pos + 1 + L]
-                batch_masks[sample_in_batch, :L] = False
-                batch_non_pad += L
+    yield from _yield_batches_from_arrays(
+        _flat_iter(),
+        seq_len,
+        batch_size,
+        pad_index,
+        stride=stride,
+    )
+
+
+def iter_batches_indep(
+    dataset: pq.ParquetFile,
+    seq_len: int,
+    batch_size: int,
+    pad_index: int,
+    *,
+    stride: int | None = None,
+    tracker: TrainTracker | None = None,
+    sot_index: int | None = None,
+    eot_index: int | None = None,
+) -> Iterator[BatchData]:
+    """Yield batches treating each row independently.
+
+    For each row, optional SOT/EOT tokens are added via :func:`_augment_row`,
+    then a sliding window produces samples.  Windows never cross row
+    boundaries.  Rows shorter than 2 tokens are skipped.
+
+    If *tracker* is given, its ``index`` / ``offset`` are used as the
+    start position and updated after each sample for checkpointing.
+    """
+
+    start_index = tracker.index if tracker is not None else 0
+    start_offset = tracker.offset if tracker is not None else 0
+
+    def _flat_iter():
+        first = True
+        start_rg, row_idx = _resolve_start_row_group(dataset, start_index)
+
+        for rg_idx in range(start_rg, dataset.metadata.num_row_groups):
+            offsets, values = _read_row_group(dataset, rg_idx)
+
+            for i in range(len(offsets) - 1):
+                if row_idx < start_index:
+                    row_idx += 1
+                    continue
+
+                src = _augment_row(
+                    values,
+                    int(offsets[i]),
+                    int(offsets[i + 1]),
+                    sot_index=sot_index,
+                    eot_index=eot_index,
+                )
+                if len(src) <= 1:
+                    row_idx += 1
+                    continue
+
+                start_pos = start_offset if first else 0
+                first = False
 
                 if tracker is not None:
-                    tracker.index = row_index
-                    tracker.offset = pos
+                    rid = row_idx
 
-                sample_in_batch += 1
+                    def on_sample(pos: int) -> None:
+                        assert tracker is not None
+                        tracker.index = rid
+                        tracker.offset = pos
 
-                if sample_in_batch == batch_size:
-                    yield BatchData(
-                        torch.from_numpy(batch_inputs.copy()),
-                        torch.from_numpy(batch_masks.copy()),
-                        torch.from_numpy(batch_targets.copy()),
-                        torch.ones(batch_size, dtype=torch.bool),
-                        batch_size * seq_len,
-                        batch_non_pad,
-                    )
-                    batch_inputs.fill(pad_index)
-                    batch_masks.fill(True)
-                    batch_targets.fill(pad_index)
-                    sample_in_batch = 0
-                    batch_non_pad = 0
+                    yield src, start_pos, on_sample
+                else:
+                    yield src, start_pos, None
 
-                pos += stride
+                row_idx += 1
 
-            row_index += 1
-
-    if sample_in_batch > 0:
-        # Unfilled slots retain the initial all-True mask (every position
-        # masked as pad), which makes attention softmax receive all -inf
-        # and produce NaN.  Clear their masks so only the causal mask
-        # applies — each query can attend to at least itself.
-        if sample_in_batch < batch_size:
-            batch_masks[sample_in_batch:, :] = False
-
-        slot_valid = torch.zeros(batch_size, dtype=torch.bool)
-        slot_valid[:sample_in_batch] = True
-        yield BatchData(
-            torch.from_numpy(batch_inputs.copy()),
-            torch.from_numpy(batch_masks.copy()),
-            torch.from_numpy(batch_targets.copy()),
-            slot_valid,
-            batch_size * seq_len,
-            batch_non_pad,
-        )
+    yield from _yield_batches_from_arrays(
+        _flat_iter(),
+        seq_len,
+        batch_size,
+        pad_index,
+        stride=stride,
+    )

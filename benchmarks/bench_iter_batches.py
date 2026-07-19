@@ -9,7 +9,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from spargel_llm.train import iter_batches
+from spargel_llm.train import iter_batches, iter_batches_indep
 
 RNG = np.random.default_rng(42)
 
@@ -39,13 +39,23 @@ def _consume(iterator: Iterator) -> tuple[int, float]:
     return count, time.perf_counter() - t0
 
 
-CONFIGS = [
-    ("seq=128  bs=128", 128, 128, None, None, None),
-    ("seq=512  bs=32", 512, 32, None, None, None),
-    ("seq=512  bs=64", 512, 64, None, None, None),
-    ("seq=2048 bs=16", 2048, 16, None, None, None),
-    ("seq=512  bs=32  +bdy", 512, 32, None, 1, 2),
-    ("seq=128  bs=128 stride=64", 128, 128, 64, None, None),
+_BASE: list[tuple[str, int, int, int | None]] = [
+    # (label, seq_len, batch_size, stride)
+    ("seq=128  bs=128", 128, 128, None),
+    ("seq=512  bs=32", 512, 32, None),
+    ("seq=512  bs=64", 512, 64, None),
+    ("seq=2048 bs=16", 2048, 16, None),
+    ("seq=128  bs=128  stride=64", 128, 128, 64),
+]
+_BOUNDARY: list[tuple[str, int, int, int | None, int | None, int | None]] = [
+    ("seq=512  bs=32   +bdy", 512, 32, None, 1, 2),
+]
+
+CONFIGS: list[tuple[str, int, int, int | None, int | None, int | None, str]] = [
+    # (label, seq_len, batch_size, stride, sot_index, eot_index, mode)
+    *((f"{lbl}  concat", sl, bs, st, None, None, "concat") for lbl, sl, bs, st in _BASE),
+    *((f"{lbl}  indep", sl, bs, st, None, None, "indep") for lbl, sl, bs, st in _BASE),
+    *((f"{lbl}  indep", sl, bs, st, sot, eot, "indep") for lbl, sl, bs, st, sot, eot in _BOUNDARY),
 ]
 
 
@@ -66,18 +76,28 @@ def main():
     total_t0 = time.perf_counter()
 
     for ds_label, pf in datasets:
-        for cfg_label, sl, bs, stride, sot, eot in CONFIGS:
+        for cfg_label, sl, bs, stride, sot, eot, mode in CONFIGS:
 
             def iterator():
-                return iter_batches(
-                    pf,
-                    seq_len=sl,
-                    batch_size=bs,
-                    pad_index=0,
-                    stride=stride,
-                    sot_index=sot,
-                    eot_index=eot,
-                )
+                if mode == "indep":
+                    return iter_batches_indep(
+                        pf,
+                        seq_len=sl,
+                        batch_size=bs,
+                        pad_index=0,
+                        stride=stride,
+                        sot_index=sot,
+                        eot_index=eot,
+                    )
+                else:
+                    return iter_batches(
+                        pf,
+                        seq_len=sl,
+                        batch_size=bs,
+                        pad_index=0,
+                        sep_index=4,
+                        stride=stride,
+                    )
 
             _consume(iterator())  # warm-up
             count, sec = _consume(iterator())

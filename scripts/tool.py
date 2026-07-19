@@ -32,6 +32,7 @@ from spargel_llm.train import (
     compute_validation_metrics,
     generate_step,
     iter_batches,
+    iter_batches_indep,
     train,
 )
 from spargel_llm.typing import StrOrPath
@@ -40,6 +41,7 @@ from spargel_llm.utils import escape_whitespace, format_bytes, format_flops
 PAD = 1
 SOT = 2
 EOT = 3
+SEP = 4
 
 
 class TrainConfig(BaseModel):
@@ -76,9 +78,13 @@ class LogState:
 
     sum_loss: float = 0.0
     sum_time: float = 0.0
-    tokens: int = 0
     tokens_non_pad: int = 0
     val_exhausted_warned: bool = False
+
+    # Long-window accumulators for non_pad_ratio (reported every log_period*10 steps,
+    # but the per-log_period accumulators above are reset every log_period steps).
+    sum_tokens: int = 0
+    sum_tokens_non_pad: int = 0
 
 
 #### load/store helper functions ####
@@ -216,6 +222,23 @@ def always_true():
         yield True
 
 
+def _resolve_iter_mode(
+    indep: bool, add_sot: bool, add_eot: bool
+) -> tuple[int | None, int | None, int | None]:
+    """Return ``(sot_index, eot_index, sep_index)`` for the given mode flags."""
+    if indep:
+        return (SOT if add_sot else None, EOT if add_eot else None, None)
+    if add_sot:
+        log_warning(
+            "--sot is ignored in concatenated mode (use --indep for independent mode)."
+        )
+    if add_eot:
+        log_warning(
+            "--eot is ignored in concatenated mode (use --indep for independent mode)."
+        )
+    return (None, None, SEP)
+
+
 def estimate_memory(
     config: Config,
     *,
@@ -253,22 +276,25 @@ def estimate_memory(
     V = config.vocab_size
 
     # ---- precision constants ----
-    # Activations under autocast: most ops → bf16 (2 B), softmax → fp32 (4 B).
-    # RMSNorm (use_fp32=True) converts its input to fp32 for computation.
-    # torch.compile (Inductor) may store the saved input in bf16/fp16 when
-    # the per-sample activation volume (B × S) is large enough that the
-    # memory savings outweigh the recomputation cost during backward.
+    # Autocast: matmuls / most pointwise ops → bf16 (2 B).
+    # softmax & cross-entropy logits → fp32 (4 B) for numerical stability
+    # (Inductor upcasts bf16→fp32 internally even under autocast).
     act_bytes = 2 if use_bf16 else 4
     fp32 = 4
 
-    # Recurring volume: one residual / norm-IO tensor.
     residual = B * S * D
 
     # ---- memory ----
 
     embed_act = residual * act_bytes
 
-    # Precision of RMSNorm saved inputs under torch.compile.
+    # RMSNorm (use_fp32=True) saves its input for backward.  Inductor's
+    # min-cut partitioner bans recomputation when dist_from_bw > 4, which
+    # covers nearly all layers, so the saved tensor precision is determined
+    # by a cost-model heuristic: store the saved input in bf16 when the
+    # memory savings outweigh the backward recomputation cost of the fp32
+    # cast.  Both savings and recomputation cost scale linearly with D, so
+    # the decision boundary depends only on the per-sample token count B×S.
     if B * S >= 200_000:
         norm_bytes = act_bytes
     else:
@@ -276,14 +302,14 @@ def estimate_memory(
 
     # Per-block activations saved for backward.
     per_block = (
-        residual * norm_bytes              # norm1 input
-        + residual * act_bytes             # norm1 output (for W_q/k/v grads)
+        residual * norm_bytes  # norm1 input
+        + residual * act_bytes  # norm1 output (for W_q/k/v grads)
         + B * H * S * (2 * d_k + d_v) * act_bytes  # Q, K, V
-        + B * H * S * S * fp32             # attention softmax
-        + B * H * S * d_v * act_bytes      # pre-W_o
-        + residual * norm_bytes            # norm2 input
-        + residual * act_bytes             # norm2 output (for FF up grad)
-        + B * S * d_ff * act_bytes         # FF hidden (ReLU saves input)
+        + B * H * S * S * fp32  # attention softmax
+        + B * H * S * d_v * act_bytes  # pre-W_o
+        + residual * norm_bytes  # norm2 input
+        + residual * act_bytes  # norm2 output (for FF up grad)
+        + B * S * d_ff * act_bytes  # FF hidden (ReLU saves input)
     )
 
     all_blocks = n_layer * per_block
@@ -386,12 +412,8 @@ def _report_memory_estimate(
     print()
     log_info("==== FLOPs Estimate ====")
     if micro_batches > 1:
-        print(
-            f"  Forward (per micro-batch):  {format_flops(flops_fwd_micro)}"
-        )
-        print(
-            f"  Fwd + bwd (per micro-batch):  {format_flops(flops_fwd_bwd_micro)}"
-        )
+        print(f"  Forward (per micro-batch):  {format_flops(flops_fwd_micro)}")
+        print(f"  Fwd + bwd (per micro-batch):  {format_flops(flops_fwd_bwd_micro)}")
     print(f"Tokens per step:             {tokens_per_step:,}")
     print(f"Total tokens:                {total_tokens:,} ({steps} steps)")
     print()
@@ -414,13 +436,15 @@ def log_step_callback(
     batch_size: int,
     pad_index: int,
     device: str,
-    eot_index: int | None,
-    sot_index: int | None,
     use_bf16: bool = True,
     writer: SummaryWriter | None,
     on_save: Callable[[], None],
     on_backup: Callable[[], None],
     lr_scheduler: LRScheduler | None = None,
+    indep: bool = False,
+    sep_index: int | None = None,
+    sot_index: int | None = None,
+    eot_index: int | None = None,
 ) -> None:
     token_count = train_info.token_count
 
@@ -432,8 +456,9 @@ def log_step_callback(
 
     state.sum_loss += info.loss * info.tokens_non_pad
     state.sum_time += info.time
-    state.tokens += info.tokens
     state.tokens_non_pad += info.tokens_non_pad
+    state.sum_tokens += info.tokens
+    state.sum_tokens_non_pad += info.tokens_non_pad
 
     step = info.step
 
@@ -454,9 +479,11 @@ def log_step_callback(
                 pad_index=pad_index,
                 device=device,
                 num_batches=val_batches,
-                eot_index=eot_index,
-                sot_index=sot_index,
                 use_bf16=use_bf16,
+                indep=indep,
+                sep_index=sep_index,
+                sot_index=sot_index,
+                eot_index=eot_index,
             )
 
             if val_actual < val_batches and not state.val_exhausted_warned:
@@ -502,11 +529,13 @@ def log_step_callback(
             print(", ".join(parts))
 
         if step % (log_period * 10) == 0:
-            non_pad = state.tokens_non_pad
-            total = state.tokens
+            non_pad = state.sum_tokens_non_pad
+            total = state.sum_tokens
             if total > 0:
                 ratio = non_pad / total
                 print(f"non_pad_ratio={ratio:.6f} (non_pad={non_pad}, total={total})")
+            state.sum_tokens = 0
+            state.sum_tokens_non_pad = 0
 
             on_save()
 
@@ -515,7 +544,6 @@ def log_step_callback(
 
         state.sum_loss = 0.0
         state.sum_time = 0.0
-        state.tokens = 0
         state.tokens_non_pad = 0
 
 
@@ -838,14 +866,15 @@ def action_train(
     log_period: int = 10,
     tensorboard_dir: Optional[str] = None,
     device: str = "cpu",
-    start_index: Optional[int] = None,
-    start_offset: Optional[int] = None,
-    add_eot: bool = False,
-    add_sot: bool = False,
     micro_batches: Optional[int] = None,
     loop_dataset: bool = False,
     use_bf16: bool = True,
     estimate: bool = False,
+    start_index: Optional[int] = None,
+    start_offset: Optional[int] = None,
+    indep: bool = False,
+    add_sot: bool = False,
+    add_eot: bool = False,
 ):
     assert log_period > 0
 
@@ -920,25 +949,33 @@ def action_train(
 
     log_info(f"Start position: index={start_index}, offset={start_offset}")
 
-    eot_index = EOT if add_eot else None
-    sot_index = SOT if add_sot else None
+    sot_index, eot_index, sep_index = _resolve_iter_mode(indep, add_sot, add_eot)
 
     # Mutable state shared between iter_batches (writes progress),
     # save() (reads progress), and the exhaustion-reset path below.
     train_tracker = TrainTracker(index=start_index, offset=start_offset)
 
     def make_iterator():
-        return iter_batches(
-            dataset,
-            seq_len,
-            micro_batch_size,
-            PAD,
-            start_index=start_index or 0,
-            start_offset=start_offset or 0,
-            tracker=train_tracker,
-            eot_index=eot_index,
-            sot_index=sot_index,
-        )
+        if indep:
+            return iter_batches_indep(
+                dataset,
+                seq_len,
+                micro_batch_size,
+                PAD,
+                tracker=train_tracker,
+                sot_index=sot_index,
+                eot_index=eot_index,
+            )
+        else:
+            assert sep_index is not None
+            return iter_batches(
+                dataset,
+                seq_len,
+                micro_batch_size,
+                PAD,
+                sep_index,
+                tracker=train_tracker,
+            )
 
     # === Load validation data ===
 
@@ -1049,13 +1086,15 @@ def action_train(
             batch_size=micro_batch_size,
             pad_index=PAD,
             device=device,
-            eot_index=eot_index,
-            sot_index=sot_index,
             use_bf16=use_bf16,
             writer=writer,
             on_save=save,
             on_backup=backup,
             lr_scheduler=lr_scheduler,
+            indep=indep,
+            sep_index=sep_index,
+            sot_index=sot_index,
+            eot_index=eot_index,
         )
 
     # === Log training configuration ===
@@ -1090,7 +1129,11 @@ def action_train(
         print(f"Batch size:    {batch_size}")
     print(f"BF16 autocast: {use_bf16}")
     print(f"Loop dataset:  {loop_dataset}")
-    print(f"SOT/EOT:       {add_sot}/{add_eot}")
+    if indep:
+        print("Mode:          independent (per-row windows)")
+        print(f"SOT/EOT:       {add_sot}/{add_eot}")
+    else:
+        print("Mode:          concatenated (SEP-separated sliding window)")
     if val_msg:
         print(f"Validation:    {val_msg}")
     print(f"Time:          {datetime.now()}")
@@ -1127,13 +1170,14 @@ def action_train(
             "weight_decay": train_config.weight_decay,
             "bf16": use_bf16,
             "loop_dataset": loop_dataset,
-            "marker": {"sot": add_sot, "eot": add_eot},
             "device": device_info,
             "dataset": dataset_info,
             "validation": writer_val_info,
         }
         if micro_batches > 1:
             log_entry["micro_batches"] = micro_batches
+        if indep:
+            log_entry["marker"] = {"sot": add_sot, "eot": add_eot}
         writer.add_text(
             "train/log",
             json.dumps(log_entry),
@@ -1167,9 +1211,11 @@ def action_train(
                 pad_index=PAD,
                 device=device,
                 num_batches=val_batches,
-                eot_index=eot_index,
-                sot_index=sot_index,
                 use_bf16=use_bf16,
+                indep=indep,
+                sep_index=sep_index,
+                sot_index=sot_index,
+                eot_index=eot_index,
             )
 
             if val_actual < val_batches:
@@ -1220,8 +1266,6 @@ def action_train(
                 log_info("Dataset exhausted - restarting from beginning.")
                 train_tracker.index = 0
                 train_tracker.offset = 0
-                start_index = 0
-                start_offset = 0
             else:
                 log_info("Dataset exhausted - stopping early.")
                 project_info.train_info.index = 0
@@ -1286,9 +1330,10 @@ def action_validate(
     batch_size: Optional[int] = None,
     start_index: int = 0,
     start_offset: int = 0,
-    add_eot: bool = False,
-    add_sot: bool = False,
     use_bf16: bool = True,
+    indep: bool = False,
+    add_sot: bool = False,
+    add_eot: bool = False,
 ):
     assert num_batches > 0
 
@@ -1320,8 +1365,7 @@ def action_validate(
     log_info("Loading validation dataset.")
     dataset = load_dataset(val_path)
 
-    eot_index = EOT if add_eot else None
-    sot_index = SOT if add_sot else None
+    sot_index, eot_index, sep_index = _resolve_iter_mode(indep, add_sot, add_eot)
 
     log_info("Running validation.")
     t_start = time.perf_counter()
@@ -1334,11 +1378,11 @@ def action_validate(
         pad_index=PAD,
         device=device,
         num_batches=num_batches,
-        eot_index=eot_index,
-        sot_index=sot_index,
-        start_index=start_index,
-        start_offset=start_offset,
         use_bf16=use_bf16,
+        indep=indep,
+        sep_index=sep_index,
+        sot_index=sot_index,
+        eot_index=eot_index,
     )
 
     if val_actual < num_batches:
@@ -1357,7 +1401,11 @@ def action_validate(
     print(f"Seq length:    {seq_len}")
     print(f"Start index:   {start_index}")
     print(f"Start offset:  {start_offset}")
-    print(f"SOT/EOT:       {add_sot}/{add_eot}")
+    if indep:
+        print("Mode:          independent")
+        print(f"SOT/EOT:       {add_sot}/{add_eot}")
+    else:
+        print("Mode:          concatenated")
     print(f"BF16:          {use_bf16}")
     print(f"Device:        {device}")
     print(f"Time:          {elapsed:.4f}s")
@@ -1525,16 +1573,6 @@ def create_parser() -> ArgumentParser:
         help="initial window offset for the first sample (default: read from project)",
     )
     train_parser.add_argument(
-        "--sot",
-        action="store_true",
-        help="prepend SOT to each training/validation text (effective length +1)",
-    )
-    train_parser.add_argument(
-        "--eot",
-        action="store_true",
-        help="append EOT to each training/validation text (effective length +1)",
-    )
-    train_parser.add_argument(
         "-mb",
         "--micro-batches",
         type=int,
@@ -1565,6 +1603,21 @@ def create_parser() -> ArgumentParser:
         "--estimate",
         action="store_true",
         help="estimate and report GPU memory required for training, then exit without training",
+    )
+    train_parser.add_argument(
+        "--indep",
+        action="store_true",
+        help="use independent per-row window mode (default: concatenated mode with SEP)",
+    )
+    train_parser.add_argument(
+        "--sot",
+        action="store_true",
+        help="prepend SOT to each training/validation text (effective length +1)",
+    )
+    train_parser.add_argument(
+        "--eot",
+        action="store_true",
+        help="append EOT to each training/validation text (effective length +1)",
     )
 
     # validate
@@ -1619,6 +1672,11 @@ def create_parser() -> ArgumentParser:
         "--no-bf16",
         action="store_true",
         help="disable bfloat16 autocast",
+    )
+    validate_parser.add_argument(
+        "--indep",
+        action="store_true",
+        help="use independent per-row window mode (default: concatenated mode with SEP)",
     )
 
     return parser
@@ -1702,17 +1760,18 @@ def main():
                 batch_size=args.batch_size,
                 val_path=args.val,
                 val_batches=args.validation_batches,
-                device=device,
-                tensorboard_dir=args.tensorboard_dir,
                 log_period=args.log_period,
-                start_index=args.start_index,
-                start_offset=args.start_offset,
-                add_eot=args.eot,
-                add_sot=args.sot,
+                tensorboard_dir=args.tensorboard_dir,
+                device=device,
                 micro_batches=args.micro_batches,
                 loop_dataset=args.loop_dataset,
-                use_bf16=not args.no_bf16,
                 estimate=args.estimate,
+                start_index=args.start_index,
+                start_offset=args.start_offset,
+                use_bf16=not args.no_bf16,
+                indep=args.indep,
+                add_sot=args.sot,
+                add_eot=args.eot,
             )
         case "validate":
             action_validate(
@@ -1723,9 +1782,10 @@ def main():
                 batch_size=args.batch_size,
                 start_index=args.start_index,
                 start_offset=args.start_offset,
-                add_eot=args.eot,
-                add_sot=args.sot,
                 use_bf16=not args.no_bf16,
+                indep=args.indep,
+                add_sot=args.sot,
+                add_eot=args.eot,
             )
         case _:
             raise ValueError(f"unrecognized action: {args.action}")
