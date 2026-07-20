@@ -1,6 +1,6 @@
 [project]
 name = "spargel_llm"
-version = "0.9.3"
+version = "0.10.0"
 requires-python = ">=3.14"
 
 dependencies = [
