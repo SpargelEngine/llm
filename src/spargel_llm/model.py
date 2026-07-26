@@ -19,8 +19,8 @@ class Config(BaseModel):
     dim_key: PositiveInt
     dim_value: PositiveInt
     dim_ff_hidden: PositiveInt
-    use_rope: bool
-    ff_activation: FeedForward.Activation
+    use_rope: bool = True
+    ff_activation: FeedForward.Activation = "relu"
 
 
 class TransformerBlock(nn.Module):

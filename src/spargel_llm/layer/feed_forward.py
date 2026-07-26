@@ -14,6 +14,8 @@ class FeedForward(nn.Module):
 
     def __init__(self, dim: int, dim_hidden: int, activation: Activation):
         super().__init__()
+        self.dim = dim
+        self.dim_hidden = dim_hidden
         self.activation = activation
 
         self.up = nn.Linear(dim, dim_hidden)
@@ -33,4 +35,6 @@ class FeedForward(nn.Module):
 
     @override
     def extra_repr(self) -> str:
-        return f"dim={self.dim}, hidden={self.hidden}, activation={self.activation!r}"
+        return (
+            f"dim={self.dim}, hidden={self.dim_hidden}, activation={self.activation!r}"
+        )
