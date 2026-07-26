@@ -1,17 +1,17 @@
 [project]
 name = "spargel_llm"
-version = "0.10.0"
+version = "0.11.0"
 requires-python = ">=3.14"
 
 dependencies = [
     "numpy>=2.5.1",
     "pyarrow>=25.0.0",
     "pydantic>=2.12.5",
-    "regex>=2026.7.10",
+    "regex>=2026.7.19",
     "rich>=15.0.0",
     "tensorboard>=2.21.0",
     "tokenizers>=0.23.1",
-    "tqdm>=4.69.0",
+    "tqdm>=4.69.1",
 ]
 
 [build-system]
@@ -46,7 +46,7 @@ explicit = true
 members = ["."]
 
 [dependency-groups]
-dev = ["ipykernel>=7.2.0", "pytest>=9.1.0", "ruff>=0.15.22", "spargel_llm"]
+dev = ["ipykernel>=7.2.0", "pytest>=9.1.0", "ruff>=0.16.0", "spargel_llm"]
 
 [tool.ruff.lint]
 extend-select = ["I"]

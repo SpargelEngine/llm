@@ -18,8 +18,8 @@ class Item(NamedTuple):
 
     seq_len: int
 
-    input_ids: np.ndarray  # (seq_len,) long
-    target_ids: np.ndarray  # (seq_len,) long
+    input_ids: np.ndarray  # (seq_len,) int64
+    target_ids: np.ndarray  # (seq_len,) int64
     mask: np.ndarray  # (seq_len,) bool (True=valid)
 
     # number of valid (non-PAD) tokens in the target
