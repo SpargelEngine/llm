@@ -5,7 +5,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from spargel_llm.train.basic import Item, compile_batch_data
-from spargel_llm.train.pretrain import iterate_parquet_concat, iterate_sliding_window
+from spargel_llm.train.pretrain import ParquetConcatIterator, SlidingWindowIterator
 
 PAD = 0
 SEP = 4
@@ -48,7 +48,7 @@ class TestIterateSlidingWindow:
     def test_non_overlapping(self):
         """stride defaults to seq_len+1 → non-overlapping windows."""
         seq = np.array([1, 2, 3, 4, 5, 6, 7], dtype=np.int64)
-        items = list(iterate_sliding_window(seq, seq_len=3, pad_id=PAD))
+        items = list(SlidingWindowIterator(seq, seq_len=3, pad_id=PAD))
 
         assert len(items) == 2
         np.testing.assert_array_equal(items[0].input_ids, [1, 2, 3])
@@ -64,7 +64,7 @@ class TestIterateSlidingWindow:
     def test_overlapping_stride(self):
         seq = np.array([1, 2, 3, 4], dtype=np.int64)
         items = list(
-            iterate_sliding_window(seq, seq_len=2, pad_id=PAD, stride=1)
+            SlidingWindowIterator(seq, seq_len=2, pad_id=PAD, stride=1)
         )
 
         assert len(items) == 3
@@ -79,7 +79,7 @@ class TestIterateSlidingWindow:
     def test_stride_zero_means_non_overlapping(self):
         seq = np.array([1, 2, 3, 4, 5], dtype=np.int64)
         items = list(
-            iterate_sliding_window(seq, seq_len=3, pad_id=PAD, stride=0)
+            SlidingWindowIterator(seq, seq_len=3, pad_id=PAD, stride=0)
         )
         assert len(items) == 1
         np.testing.assert_array_equal(items[0].input_ids, [1, 2, 3])
@@ -87,24 +87,24 @@ class TestIterateSlidingWindow:
     def test_offset_skips_initial_positions(self):
         seq = np.array([10, 20, 30, 40, 50], dtype=np.int64)
         items = list(
-            iterate_sliding_window(seq, seq_len=2, offset=2, pad_id=PAD, stride=2)
+            SlidingWindowIterator(seq, seq_len=2, offset=2, pad_id=PAD, stride=2)
         )
         assert len(items) == 1
         np.testing.assert_array_equal(items[0].input_ids, [30, 40])
 
     def test_empty_sequence(self):
         seq = np.array([], dtype=np.int64)
-        items = list(iterate_sliding_window(seq, seq_len=3, pad_id=PAD))
+        items = list(SlidingWindowIterator(seq, seq_len=3, pad_id=PAD))
         assert len(items) == 0
 
     def test_single_token_yields_nothing(self):
         seq = np.array([42], dtype=np.int64)
-        items = list(iterate_sliding_window(seq, seq_len=3, pad_id=PAD))
+        items = list(SlidingWindowIterator(seq, seq_len=3, pad_id=PAD))
         assert len(items) == 0
 
     def test_two_tokens(self):
         seq = np.array([7, 8], dtype=np.int64)
-        items = list(iterate_sliding_window(seq, seq_len=3, pad_id=PAD))
+        items = list(SlidingWindowIterator(seq, seq_len=3, pad_id=PAD))
 
         assert len(items) == 1
         np.testing.assert_array_equal(items[0].input_ids, [7, 0, 0])
@@ -115,7 +115,7 @@ class TestIterateSlidingWindow:
     def test_partial_tail_padded(self):
         seq = np.array([1, 2, 3, 4, 5], dtype=np.int64)
         items = list(
-            iterate_sliding_window(seq, seq_len=3, pad_id=7, stride=3)
+            SlidingWindowIterator(seq, seq_len=3, pad_id=7, stride=3)
         )
         assert len(items) == 2
         # offset=3: L=1 → input=[4,7,7], target=[5,7,7]
@@ -127,7 +127,7 @@ class TestIterateSlidingWindow:
     def test_input_target_offset_by_one(self):
         seq = np.array([5, 10, 15, 20, 25], dtype=np.int64)
         items = list(
-            iterate_sliding_window(seq, seq_len=3, pad_id=PAD, stride=2)
+            SlidingWindowIterator(seq, seq_len=3, pad_id=PAD, stride=2)
         )
         np.testing.assert_array_equal(items[0].input_ids, [5, 10, 15])
         np.testing.assert_array_equal(items[0].target_ids, [10, 15, 20])
@@ -135,14 +135,14 @@ class TestIterateSlidingWindow:
     def test_offset_beyond_sequence_yields_nothing(self):
         seq = np.array([1, 2, 3], dtype=np.int64)
         items = list(
-            iterate_sliding_window(seq, seq_len=2, offset=2, pad_id=PAD)
+            SlidingWindowIterator(seq, seq_len=2, offset=2, pad_id=PAD)
         )
         assert len(items) == 0
 
     def test_long_sequence(self):
         seq = np.arange(100, dtype=np.int64)
         items = list(
-            iterate_sliding_window(seq, seq_len=10, pad_id=PAD, stride=5)
+            SlidingWindowIterator(seq, seq_len=10, pad_id=PAD, stride=5)
         )
         assert len(items) == 20
         assert items[0].tokens_valid == 10
@@ -151,10 +151,58 @@ class TestIterateSlidingWindow:
     def test_full_window_mask_always_true(self):
         seq = np.array([1, 2, 3, 4, 5], dtype=np.int64)
         items = list(
-            iterate_sliding_window(seq, seq_len=2, pad_id=PAD, stride=2)
+            SlidingWindowIterator(seq, seq_len=2, pad_id=PAD, stride=2)
         )
         for item in items:
             assert item.mask.all()
+
+    def test_offset_tracks_position(self):
+        """offset reflects the next window start position during iteration."""
+        seq = np.array([1, 2, 3, 4, 5, 6], dtype=np.int64)
+        it = SlidingWindowIterator(seq, seq_len=2, pad_id=PAD, stride=2)
+
+        assert it.offset == 0
+        next(it)
+        assert it.offset == 2
+        next(it)
+        assert it.offset == 4
+        next(it)  # last (partial) window
+        assert it.offset == 6  # past end, next call raises StopIteration
+
+    def test_resume_from_saved_offset(self):
+        """Resuming with a saved offset yields the same remaining items."""
+        seq = np.array([1, 2, 3, 4, 5, 6], dtype=np.int64)
+        it = SlidingWindowIterator(seq, seq_len=2, pad_id=PAD, stride=2)
+
+        # Consume first item, then save position
+        next(it)
+        saved_offset = it.offset
+
+        # Full iteration from scratch
+        all_items = list(
+            SlidingWindowIterator(seq, seq_len=2, pad_id=PAD, stride=2)
+        )
+
+        # Resume from saved offset
+        resumed_items = list(
+            SlidingWindowIterator(
+                seq, seq_len=2, offset=saved_offset, pad_id=PAD, stride=2
+            )
+        )
+
+        # resumed_items should match all_items[1:]
+        assert len(resumed_items) == len(all_items) - 1
+        for a, b in zip(resumed_items, all_items[1:]):
+            np.testing.assert_array_equal(a.input_ids, b.input_ids)
+            np.testing.assert_array_equal(a.target_ids, b.target_ids)
+
+    def test_offset_before_iteration(self):
+        """offset equals the initial value before any iteration."""
+        it = SlidingWindowIterator(
+            np.array([1, 2, 3], dtype=np.int64),
+            seq_len=2, offset=5, pad_id=PAD,
+        )
+        assert it.offset == 5
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -166,7 +214,7 @@ class TestIterateParquetConcat:
     def test_basic_concat(self):
         pf = _make_parquet([[1, 2], [10, 20, 30]])
         items = list(
-            iterate_parquet_concat(pf, seq_len=3, pad_id=PAD, sep_id=SEP)
+            ParquetConcatIterator(pf, seq_len=3, pad_id=PAD, sep_id=SEP)
         )
         # flat = [1,2,4,10,20,30]
         assert len(items) == 2
@@ -180,7 +228,7 @@ class TestIterateParquetConcat:
     def test_sep_only_between_rows(self):
         pf = _make_parquet([[1], [5], [9]])
         items = list(
-            iterate_parquet_concat(pf, seq_len=3, pad_id=PAD, sep_id=SEP)
+            ParquetConcatIterator(pf, seq_len=3, pad_id=PAD, sep_id=SEP)
         )
         # flat = [1,4,5,4,9], no trailing SEP
         np.testing.assert_array_equal(items[0].input_ids, [1, 4, 5])
@@ -189,7 +237,7 @@ class TestIterateParquetConcat:
     def test_single_row_no_sep(self):
         pf = _make_parquet([[10, 20, 30]])
         items = list(
-            iterate_parquet_concat(
+            ParquetConcatIterator(
                 pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=2
             )
         )
@@ -201,18 +249,23 @@ class TestIterateParquetConcat:
         rows = [[1, 2], [3, 4], [5, 6]]
         pf = _make_parquet_multi_rg(rows, row_group_size=1)
         items = list(
-            iterate_parquet_concat(
-                pf, seq_len=2, start_rg_idx=1, pad_id=PAD, sep_id=SEP, stride=2
+            ParquetConcatIterator(
+                pf, seq_len=2, group_index=1, pad_id=PAD, sep_id=SEP, stride=2
             )
         )
+        # RG1 ([3, 4]) and RG2 ([5, 6]) each produce one partial window
+        assert len(items) == 2
         np.testing.assert_array_equal(items[0].input_ids, [3, 0])
+        np.testing.assert_array_equal(items[0].target_ids, [4, 0])
+        np.testing.assert_array_equal(items[1].input_ids, [5, 0])
+        np.testing.assert_array_equal(items[1].target_ids, [6, 0])
 
     def test_offset_first_rg_only(self):
         rows = [[1, 2, 3, 4], [5, 6, 7, 8]]
         pf = _make_parquet_multi_rg(rows, row_group_size=1)
         items = list(
-            iterate_parquet_concat(
-                pf, seq_len=2, start_rg_idx=0, offset=2,
+            ParquetConcatIterator(
+                pf, seq_len=2, group_index=0, offset=2,
                 pad_id=PAD, sep_id=SEP, stride=2,
             )
         )
@@ -232,7 +285,7 @@ class TestIterateParquetConcat:
         pf = pq.ParquetFile(pa.BufferReader(buf.getvalue()))
 
         items = list(
-            iterate_parquet_concat(
+            ParquetConcatIterator(
                 pf, seq_len=2, pad_id=PAD, sep_id=SEP,
                 column_name="data", stride=2,
             )
@@ -244,7 +297,7 @@ class TestIterateParquetConcat:
         rows = [[1, 2], [3, 4], [5, 6], [7, 8]]
         pf = _make_parquet_multi_rg(rows, row_group_size=2)
         items = list(
-            iterate_parquet_concat(
+            ParquetConcatIterator(
                 pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=2,
             )
         )
@@ -254,18 +307,113 @@ class TestIterateParquetConcat:
 
     def test_all_items_have_same_seq_len(self):
         pf = _make_parquet([[1, 2, 3], [10, 20, 30, 40]])
-        for item in iterate_parquet_concat(pf, seq_len=5, pad_id=PAD, sep_id=SEP):
+        for item in ParquetConcatIterator(pf, seq_len=5, pad_id=PAD, sep_id=SEP):
             assert item.seq_len == 5
 
     def test_stride_forwarded(self):
         pf = _make_parquet([[1, 2, 3, 4, 5, 6]])
         items_default = list(
-            iterate_parquet_concat(pf, seq_len=2, pad_id=PAD, sep_id=SEP)
+            ParquetConcatIterator(pf, seq_len=2, pad_id=PAD, sep_id=SEP)
         )
         items_stride1 = list(
-            iterate_parquet_concat(pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=1)
+            ParquetConcatIterator(pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=1)
         )
         assert len(items_stride1) > len(items_default)
+
+    def test_initial_position(self):
+        """Before iteration, rg_idx and offset reflect constructor args."""
+        pf = _make_parquet_multi_rg(
+            [[1, 2], [3, 4], [5, 6]], row_group_size=1
+        )
+        it = ParquetConcatIterator(
+            pf, seq_len=2, group_index=1, offset=3, pad_id=PAD, sep_id=SEP,
+        )
+        assert it.group_index == 1
+        assert it.offset == 3
+
+    def test_position_tracks_during_iteration(self):
+        """rg_idx and offset update correctly as items are consumed.
+
+        rg_idx is advanced lazily: only when we try to read past the end
+        of the current row group's inner iterator, not when the last item
+        is consumed.  offset always reflects the inner iterator's position
+        (or the initial offset if no inner is active).
+        """
+        rows = [[1, 2, 3, 4], [5, 6, 7, 8]]
+        pf = _make_parquet_multi_rg(rows, row_group_size=1)
+        it = ParquetConcatIterator(
+            pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=2,
+        )
+
+        assert it.group_index == 0
+        assert it.offset == 0
+
+        next(it)  # first window of RG0: [1,2]/[2,3]
+        assert it.group_index == 0
+        assert it.offset == 2  # advanced by stride
+
+        next(it)  # last window of RG0: [3,0]/[4,0]
+        # Still RG0 — the inner hasn't been asked for the next item yet
+        assert it.group_index == 0
+        assert it.offset == 4  # inner's position past the end
+
+        # The *next* call triggers the row group transition
+        next(it)  # first window of RG1: [5,6]/[6,7]
+        assert it.group_index == 1
+        assert it.offset == 2  # inner for RG1 advanced by stride
+
+    def test_resume_mid_row_group(self):
+        """Resuming from a saved (rg_idx, offset) within a row group works."""
+        rows = [[1, 2, 3, 4, 5, 6], [10, 20, 30]]
+        pf = _make_parquet_multi_rg(rows, row_group_size=1)
+        it = ParquetConcatIterator(
+            pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=2,
+        )
+
+        # Consume first item, then checkpoint
+        next(it)
+        saved_rg, saved_offset = it.group_index, it.offset
+
+        # Consume remaining items from the original iterator
+        remaining_original = list(it)
+
+        # Resume from checkpoint
+        resumed_it = ParquetConcatIterator(
+            pf, seq_len=2, group_index=saved_rg, offset=saved_offset,
+            pad_id=PAD, sep_id=SEP, stride=2,
+        )
+        remaining_resumed = list(resumed_it)
+
+        assert len(remaining_resumed) == len(remaining_original)
+        for a, b in zip(remaining_resumed, remaining_original):
+            np.testing.assert_array_equal(a.input_ids, b.input_ids)
+            np.testing.assert_array_equal(a.target_ids, b.target_ids)
+
+    def test_resume_at_row_group_boundary(self):
+        """Resuming at a row group boundary (rg_idx=1, offset=0) works.
+
+        Starting at rg_idx=1 with offset=0 should produce the same
+        items as a full iteration with RG0 items skipped.
+        """
+        rows = [[1, 2], [3, 4], [5, 6]]
+        pf = _make_parquet_multi_rg(rows, row_group_size=1)
+
+        # Full iteration from the start
+        all_items = list(ParquetConcatIterator(
+            pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=2,
+        ))
+
+        # RG0 has 1 row with 2 tokens, stride=2 → exactly 1 item
+        # So rg_idx=1, offset=0 should skip the first item
+        resumed_items = list(ParquetConcatIterator(
+            pf, seq_len=2, group_index=1, offset=0,
+            pad_id=PAD, sep_id=SEP, stride=2,
+        ))
+
+        assert len(resumed_items) == len(all_items) - 1
+        for a, b in zip(resumed_items, all_items[1:]):
+            np.testing.assert_array_equal(a.input_ids, b.input_ids)
+            np.testing.assert_array_equal(a.target_ids, b.target_ids)
 
 
 # ═══════════════════════════════════════════════════════════════════

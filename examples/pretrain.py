@@ -12,7 +12,7 @@ from spargel_llm.train.basic import (
     compute_validation_metrics,
     train_step,
 )
-from spargel_llm.train.pretrain import iterate_parquet_concat
+from spargel_llm.train.pretrain import ParquetConcatIterator
 
 num_threads = os.cpu_count() or 8
 torch.set_num_threads(num_threads)
@@ -68,10 +68,10 @@ def next_batches(
 
 pf_train = ParquetFile("tokens.parquet")
 pf_val = ParquetFile("tokens_val.parquet")
-iterator_train = iterate_parquet_concat(pf_train, seq_len, pad_id=PAD, sep_id=SEP)
+iterator_train = ParquetConcatIterator(pf_train, seq_len, pad_id=PAD, sep_id=SEP)
 
 # Prepare validation data
-iterator_val = iterate_parquet_concat(pf_val, seq_len, pad_id=PAD, sep_id=SEP)
+iterator_val = ParquetConcatIterator(pf_val, seq_len, pad_id=PAD, sep_id=SEP)
 val_batch_data = next_batches(iterator_val, 10, batch_size, seq_len, pad_id=PAD)
 del iterator_val
 if val_batch_data is not None:
