@@ -72,7 +72,7 @@ def compile_batch_data(
 
     input_ids = torch.full((batches, batch_size, seq_len), pad_id, dtype=torch.long)
     target_ids = torch.full((batches, batch_size, seq_len), pad_id, dtype=torch.long)
-    mask = torch.zeros((batches, batch_size, seq_len), dtype=torch.bool)
+    mask = torch.ones((batches, batch_size, seq_len), dtype=torch.bool)  # default True so unfilled slots don't cause all-masked NaN in attention
     slot_mask = torch.zeros((batches, batch_size), dtype=torch.bool)
 
     tokens_valid = [0] * batches

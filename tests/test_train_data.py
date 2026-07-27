@@ -490,7 +490,7 @@ class TestCompileBatchData:
 
         np.testing.assert_array_equal(bd.slot_mask[0], [True, False, False])
         np.testing.assert_array_equal(bd.input_ids[0][1], [0, 0, 0])
-        np.testing.assert_array_equal(bd.mask[0][1], [False, False, False])
+        np.testing.assert_array_equal(bd.mask[0][1], [True, True, True])
 
     def test_tokens_valid_sums_across_slots(self):
         items = [
