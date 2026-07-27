@@ -121,21 +121,26 @@ class ParquetConcatIterator(Iterator[Item]):
                 raise StopIteration
 
             table = self.pf.read_row_group(self.group_index, columns=[self.column_name])
-            column = table.column(self.column_name)
+            column = table.column(self.column_name).combine_chunks()
 
-            total_len = len(column) - 1  # space for SEP tokens
-            for seq in column:
-                total_len += len(seq)
+            offsets = column.offsets.to_numpy()
+            values = column.values.to_numpy()
+
+            n_rows = len(offsets) - 1
+            total_len = values.size + n_rows - 1  # values + SEP between each pair
 
             seq_concat = np.empty(total_len, dtype=np.int64)
 
             pos = 0
-            for seq in column:
-                L = len(seq)
-                seq_concat[pos : pos + L] = seq
-                if pos + L < total_len:
-                    seq_concat[pos + L] = self.sep_id
-                pos += L + 1
+            for i in range(n_rows):
+                start = int(offsets[i])
+                end = int(offsets[i + 1])
+                L = end - start
+                seq_concat[pos : pos + L] = values[start:end]
+                pos += L
+                if i < n_rows - 1:
+                    seq_concat[pos] = self.sep_id
+                    pos += 1
 
             self._inner = SlidingWindowIterator(
                 seq_concat,
