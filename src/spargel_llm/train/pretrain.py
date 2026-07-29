@@ -84,6 +84,7 @@ class ParquetConcatIterator(Iterator[Item]):
         sep_id: int,
         column_name: str = "tokens",
         stride: int = 0,
+        loop: bool = False,
     ):
         self.pf = pf
         self.seq_len = seq_len
@@ -93,6 +94,7 @@ class ParquetConcatIterator(Iterator[Item]):
         self.sep_id = sep_id
         self.column_name = column_name
         self.stride = stride
+        self.loop = loop
 
         self._num_row_groups = pf.metadata.num_row_groups
         self._inner: SlidingWindowIterator | None = None
@@ -118,7 +120,10 @@ class ParquetConcatIterator(Iterator[Item]):
                     self._offset = 0
 
             if self.group_index >= self._num_row_groups:
-                raise StopIteration
+                if self.loop:
+                    self.group_index = 0
+                else:
+                    raise StopIteration
 
             table = self.pf.read_row_group(self.group_index, columns=[self.column_name])
             column = table.column(self.column_name).combine_chunks()

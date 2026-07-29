@@ -415,6 +415,95 @@ class TestIterateParquetConcat:
             np.testing.assert_array_equal(a.input_ids, b.input_ids)
             np.testing.assert_array_equal(a.target_ids, b.target_ids)
 
+    # ── loop tests ────────────────────────────────────────────────
+
+    def test_loop_wraps_around(self):
+        """loop=True wraps back to the first row group after exhaustion."""
+        rows = [[1, 2, 3], [10, 20, 30]]
+        pf = _make_parquet_multi_rg(rows, row_group_size=1)
+        it = ParquetConcatIterator(
+            pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=2, loop=True,
+        )
+
+        # Each RG has seq_len=3, stride=2 → 1 item per RG → 2 items per cycle
+        cycle1 = [next(it) for _ in range(2)]
+        cycle2 = [next(it) for _ in range(2)]
+
+        assert len(cycle1) == 2
+        assert len(cycle2) == 2
+        for a, b in zip(cycle1, cycle2):
+            np.testing.assert_array_equal(a.input_ids, b.input_ids)
+            np.testing.assert_array_equal(a.target_ids, b.target_ids)
+
+    def test_loop_resets_offset(self):
+        """After looping, group_index wraps to 0; inner offset tracks normally."""
+        rows = [[1, 2, 3, 4], [5, 6, 7, 8]]
+        pf = _make_parquet_multi_rg(rows, row_group_size=1)
+        it = ParquetConcatIterator(
+            pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=2, loop=True,
+        )
+
+        # Each RG: len=4, seq_len=2, stride=2 → 2 items per RG → 4 per cycle.
+        # After 4 items, RG1's inner is still active but not yet exhausted.
+        # One more next() exhausts RG1, wraps to RG0, and yields RG0's first
+        # window, advancing inner offset to 2.
+        for _ in range(4):
+            next(it)
+
+        # The 5th next() triggers the wrap AND yields the first item of the new cycle
+        next(it)
+        assert it.group_index == 0
+        assert it.offset == 2  # inner advanced by one window after wrap
+
+    def test_loop_default_off(self):
+        """Default loop=False raises StopIteration after exhaustion."""
+        pf = _make_parquet([[1, 2, 3]])
+        it = ParquetConcatIterator(
+            pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=2,
+        )
+        list(it)  # exhaust
+        with __import__("pytest").raises(StopIteration):
+            next(it)
+
+    def test_loop_with_single_row_group(self):
+        """loop=True works even when there is only one row group."""
+        pf = _make_parquet([[1, 2, 3, 4]])
+        it = ParquetConcatIterator(
+            pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=2, loop=True,
+        )
+
+        items1 = [next(it) for _ in range(2)]   # cycle 1
+        items2 = [next(it) for _ in range(2)]   # cycle 2
+
+        assert len(items1) == 2
+        assert len(items2) == 2
+        # Each cycle should produce the same windows
+        np.testing.assert_array_equal(items1[0].input_ids, items2[0].input_ids)
+        np.testing.assert_array_equal(items1[1].input_ids, items2[1].input_ids)
+
+    def test_loop_position_tracks_correctly(self):
+        """group_index and offset advance correctly across loop wraps."""
+        rows = [[1, 2], [3, 4]]
+        pf = _make_parquet_multi_rg(rows, row_group_size=1)
+        it = ParquetConcatIterator(
+            pf, seq_len=2, pad_id=PAD, sep_id=SEP, stride=2, loop=True,
+        )
+
+        # RG0, one partial item: [1,0]/[2,0]
+        next(it)
+        assert it.group_index == 0
+        assert it.offset == 2  # past end of RG0
+
+        # Triggers transition to RG1
+        next(it)  # RG1: [3,0]/[4,0]
+        assert it.group_index == 1
+        assert it.offset == 2  # past end of RG1
+
+        # Triggers wrap back to RG0
+        next(it)  # RG0 again: [1,0]/[2,0]
+        assert it.group_index == 0
+        assert it.offset == 2
+
 
 # ═══════════════════════════════════════════════════════════════════
 # compile_batch_data
