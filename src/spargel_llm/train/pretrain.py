@@ -27,6 +27,7 @@ class SlidingWindowIterator(Iterator[Item]):
         self.offset = offset
         self.pad_id = pad_id
         self.stride = stride if stride > 0 else seq_len + 1
+        self._full_mask = np.ones(seq_len, dtype=np.bool)
 
     def __iter__(self) -> SlidingWindowIterator:
         return self
@@ -45,7 +46,7 @@ class SlidingWindowIterator(Iterator[Item]):
                 seq_len=self.seq_len,
                 input_ids=self.seq[start : start + self.seq_len],
                 target_ids=self.seq[start + 1 : start + 1 + self.seq_len],
-                mask=np.ones(self.seq_len, dtype=np.bool),
+                mask=self._full_mask,
                 tokens_valid=self.seq_len,
             )
 

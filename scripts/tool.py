@@ -23,7 +23,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from spargel_llm.logging import log_info, log_success, log_warning
 from spargel_llm.lr_scheduler import LRSchedulerModel
-from spargel_llm.model import Config, Model, compute_param_counts
+from spargel_llm.model import Config, Model
 from spargel_llm.parquet_utils import get_dataset_id
 from spargel_llm.train import (
     StepInfo,
@@ -237,6 +237,45 @@ def _resolve_iter_mode(
             "--eot is ignored in concatenated mode (use --indep for independent mode)."
         )
     return (None, None, SEP)
+
+
+def compute_param_counts(config: Config) -> tuple[int, int]:
+    """Compute the number of trainable parameters implied by *config*.
+
+    Returns ``(embedding_params, body_params)`` where *embedding_params*
+    counts the input embedding and output projection (lm head), and
+    *body_params* counts every other parameter (transformer blocks,
+    final norm, positional encoding, etc.).
+    """
+    # ---- input / output embeddings ----
+    embedding_params = config.vocab_size * config.dim  # nn.Embedding
+    embedding_params += (
+        config.dim * config.vocab_size + config.vocab_size
+    )  # nn.Linear (weight + bias)
+
+    # ---- per transformer block ----
+    # attention: W_q + W_k + W_v + W_o
+    attn_params = (
+        config.num_head * config.dim * config.dim_key
+        + config.num_head * config.dim * config.dim_key
+        + config.num_head * config.dim * config.dim_value
+        + config.num_head * config.dim_value * config.dim
+    )
+    # feed-forward: up (weight + bias) + down (weight + bias)
+    ff_params = (
+        config.dim * config.dim_ff_hidden
+        + config.dim_ff_hidden
+        + config.dim_ff_hidden * config.dim
+        + config.dim
+    )
+
+    body_params = config.num_layer * (attn_params + ff_params)
+
+    # RMSNorm currently uses a plain scalar 1, not an nn.Parameter.
+    # PositionalEncoding uses non-persistent nn.Buffers.
+    # Therefore neither contributes to the parameter count.
+
+    return embedding_params, body_params
 
 
 def estimate_memory(

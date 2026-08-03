@@ -1,5 +1,6 @@
 import os
 import random
+import sys
 
 import numpy as np
 import torch
@@ -12,17 +13,6 @@ from spargel_llm.train.basic import (
     compute_validation_metrics,
     train_step,
 )
-
-num_threads = os.cpu_count() or 8
-torch.set_num_threads(num_threads)
-print(f"PyTorch will use {num_threads} CPU thread(s).")
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
-
-use_bf16 = device == "cuda"
-print(f"Use BF16: {use_bf16}")
-
 
 # Vocab: 0123456789, <pad>, <eot>, +, =
 
@@ -63,47 +53,66 @@ def gen_data() -> Item:
     )
 
 
-model = Model(
-    Config(
-        vocab_size=16,
-        max_seq_len=16,
-        num_layer=4,
-        num_head=4,
-        dim=64,
-        dim_key=16,
-        dim_value=16,
-        dim_ff_hidden=256,
-    )
-)
-model = model.to(device)
-optimizer = AdamW(model.parameters())
-
-
-# Prepare validation data
-val_batch_data = compile_batch_data(
-    [gen_data() for _ in range(batch_size * 10)], batch_size, seq_len, pad_id=PAD
-).to(device)
-
-
-# Train loop
-count = 0
-sum_loss = 0.0
-
-for i in range(1000):
-    items = [gen_data() for _ in range(batch_size)]
-    batch_data = compile_batch_data(items, batch_size, seq_len, pad_id=PAD).to(device)
-    loss = train_step(model, optimizer, batch_data, pad_id=PAD, use_bf16=use_bf16)
-
-    count += 1
-    sum_loss += loss.item()
-
-    if (i + 1) % 100 == 0:
-        avg_loss, avg_perplexity = compute_validation_metrics(
-            model, val_batch_data, pad_id=PAD, use_bf16=use_bf16
+def main(device: str):
+    model = Model(
+        Config(
+            vocab_size=16,
+            max_seq_len=16,
+            num_layer=4,
+            num_head=4,
+            dim=64,
+            dim_key=16,
+            dim_value=16,
+            dim_ff_hidden=256,
         )
-        print(
-            f"{i+1}: avg_loss={sum_loss / count:.6f}, val_loss={avg_loss.item():.6f}, val_ppl={avg_perplexity.item():.4f}"
-        )
+    ).to(device)
+    optimizer = AdamW(model.parameters())
 
-        count = 0
-        sum_loss = 0.0
+    # Prepare validation data
+    val_batch_data = compile_batch_data(
+        [gen_data() for _ in range(batch_size)], batch_size, seq_len, pad_id=PAD
+    ).to(device)
+
+    # Train loop
+    count = 0
+    sum_loss = 0.0
+
+    for i in range(steps):
+        items = [gen_data() for _ in range(batch_size)]
+        batch_data = compile_batch_data(items, batch_size, seq_len, pad_id=PAD).to(
+            device
+        )
+        loss = train_step(model, optimizer, batch_data, pad_id=PAD, use_bf16=use_bf16)
+
+        count += 1
+        sum_loss += loss.item()
+
+        if (i + 1) % 100 == 0:
+            avg_loss, avg_perplexity = compute_validation_metrics(
+                model, val_batch_data, pad_id=PAD, use_bf16=use_bf16
+            )
+            print(
+                f"{i+1}: avg_loss={sum_loss / count:.6f}, val_loss={avg_loss.item():.6f}, val_ppl={avg_perplexity.item():.4f}"
+            )
+
+            count = 0
+            sum_loss = 0.0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) <= 1:
+        print(f"Usage: {sys.argv[0]} steps")
+        sys.exit(1)
+    steps = int(sys.argv[1])
+
+    num_threads = os.cpu_count() or 8
+    torch.set_num_threads(num_threads)
+    print(f"PyTorch will use {num_threads} CPU thread(s).")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    use_bf16 = device == "cuda"
+    print(f"Use BF16: {use_bf16}")
+
+    main(device)

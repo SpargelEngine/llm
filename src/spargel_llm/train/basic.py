@@ -6,10 +6,9 @@ from typing import NamedTuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 from torch.optim import Optimizer
 
-from spargel_llm.model import Model
 from spargel_llm.typing import CrossEntropyReduction
 
 
@@ -72,7 +71,9 @@ def compile_batch_data(
 
     input_ids = torch.full((batches, batch_size, seq_len), pad_id, dtype=torch.long)
     target_ids = torch.full((batches, batch_size, seq_len), pad_id, dtype=torch.long)
-    mask = torch.ones((batches, batch_size, seq_len), dtype=torch.bool)  # default True so unfilled slots don't cause all-masked NaN in attention
+    mask = torch.ones(
+        (batches, batch_size, seq_len), dtype=torch.bool
+    )  # default True so unfilled slots don't cause all-masked NaN in attention
     slot_mask = torch.zeros((batches, batch_size), dtype=torch.bool)
 
     tokens_valid = [0] * batches
@@ -109,7 +110,7 @@ def compile_batch_data(
 
 @torch.compile
 def compute_loss_step(
-    model: Model,
+    model: nn.Module,
     input_ids: Tensor,
     target_ids: Tensor,
     mask: Tensor,
@@ -135,7 +136,7 @@ def compute_loss_step(
     # (..., seq_len, vocab_size)
 
     # Zero out invalid slots, avoid NaN.
-    logits = torch.where(slot_mask[:, None, None], logits, torch.zeros_like(logits))
+    logits = torch.where(slot_mask[:, None, None], logits, 0.0)
 
     # flatten batch dimension to one
     flattened_logits = logits.flatten(0, -2)
@@ -149,7 +150,7 @@ def compute_loss_step(
 
 
 def train_step(
-    model: Model,
+    model: nn.Module,
     optimizer: Optimizer,
     batch_data: BatchData,
     *,
@@ -197,7 +198,7 @@ def train_step(
 
 
 def compute_validation_metrics(
-    model: Model,
+    model: nn.Module,
     batch_data: BatchData,
     *,
     pad_id: int,
