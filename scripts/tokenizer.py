@@ -99,9 +99,15 @@ def action_show(tokenizer_path: str, tokens_path: str, row: int | None = None):
 def action_train(path: str, texts_path: str, vocab_size: int, field: str = "text"):
     tokenizer = Tokenizer.from_file(path)
 
+    def pad_to(tokens: list[str], length: int):
+        assert len(tokens) <= length
+        tokens += [f"<placeholder{i}>" for i in range(len(tokens), length)]
+        assert len(tokens) == length
+
     special_tokens = ["<unk>", "<pad>", "<sot>", "<eot>", "<sep>"]
-    special_tokens += [f"<placeholder{i}>" for i in range(len(special_tokens), 16)]
-    assert len(special_tokens) == 16
+    pad_to(special_tokens, 8)
+    special_tokens += ["<im_start>", "<im_end>"]
+    pad_to(special_tokens, 16)
 
     trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=special_tokens)
     pf = pq.ParquetFile(texts_path)
