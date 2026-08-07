@@ -5,7 +5,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from spargel_llm.parquet_utils import make_text_schema
 from spargel_llm.text_pass import load_texts
 
 
@@ -39,7 +38,7 @@ def main():
     args = parser.parse_args()
 
     output_path = Path(args.output)
-    schema = make_text_schema()
+    schema = pa.schema([pa.field("text", pa.string())])
 
     with pq.ParquetWriter(output_path, schema, compression="zstd") as writer:
         batch: list[str] = []

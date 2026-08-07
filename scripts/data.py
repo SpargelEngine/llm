@@ -11,12 +11,10 @@ from tqdm import tqdm
 
 from spargel_llm.parquet_utils import (
     concat_parquet_files,
-    get_dataset_id,
     iter_row_groups,
     read_row,
     resolve_index,
     resolve_row,
-    with_new_dataset_id,
 )
 
 #### shared helpers ####
@@ -32,7 +30,7 @@ def _distribute_rows(pf, output_paths, schema, rng, show_progress=True):
     output_paths : list[str]
         Paths of the output files, one per bucket.
     schema : pa.Schema
-        Schema for the output files (caller decides whether to set a dataset ID).
+        Schema for the output files.
     rng : random.Random
         Random number generator.
     show_progress : bool
@@ -82,7 +80,7 @@ def action_copy(
     except possibly the last will contain exactly that many rows.
     """
     pf = pq.ParquetFile(input_path)
-    schema = with_new_dataset_id(pf.schema_arrow)
+    schema = pf.schema_arrow
     written_rows = 0
 
     with pq.ParquetWriter(
@@ -138,7 +136,7 @@ def action_dist(
     pf = pq.ParquetFile(input_path)
     output_paths = [output_format % i for i in range(num_files)]
     rng = random.Random(random_seed)
-    _distribute_rows(pf, output_paths, with_new_dataset_id(pf.schema_arrow), rng)
+    _distribute_rows(pf, output_paths, pf.schema_arrow, rng)
     print(f"{input_path} distributed across {num_files} files.")
 
 
@@ -151,10 +149,6 @@ def _open_and_print_parquet_metadata(path: str):
     print("Schema:")
     print(pf.schema_arrow)
     print("=" * 16)
-
-    dataset_id = get_dataset_id(pf)
-    if dataset_id:
-        print(f"Dataset ID:       {dataset_id}")
 
     return pf
 
@@ -229,7 +223,7 @@ def action_shuffle(
         rng.shuffle(indices)
         shuffled = table.take(pa.array(indices))
         del table, indices
-        schema = with_new_dataset_id(pf.schema_arrow)
+        schema = pf.schema_arrow
         with pq.ParquetWriter(output, schema, compression="zstd") as writer:
             writer.write_table(shuffled)
         out_rgs = pq.ParquetFile(output).metadata.num_row_groups
@@ -304,7 +298,7 @@ def action_slice(input_path: str, slice_spec: str, output: str):
     pf = pq.ParquetFile(input_path)
     start, end = _parse_slice(slice_spec, pf.metadata.num_rows)
 
-    schema = with_new_dataset_id(pf.schema_arrow)
+    schema = pf.schema_arrow
     written_rows = 0
 
     print(f"Slicing {input_path}[{start}:{end}] ...")
@@ -345,7 +339,7 @@ def action_split(input_path: str, pos: int, output1: str, output2: str):
             f"split position {pos} out of range (file has {pf.metadata.num_rows} rows)"
         )
 
-    schema = with_new_dataset_id(pf.schema_arrow)
+    schema = pf.schema_arrow
     n1 = n2 = 0
 
     with (

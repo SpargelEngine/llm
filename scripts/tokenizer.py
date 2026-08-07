@@ -2,16 +2,12 @@ import math
 from argparse import ArgumentParser
 
 import pyarrow as pa
-import pyarrow.parquet as pq
+from pyarrow.parquet import ParquetFile, ParquetWriter
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from tokenizers.trainers import BpeTrainer
 from tqdm import tqdm
 
-from spargel_llm.parquet_utils import (
-    make_tokens_schema,
-    read_row,
-    resolve_row,
-)
+from spargel_llm.parquet_utils import read_row, resolve_row
 from spargel_llm.utils import escape_whitespace
 
 
@@ -43,10 +39,10 @@ def action_encode(
     path: str, texts_path: str, output: str, batch_size: int = 1000, field: str = "text"
 ):
     tokenizer = Tokenizer.from_file(path)
-    pf = pq.ParquetFile(texts_path)
-    schema = make_tokens_schema()
+    pf = ParquetFile(texts_path)
+    schema = pa.schema([pa.field("tokens", pa.list_(pa.uint32()))])
 
-    with pq.ParquetWriter(output, schema, compression="zstd") as writer:
+    with ParquetWriter(output, schema, compression="zstd") as writer:
         total = math.ceil(pf.metadata.num_rows / batch_size)
         for batch in tqdm(
             pf.iter_batches(batch_size=batch_size), desc="batches", total=total
@@ -87,7 +83,7 @@ def action_show(tokenizer_path: str, tokens_path: str, row: int | None = None):
     If row is not specified, a random row is selected.
     """
     tokenizer = Tokenizer.from_file(tokenizer_path)
-    pf = pq.ParquetFile(tokens_path)
+    pf = ParquetFile(tokens_path)
     row = resolve_row(pf, row)
     local_idx, table = read_row(pf, row, ["tokens"])
     token_ids = table.column("tokens")[local_idx].as_py()
@@ -110,7 +106,7 @@ def action_train(path: str, texts_path: str, vocab_size: int, field: str = "text
     pad_to(special_tokens, 16)
 
     trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=special_tokens)
-    pf = pq.ParquetFile(texts_path)
+    pf = ParquetFile(texts_path)
 
     def text_iter():
         for batch in pf.iter_batches():

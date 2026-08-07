@@ -54,12 +54,14 @@ class TestIterateSlidingWindow:
         np.testing.assert_array_equal(items[0].input_ids, [1, 2, 3])
         np.testing.assert_array_equal(items[0].target_ids, [2, 3, 4])
         np.testing.assert_array_equal(items[0].mask, [True, True, True])
-        assert items[0].tokens_valid == 3
+        assert items[0].num_non_pad == 3
+        assert items[0].num_valid == 3
 
         np.testing.assert_array_equal(items[1].input_ids, [5, 6, 0])
         np.testing.assert_array_equal(items[1].target_ids, [6, 7, 0])
         np.testing.assert_array_equal(items[1].mask, [True, True, False])
-        assert items[1].tokens_valid == 2
+        assert items[1].num_non_pad == 2
+        assert items[1].num_valid == 2
 
     def test_overlapping_stride(self):
         seq = np.array([1, 2, 3, 4], dtype=np.int64)
@@ -74,7 +76,8 @@ class TestIterateSlidingWindow:
         np.testing.assert_array_equal(items[1].target_ids, [3, 4])
         np.testing.assert_array_equal(items[2].input_ids, [3, 0])
         np.testing.assert_array_equal(items[2].target_ids, [4, 0])
-        assert items[2].tokens_valid == 1
+        assert items[2].num_non_pad == 1
+        assert items[2].num_valid == 1
 
     def test_stride_zero_means_non_overlapping(self):
         seq = np.array([1, 2, 3, 4, 5], dtype=np.int64)
@@ -110,7 +113,8 @@ class TestIterateSlidingWindow:
         np.testing.assert_array_equal(items[0].input_ids, [7, 0, 0])
         np.testing.assert_array_equal(items[0].target_ids, [8, 0, 0])
         np.testing.assert_array_equal(items[0].mask, [True, False, False])
-        assert items[0].tokens_valid == 1
+        assert items[0].num_non_pad == 1
+        assert items[0].num_valid == 1
 
     def test_partial_tail_padded(self):
         seq = np.array([1, 2, 3, 4, 5], dtype=np.int64)
@@ -122,7 +126,8 @@ class TestIterateSlidingWindow:
         np.testing.assert_array_equal(items[1].input_ids, [4, 7, 7])
         np.testing.assert_array_equal(items[1].target_ids, [5, 7, 7])
         np.testing.assert_array_equal(items[1].mask, [True, False, False])
-        assert items[1].tokens_valid == 1
+        assert items[1].num_non_pad == 1
+        assert items[1].num_valid == 1
 
     def test_input_target_offset_by_one(self):
         seq = np.array([5, 10, 15, 20, 25], dtype=np.int64)
@@ -145,8 +150,10 @@ class TestIterateSlidingWindow:
             SlidingWindowIterator(seq, seq_len=10, pad_id=PAD, stride=5)
         )
         assert len(items) == 20
-        assert items[0].tokens_valid == 10
-        assert items[-1].tokens_valid == 4
+        assert items[0].num_non_pad == 10
+        assert items[-1].num_non_pad == 4
+        assert items[0].num_valid == 10
+        assert items[-1].num_valid == 4
 
     def test_full_window_mask_always_true(self):
         seq = np.array([1, 2, 3, 4, 5], dtype=np.int64)
@@ -220,10 +227,12 @@ class TestIterateParquetConcat:
         assert len(items) == 2
         np.testing.assert_array_equal(items[0].input_ids, [1, 2, 4])
         np.testing.assert_array_equal(items[0].target_ids, [2, 4, 10])
-        assert items[0].tokens_valid == 3
+        assert items[0].num_non_pad == 3
+        assert items[0].num_valid == 3
         np.testing.assert_array_equal(items[1].input_ids, [20, 0, 0])
         np.testing.assert_array_equal(items[1].target_ids, [30, 0, 0])
-        assert items[1].tokens_valid == 1
+        assert items[1].num_non_pad == 1
+        assert items[1].num_valid == 1
 
     def test_sep_only_between_rows(self):
         pf = _make_parquet([[1], [5], [9]])
@@ -516,11 +525,11 @@ class TestCompileBatchData:
             Item(seq_len=3,
                  input_ids=np.array([1, 2, 3], dtype=np.int64),
                  target_ids=np.array([2, 3, 4], dtype=np.int64),
-                 mask=np.ones(3, dtype=np.bool), tokens_valid=3),
+                 mask=np.ones(3, dtype=np.bool), num_non_pad=3, num_valid=3),
             Item(seq_len=3,
                  input_ids=np.array([5, 6, 7], dtype=np.int64),
                  target_ids=np.array([6, 7, 8], dtype=np.int64),
-                 mask=np.ones(3, dtype=np.bool), tokens_valid=3),
+                 mask=np.ones(3, dtype=np.bool), num_non_pad=3, num_valid=3),
         ]
         bd = compile_batch_data(items, batch_size=2, seq_len=3, pad_id=PAD)
 
@@ -529,22 +538,23 @@ class TestCompileBatchData:
         np.testing.assert_array_equal(bd.input_ids[0], [[1, 2, 3], [5, 6, 7]])
         np.testing.assert_array_equal(bd.target_ids[0], [[2, 3, 4], [6, 7, 8]])
         np.testing.assert_array_equal(bd.slot_mask[0], [True, True])
-        assert bd.tokens_valid == [6]
+        assert bd.num_non_pad == [6]
+        assert bd.num_valid == [6]
 
     def test_partial_last_batch(self):
         items = [
             Item(seq_len=2,
                  input_ids=np.array([1, 2], dtype=np.int64),
                  target_ids=np.array([2, 3], dtype=np.int64),
-                 mask=np.ones(2, dtype=np.bool), tokens_valid=2),
+                 mask=np.ones(2, dtype=np.bool), num_non_pad=2, num_valid=2),
             Item(seq_len=2,
                  input_ids=np.array([4, 5], dtype=np.int64),
                  target_ids=np.array([5, 6], dtype=np.int64),
-                 mask=np.ones(2, dtype=np.bool), tokens_valid=2),
+                 mask=np.ones(2, dtype=np.bool), num_non_pad=2, num_valid=2),
             Item(seq_len=2,
                  input_ids=np.array([7, 0], dtype=np.int64),
                  target_ids=np.array([8, 0], dtype=np.int64),
-                 mask=np.array([True, False]), tokens_valid=1),
+                 mask=np.array([True, False]), num_non_pad=1, num_valid=1),
         ]
         bd = compile_batch_data(items, batch_size=2, seq_len=2, pad_id=PAD)
 
@@ -552,20 +562,22 @@ class TestCompileBatchData:
         np.testing.assert_array_equal(bd.input_ids[1], [[7, 0], [0, 0]])
         np.testing.assert_array_equal(bd.slot_mask[0], [True, True])
         np.testing.assert_array_equal(bd.slot_mask[1], [True, False])
-        assert bd.tokens_valid == [4, 1]
+        assert bd.num_non_pad == [4, 1]
+        assert bd.num_valid == [4, 1]
 
     def test_multiple_full_batches(self):
         items = [
             Item(seq_len=2,
                  input_ids=np.array([i, i + 1], dtype=np.int64),
                  target_ids=np.array([i + 1, i + 2], dtype=np.int64),
-                 mask=np.ones(2, dtype=np.bool), tokens_valid=2)
+                 mask=np.ones(2, dtype=np.bool), num_non_pad=2, num_valid=2)
             for i in range(5)
         ]
         bd = compile_batch_data(items, batch_size=2, seq_len=2, pad_id=PAD)
 
         assert bd.batches == 3
-        assert bd.tokens_valid == [4, 4, 2]
+        assert bd.num_non_pad == [4, 4, 2]
+        assert bd.num_valid == [4, 4, 2]
         np.testing.assert_array_equal(bd.input_ids[2], [[4, 5], [0, 0]])
 
     def test_slot_mask_marks_unfilled(self):
@@ -573,27 +585,49 @@ class TestCompileBatchData:
             Item(seq_len=3,
                  input_ids=np.array([1, 2, 3], dtype=np.int64),
                  target_ids=np.array([2, 3, 4], dtype=np.int64),
-                 mask=np.ones(3, dtype=np.bool), tokens_valid=3)
+                 mask=np.ones(3, dtype=np.bool), num_non_pad=3, num_valid=3)
         ]
         bd = compile_batch_data(items, batch_size=3, seq_len=3, pad_id=PAD)
 
         np.testing.assert_array_equal(bd.slot_mask[0], [True, False, False])
         np.testing.assert_array_equal(bd.input_ids[0][1], [0, 0, 0])
         np.testing.assert_array_equal(bd.mask[0][1], [True, True, True])
+        # unfilled slots contribute nothing to the totals
+        assert bd.num_non_pad == [3]
+        assert bd.num_valid == [3]
 
-    def test_tokens_valid_sums_across_slots(self):
+    def test_num_non_pad_sums_across_slots(self):
+        """num_non_pad and num_valid are aggregated over the slots of a batch."""
         items = [
             Item(seq_len=3,
                  input_ids=np.array([1, 2, 3], dtype=np.int64),
                  target_ids=np.array([2, 3, 4], dtype=np.int64),
-                 mask=np.ones(3, dtype=np.bool), tokens_valid=3),
+                 mask=np.ones(3, dtype=np.bool), num_non_pad=3, num_valid=3),
             Item(seq_len=3,
                  input_ids=np.array([5, 0, 0], dtype=np.int64),
                  target_ids=np.array([6, 0, 0], dtype=np.int64),
-                 mask=np.array([True, False, False]), tokens_valid=1),
+                 mask=np.array([True, False, False]), num_non_pad=1, num_valid=1),
         ]
         bd = compile_batch_data(items, batch_size=2, seq_len=3, pad_id=PAD)
-        assert bd.tokens_valid == [4]
+        assert bd.num_non_pad == [4]
+        assert bd.num_valid == [4]
+
+    def test_num_valid_and_num_non_pad_are_independent(self):
+        """num_valid counts visible positions even when targets are pad,
+        so the two fields can differ."""
+        items = [
+            Item(seq_len=3,
+                 input_ids=np.array([1, 2, 3], dtype=np.int64),
+                 target_ids=np.array([2, 3, 4], dtype=np.int64),
+                 mask=np.ones(3, dtype=np.bool), num_non_pad=3, num_valid=3),
+            Item(seq_len=3,
+                 input_ids=np.array([5, 0, 0], dtype=np.int64),
+                 target_ids=np.array([6, 0, 0], dtype=np.int64),
+                 mask=np.ones(3, dtype=np.bool), num_non_pad=1, num_valid=3),
+        ]
+        bd = compile_batch_data(items, batch_size=2, seq_len=3, pad_id=PAD)
+        assert bd.num_non_pad == [4]
+        assert bd.num_valid == [6]
 
     def test_asserts_equal_seq_len(self):
         import pytest
@@ -601,11 +635,11 @@ class TestCompileBatchData:
             Item(seq_len=3,
                  input_ids=np.array([1, 2, 3], dtype=np.int64),
                  target_ids=np.array([2, 3, 4], dtype=np.int64),
-                 mask=np.ones(3, dtype=np.bool), tokens_valid=3),
+                 mask=np.ones(3, dtype=np.bool), num_non_pad=3, num_valid=3),
             Item(seq_len=4,
                  input_ids=np.array([1, 2, 3, 4], dtype=np.int64),
                  target_ids=np.array([2, 3, 4, 5], dtype=np.int64),
-                 mask=np.ones(4, dtype=np.bool), tokens_valid=4),
+                 mask=np.ones(4, dtype=np.bool), num_non_pad=4, num_valid=4),
         ]
         with pytest.raises(AssertionError):
             compile_batch_data(items, batch_size=2, seq_len=3, pad_id=PAD)
@@ -620,7 +654,7 @@ class TestCompileBatchData:
             Item(seq_len=2,
                  input_ids=np.array([1, 2], dtype=np.int64),
                  target_ids=np.array([2, 3], dtype=np.int64),
-                 mask=np.ones(2, dtype=np.bool), tokens_valid=2)
+                 mask=np.ones(2, dtype=np.bool), num_non_pad=2, num_valid=2)
         ]
         bd = compile_batch_data(items, batch_size=4, seq_len=2, pad_id=PAD)
         assert bd.batches == 1

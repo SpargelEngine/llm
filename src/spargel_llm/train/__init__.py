@@ -25,7 +25,6 @@ class TrainInfo(BaseModel):
     steps: NonNegativeInt = 0
     index: NonNegativeInt = 0
     offset: NonNegativeInt = 0
-    dataset_id: str = ""
 
 
 @dataclass

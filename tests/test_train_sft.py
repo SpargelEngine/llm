@@ -77,7 +77,9 @@ class TestBuildItemChatmlBasic:
         assert item.input_ids.dtype == np.int64
         assert item.target_ids.dtype == np.int64
         assert item.mask.dtype == np.bool
-        assert item.tokens_valid > 0
+        assert item.num_non_pad > 0
+        # num_valid counts the visible (masked-in) positions
+        assert item.num_valid == int(item.mask.sum())
 
     def test_input_sequence_starts_with_im_start(self):
         """The very first token should be ``<im_start>``."""
@@ -153,7 +155,7 @@ class TestBuildItemChatmlTargets:
             assert item.target_ids[pos] == item.input_ids[pos + 1]
 
     def test_no_assistant_messages(self):
-        """When there is no assistant, *tokens_valid* is 0 and targets are pad."""
+        """When there is no assistant, *num_non_pad* is 0 and targets are pad."""
         tokenizer = _make_tiny_tokenizer()
         messages = [
             Message(role="system", content="You are helpful."),
@@ -163,7 +165,9 @@ class TestBuildItemChatmlTargets:
             messages, tokenizer, seq_len=64,
             pad_id=PAD, im_start_id=IM_START, im_end_id=IM_END,
         )
-        assert item.tokens_valid == 0
+        assert item.num_non_pad == 0
+        # but the input is still fully visible
+        assert item.num_valid == int(item.mask.sum()) > 0
         valid_len = item.mask.sum()
         np.testing.assert_array_equal(
             item.target_ids[:valid_len], np.full(valid_len, PAD, dtype=np.int64),
@@ -201,9 +205,10 @@ class TestBuildItemChatmlTargets:
         # Two assistant messages → two target ranges
         assert len(ranges) == 2, f"Expected 2 target ranges, got {len(ranges)}"
 
-        # tokens_valid covers both ranges
+        # num_non_pad covers both ranges
         total = sum(end - start for start, end in ranges)
-        assert item.tokens_valid == total
+        assert item.num_non_pad == total
+        assert item.num_valid == int(item.mask.sum())
 
     def test_shift_is_next_token_prediction(self):
         """For every position where target is not *pad_id*,
@@ -224,8 +229,8 @@ class TestBuildItemChatmlTargets:
                     f"target={item.target_ids[i]}, input[i+1]={item.input_ids[i+1]}"
                 )
 
-    def test_tokens_valid_matches_target_count(self):
-        """*tokens_valid* equals the number of non-PAD entries in *target_ids*."""
+    def test_num_non_pad_matches_target_count(self):
+        """*num_non_pad* equals the number of non-PAD entries in *target_ids*."""
         tokenizer = _make_tiny_tokenizer()
         messages = [
             Message(role="user", content="Question here."),
@@ -236,7 +241,24 @@ class TestBuildItemChatmlTargets:
             pad_id=PAD, im_start_id=IM_START, im_end_id=IM_END,
         )
         expected = int((item.target_ids != PAD).sum())
-        assert item.tokens_valid == expected
+        assert item.num_non_pad == expected
+
+    def test_num_valid_is_visible_length(self):
+        """*num_valid* equals the number of positions covered by *mask*,
+        and can exceed *num_non_pad* (input is visible where there are no
+        assistant targets)."""
+        tokenizer = _make_tiny_tokenizer()
+        messages = [
+            Message(role="user", content="Question here."),
+            Message(role="assistant", content="Answer here."),
+        ]
+        item = build_sft_item_chatml(
+            messages, tokenizer, seq_len=64,
+            pad_id=PAD, im_start_id=IM_START, im_end_id=IM_END,
+        )
+        assert item.num_valid == int(item.mask.sum())
+        assert item.num_valid >= item.num_non_pad
+        assert item.num_valid > item.num_non_pad
 
 
 class TestBuildItemChatmlTruncation:
@@ -255,11 +277,11 @@ class TestBuildItemChatmlTruncation:
         # be the trailing newline, and the position after that is pad
         assert valid_len < 256
         # There should be at least one assistant target token
-        assert item.tokens_valid >= 1
+        assert item.num_non_pad >= 1
 
     def test_truncation_before_assistant_starts(self):
         """If *seq_len* is too small for the assistant message to begin,
-        *tokens_valid* is 0."""
+        *num_non_pad* is 0."""
         tokenizer = _make_tiny_tokenizer()
         messages = [
             Message(role="system", content="You are a helpful assistant."),
@@ -270,7 +292,7 @@ class TestBuildItemChatmlTruncation:
             messages, tokenizer, seq_len=8,
             pad_id=PAD, im_start_id=IM_START, im_end_id=IM_END,
         )
-        assert item.tokens_valid == 0
+        assert item.num_non_pad == 0
 
     def test_assistant_content_partially_truncated(self):
         """When the assistant content extends beyond *seq_len*, only the
@@ -285,7 +307,7 @@ class TestBuildItemChatmlTruncation:
             messages, tokenizer, seq_len=32,
             pad_id=PAD, im_start_id=IM_START, im_end_id=IM_END,
         )
-        assert item.tokens_valid > 0
+        assert item.num_non_pad > 0
         # All target positions must be within [0, seq_len)
         target_positions = np.where(item.target_ids != PAD)[0]
         assert len(target_positions) > 0
@@ -319,7 +341,7 @@ class TestBuildItemChatmlRoles:
             pad_id=PAD, im_start_id=IM_START, im_end_id=IM_END,
             assistant_role="tool",
         )
-        assert item.tokens_valid > 0
+        assert item.num_non_pad > 0
 
     def test_custom_role_no_targets_if_not_assistant(self):
         """Only the role named by *assistant_role* gets targets."""
@@ -367,7 +389,7 @@ class TestBuildItemChatmlRoles:
             pad_id=PAD, im_start_id=IM_START, im_end_id=IM_END,
             assistant_role="robot-assistant-007",
         )
-        assert item.tokens_valid > 0
+        assert item.num_non_pad > 0
 
 
 class TestBuildItemChatmlEdgeCases:
@@ -379,7 +401,7 @@ class TestBuildItemChatmlEdgeCases:
             messages, tokenizer, seq_len=64,
             pad_id=PAD, im_start_id=IM_START, im_end_id=IM_END,
         )
-        assert item.tokens_valid > 0
+        assert item.num_non_pad > 0
 
     def test_very_large_seq_len(self):
         """A large *seq_len* does not break; the token sequence is just
@@ -392,7 +414,7 @@ class TestBuildItemChatmlEdgeCases:
         )
         assert item.seq_len == 4096
         assert item.input_ids.shape == (4096,)
-        assert item.tokens_valid > 0
+        assert item.num_non_pad > 0
 
     def test_multiple_assistant_messages_with_different_content(self):
         """Tokens from different assistant turns do not interfere."""

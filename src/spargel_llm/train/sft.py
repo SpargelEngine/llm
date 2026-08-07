@@ -1,16 +1,15 @@
 # Utilities for SFT (Supervised Fine-Tuning)
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 import numpy as np
+from pydantic import BaseModel
 from tokenizers import Tokenizer
 
 from .basic import Item
 
 
-@dataclass
-class Message:
+class Message(BaseModel):
     role: str
     content: str
 
@@ -71,17 +70,18 @@ def build_sft_item_chatml(
     input_ids[:L] = tokens[:L]
     mask[:L] = True
 
-    tokens_valid = 0
+    num_non_pad = 0
 
     for start, end in assistant_ranges:
         end = min(end, seq_len + 1)
         target_ids[start - 1 : end - 1] = tokens[start:end]
-        tokens_valid += end - start
+        num_non_pad += end - start
 
     return Item(
         seq_len=seq_len,
         input_ids=input_ids,
         target_ids=target_ids,
         mask=mask,
-        tokens_valid=tokens_valid,
+        num_non_pad=num_non_pad,
+        num_valid=L,
     )

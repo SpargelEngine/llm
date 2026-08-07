@@ -15,9 +15,8 @@ from spargel_llm.train import (
 SEP = 4
 
 
-def _make_parquet(rows: list[list[int]], dataset_id: str = "test") -> pq.ParquetFile:
+def _make_parquet(rows: list[list[int]]) -> pq.ParquetFile:
     schema = pa.schema([pa.field("tokens", pa.list_(pa.uint32()))])
-    schema = schema.with_metadata({"dataset_id": dataset_id})
     table = pa.table(
         {"tokens": [pa.array(r, type=pa.uint32()) for r in rows]}, schema=schema
     )
@@ -27,10 +26,9 @@ def _make_parquet(rows: list[list[int]], dataset_id: str = "test") -> pq.Parquet
 
 
 def _make_parquet_multi_rg(
-    rows: list[list[int]], row_group_size: int, dataset_id: str = "test"
+    rows: list[list[int]], row_group_size: int
 ) -> pq.ParquetFile:
     schema = pa.schema([pa.field("tokens", pa.list_(pa.uint32()))])
-    schema = schema.with_metadata({"dataset_id": dataset_id})
     table = pa.table(
         {"tokens": [pa.array(r, type=pa.uint32()) for r in rows]}, schema=schema
     )

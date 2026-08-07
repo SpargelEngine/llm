@@ -21,9 +21,13 @@ class Item(NamedTuple):
     target_ids: np.ndarray  # (seq_len,) int64
     mask: np.ndarray  # (seq_len,) bool (True=valid)
 
-    # number of valid (non-PAD) tokens in the target
+    # number of non-PAD tokens in the target
     # which will participate in the computation of cross entropy
-    tokens_valid: int
+    num_non_pad: int
+
+    # number of visible token positions (i.e. not masked)
+    # mainly for statistics
+    num_valid: int
 
 
 class BatchData(NamedTuple):
@@ -40,9 +44,13 @@ class BatchData(NamedTuple):
     mask: Tensor  # (batches, batch_size, seq_len) bool (True=valid)
     slot_mask: Tensor  # (batches, batch_size) bool (True=valid)
 
-    # (batches) number of valid (non-PAD) tokens per batch in the target
+    # (batches,) number of non-PAD tokens per batch in the target
     # which will participate in the computation of cross entropy
-    tokens_valid: list[int]
+    num_non_pad: list[int]
+
+    # (batches,) number of visible token positions (i.e. not masked) per batch
+    # mainly for statistics
+    num_valid: list[int]
 
     def to(self, device: torch.device | str | int):
         return BatchData(
@@ -53,7 +61,8 @@ class BatchData(NamedTuple):
             target_ids=self.target_ids.to(device),
             mask=self.mask.to(device),
             slot_mask=self.slot_mask.to(device),
-            tokens_valid=self.tokens_valid,
+            num_non_pad=self.num_non_pad,
+            num_valid=self.num_valid,
         )
 
 
@@ -76,10 +85,12 @@ def compile_batch_data(
     )  # default True so unfilled slots don't cause all-masked NaN in attention
     slot_mask = torch.zeros((batches, batch_size), dtype=torch.bool)
 
-    tokens_valid = [0] * batches
+    num_non_pad = [0] * batches
+    num_valid = [0] * batches
 
     for batch in range(batches):
-        batch_tokens_valid = 0
+        batch_num_non_pad = 0
+        batch_num_valid = 0
 
         for offset in range(batch_size):
             i = batch * batch_size + offset
@@ -92,9 +103,11 @@ def compile_batch_data(
             mask[batch][offset] = torch.from_numpy(item.mask)
             slot_mask[batch][offset] = True
 
-            batch_tokens_valid += item.tokens_valid
+            batch_num_non_pad += item.num_non_pad
+            batch_num_valid += item.num_valid
 
-        tokens_valid[batch] = batch_tokens_valid
+        num_non_pad[batch] = batch_num_non_pad
+        num_valid[batch] = batch_num_valid
 
     return BatchData(
         batches=batches,
@@ -104,7 +117,8 @@ def compile_batch_data(
         target_ids=target_ids,
         mask=mask,
         slot_mask=slot_mask,
-        tokens_valid=tokens_valid,
+        num_non_pad=num_non_pad,
+        num_valid=num_valid,
     )
 
 
@@ -164,7 +178,7 @@ def train_step(
     """
 
     device = batch_data.input_ids.device
-    total_tokens_valid = sum(batch_data.tokens_valid)
+    num_non_pad = sum(batch_data.num_non_pad)
 
     model.train()
 
@@ -187,7 +201,7 @@ def train_step(
                 reduction="sum",
             )
 
-        loss /= total_tokens_valid
+        loss /= num_non_pad
         loss_all += loss
         loss.backward()
 
@@ -214,7 +228,7 @@ def compute_validation_metrics(
     """
 
     device = batch_data.input_ids.device
-    total_tokens_valid = sum(batch_data.tokens_valid)
+    num_non_pad = sum(batch_data.num_non_pad)
 
     model.eval()
 
@@ -237,9 +251,9 @@ def compute_validation_metrics(
                 )
 
             sum_loss += loss
-            sum_perplexities += torch.exp(loss / batch_data.tokens_valid[i])
+            sum_perplexities += torch.exp(loss / batch_data.num_non_pad[i])
 
-    avg_loss = sum_loss / total_tokens_valid
+    avg_loss = sum_loss / num_non_pad
     avg_perplexity = sum_perplexities / batch_data.batches
 
     return avg_loss, avg_perplexity

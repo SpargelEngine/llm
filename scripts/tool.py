@@ -24,7 +24,6 @@ from torch.utils.tensorboard import SummaryWriter
 from spargel_llm.logging import log_info, log_success, log_warning
 from spargel_llm.lr_scheduler import LRSchedulerModel
 from spargel_llm.model import Config, Model
-from spargel_llm.parquet_utils import get_dataset_id
 from spargel_llm.train import (
     StepInfo,
     TrainInfo,
@@ -971,16 +970,6 @@ def action_train(
     log_info("Loading training dataset.")
     dataset = load_dataset(data_path)
 
-    new_id = get_dataset_id(dataset)
-    old_id = train_info.dataset_id
-    if new_id and new_id != old_id:
-        log_info(f"Dataset changed ({old_id!r} -> {new_id!r}).")
-        if start_index is None:
-            train_info.index = 0
-        if start_offset is None:
-            train_info.offset = 0
-        train_info.dataset_id = new_id
-
     if start_index is None:
         start_index = train_info.index
     if start_offset is None:
@@ -1138,20 +1127,13 @@ def action_train(
 
     # === Log training configuration ===
 
-    dataset_id = get_dataset_id(dataset)
-    val_dataset_id = get_dataset_id(val_dataset) if val_dataset else None
-
     # console (include file paths for troubleshooting)
 
     data_msg = f"{data_path!r}"
-    if dataset_id:
-        data_msg += f", id={dataset_id!r}"
     data_msg += f", start_index={start_index}, start_offset={start_offset}"
 
     if val_dataset:
         val_msg = f"{val_batches} batches, {val_path!r}"
-        if val_dataset_id:
-            val_msg += f", id={val_dataset_id!r}"
     else:
         val_msg = None
 
@@ -1190,14 +1172,8 @@ def action_train(
             "index": start_index,
             "offset": start_offset,
         }
-        if dataset_id:
-            dataset_info["id"] = dataset_id
 
         writer_val_info: dict = {"batches": val_batches}
-        if val_dataset is not None:
-            val_id = get_dataset_id(val_dataset)
-            if val_id:
-                writer_val_info["dataset_id"] = val_id
 
         log_entry: dict = {
             "event": "train_start",
@@ -1309,7 +1285,6 @@ def action_train(
                 log_info("Dataset exhausted - stopping early.")
                 project_info.train_info.index = 0
                 project_info.train_info.offset = 0
-                project_info.train_info.dataset_id = ""
                 break
 
     # === Final save & report ===

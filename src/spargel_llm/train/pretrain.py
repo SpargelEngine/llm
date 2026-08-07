@@ -47,7 +47,8 @@ class SlidingWindowIterator(Iterator[Item]):
                 input_ids=self.seq[start : start + self.seq_len],
                 target_ids=self.seq[start + 1 : start + 1 + self.seq_len],
                 mask=self._full_mask,
-                tokens_valid=self.seq_len,
+                num_non_pad=self.seq_len,
+                num_valid=self.seq_len,
             )
 
         input_ids = np.full(self.seq_len, self.pad_id, dtype=np.int64)
@@ -63,7 +64,8 @@ class SlidingWindowIterator(Iterator[Item]):
             input_ids=input_ids,
             target_ids=target_ids,
             mask=mask,
-            tokens_valid=L,
+            num_non_pad=L,
+            num_valid=L,
         )
 
 

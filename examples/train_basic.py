@@ -49,7 +49,8 @@ def gen_data() -> Item:
         input_ids=input_ids,
         target_ids=target_ids,
         mask=mask,
-        tokens_valid=5,
+        num_non_pad=5,
+        num_valid=12,
     )
 
 
