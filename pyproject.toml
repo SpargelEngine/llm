@@ -1,6 +1,6 @@
 [project]
 name = "spargel-llm"
-version = "0.14.0"
+version = "0.15.0"
 requires-python = ">=3.14"
 
 dependencies = [
@@ -8,8 +8,6 @@ dependencies = [
     "pyarrow>=25.0.0",
     "pydantic>=2.13.4",
     "regex>=2026.7.19",
-    "rich>=15.0.0",
-    "tensorboard>=2.21.0",
     "tokenizers>=0.23.1",
     "tqdm>=4.70.0",
 ]

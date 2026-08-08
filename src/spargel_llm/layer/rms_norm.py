@@ -3,8 +3,7 @@
 from typing import override
 
 import torch
-import torch.nn as nn
-from torch import Tensor
+from torch import Tensor, nn
 
 
 class RMSNorm(nn.Module):

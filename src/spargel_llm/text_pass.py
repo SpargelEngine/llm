@@ -5,10 +5,11 @@ import itertools
 import json
 import logging
 import os
+from collections.abc import Iterable, Iterator, Sequence
 from compression import zstd
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Iterable, Iterator, Literal, Sequence, override
+from typing import Annotated, Literal, override
 
 import regex
 from pydantic import BaseModel, Discriminator

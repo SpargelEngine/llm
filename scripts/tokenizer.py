@@ -110,8 +110,7 @@ def action_train(path: str, texts_path: str, vocab_size: int, field: str = "text
 
     def text_iter():
         for batch in pf.iter_batches():
-            for text in batch.column(field).to_pylist():
-                yield text
+            yield from batch.column(field).to_pylist()
 
     tokenizer.train_from_iterator(text_iter(), trainer, length=pf.metadata.num_rows)
     tokenizer.save(path, pretty=True)
