@@ -1,12 +1,13 @@
 # Don't forget to update `docs/text-pass.md`.
 
+from __future__ import annotations
+
 import gzip
 import itertools
 import json
 import logging
 import os
 from collections.abc import Iterable, Iterator, Sequence
-from compression import zstd
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal, override
@@ -16,6 +17,7 @@ from pydantic import BaseModel, Discriminator
 from regex import Pattern
 
 from spargel_llm.typing import StrOrPath
+from spargel_llm.zstd import zstd
 
 logger = logging.getLogger(__name__)
 

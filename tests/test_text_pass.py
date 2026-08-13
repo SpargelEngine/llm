@@ -2,7 +2,6 @@
 
 import gzip
 import json
-from compression import zstd
 from pathlib import Path
 
 import pytest
@@ -28,6 +27,7 @@ from spargel_llm.text_pass import (
     load_texts,
     process_texts,
 )
+from spargel_llm.zstd import zstd
 
 
 class TestResolveParent:
